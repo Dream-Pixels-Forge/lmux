@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>lmux dashboard</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <header>
+        <h1>lmux</h1>
+        <div class="status" id="status">Connecting...</div>
+    </header>
+
+    <main>
+        <!-- Workspace tree -->
+        <section class="panel" id="tree-panel">
+            <h2>Workspace Tree</h2>
+            <div id="tree-content" class="tree">Loading...</div>
+        </section>
+
+        <!-- Workspaces -->
+        <section class="panel" id="ws-panel">
+            <h2>Workspaces</h2>
+            <div id="ws-list" class="ws-list">Loading...</div>
+        </section>
+
+        <!-- Agents -->
+        <section class="panel" id="agents-panel">
+            <h2>Agents</h2>
+            <div id="agents-list" class="agents-list">Loading...</div>
+        </section>
+
+        <!-- Notifications -->
+        <section class="panel" id="notif-panel">
+            <h2>Notifications</h2>
+            <div id="notif-list" class="notif-list">Loading...</div>
+        </section>
+
+        <!-- Command input -->
+        <section class="panel command-panel">
+            <h2>Execute Command</h2>
+            <div class="command-input">
+                <input type="text" id="cmd-input" placeholder="e.g. workspace.list" />
+                <button id="cmd-btn" onclick="executeCommand()">Run</button>
+            </div>
+            <pre id="cmd-output" class="cmd-output"></pre>
+        </section>
+    </main>
+
+    <!-- Event log -->
+    <section class="panel event-panel">
+        <h2>Event Stream</h2>
+        <div id="events" class="events">Waiting for events...</div>
+    </section>
+
+    <script>
+    // ── API helpers ──────────────────────────────────────
+
+    async function api(path, options = {}) {
+        try {
+            const resp = await fetch(path, options);
+            return await resp.json();
+        } catch (e) {
+            return { ok: false, error: e.message };
+        }
+    }
+
+    // ── Workspace tree ───────────────────────────────────
+
+    async function loadTree() {
+        const data = await api('/api/tree');
+        const el = document.getElementById('tree-content');
+        if (!data.ok) {
+            el.innerHTML = `<span class="error">${data.error || 'Failed to load'}</span>`;
+            return;
+        }
+        const tree = data.result || data;
+        el.innerHTML = renderTree(tree);
+    }
+
+    function renderTree(node, depth = 0) {
+        if (!node) return '';
+        const indent = '  '.repeat(depth);
+        let html = '';
+
+        if (node.workspaces) {
+            for (const ws of node.workspaces) {
+                html += `<div class="tree-node workspace">${indent}<span class="icon">📁</span> ${ws.title || 'WS-' + ws.id}</div>`;
+                if (ws.surfaces) {
+                    for (const sf of ws.surfaces) {
+                        html += `<div class="tree-node surface">${indent}  <span class="icon">📄</span> ${sf.title || 'Surface ' + sf.id}</div>`;
+                        if (sf.panes) {
+                            for (const pane of sf.panes) {
+                                html += `<div class="tree-node pane">${indent}    <span class="icon">💻</span> Pane ${pane.id}</div>`;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return html || '<span class="empty">No workspaces</span>';
+    }
+
+    // ── Workspaces ───────────────────────────────────────
+
+    async function loadWorkspaces() {
+        const data = await api('/api/workspaces');
+        const el = document.getElementById('ws-list');
+        if (!data.ok) {
+            el.innerHTML = `<span class="error">${data.error || 'Failed to load'}</span>`;
+            return;
+        }
+        const ws = data.result || data;
+        const list = ws.workspaces || [];
+        if (list.length === 0) {
+            el.innerHTML = '<span class="empty">No workspaces</span>';
+            return;
+        }
+        el.innerHTML = list.map(w =>
+            `<div class="ws-item">
+                <span class="ws-title">${w.title || 'WS-' + w.id}</span>
+                <span class="ws-id">#${w.id}</span>
+                ${w.git_branch ? `<span class="ws-branch">${w.git_branch}</span>` : ''}
+            </div>`
+        ).join('');
+    }
+
+    // ── Agents ───────────────────────────────────────────
+
+    async function loadAgents() {
+        const data = await api('/api/agents');
+        const el = document.getElementById('agents-list');
+        if (!data.ok) {
+            el.innerHTML = `<span class="error">${data.error || 'Failed to load'}</span>`;
+            return;
+        }
+        const result = data.result || data;
+        const agents = result.agents || [];
+        if (agents.length === 0) {
+            el.innerHTML = '<span class="empty">No agents running</span>';
+            return;
+        }
+        el.innerHTML = agents.map(a =>
+            `<div class="agent-item">
+                <span class="agent-name">${a.name || a.id}</span>
+                <span class="agent-status">${a.status || 'unknown'}</span>
+            </div>`
+        ).join('');
+    }
+
+    // ── Notifications ────────────────────────────────────
+
+    async function loadNotifications() {
+        const data = await api('/api/notifications');
+        const el = document.getElementById('notif-list');
+        if (!data.ok) {
+            el.innerHTML = `<span class="error">${data.error || 'Failed to load'}</span>`;
+            return;
+        }
+        const result = data.result || data;
+        const notifs = result.notifications || [];
+        if (notifs.length === 0) {
+            el.innerHTML = '<span class="empty">No notifications</span>';
+            return;
+        }
+        el.innerHTML = notifs.slice(0, 20).map(n =>
+            `<div class="notif-item ${n.read ? 'read' : 'unread'}">
+                <span class="notif-text">${n.text || n.message || ''}</span>
+                <span class="notif-ws">WS-${n.workspace_id || '?'}</span>
+            </div>`
+        ).join('');
+    }
+
+    // ── Command execution ────────────────────────────────
+
+    async function executeCommand() {
+        const input = document.getElementById('cmd-input');
+        const output = document.getElementById('cmd-output');
+        const cmd = input.value.trim();
+        if (!cmd) return;
+
+        output.textContent = 'Executing...';
+        const data = await api('/api/command', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ command: cmd, args: {} })
+        });
+        output.textContent = JSON.stringify(data, null, 2);
+    }
+
+    // Allow Enter key to execute
+    document.getElementById('cmd-input').addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') executeCommand();
+    });
+
+    // ── Event stream (SSE) ──────────────────────────────
+
+    function connectEvents() {
+        const el = document.getElementById('events');
+        const statusEl = document.getElementById('status');
+
+        const source = new EventSource('/api/events');
+
+        source.onopen = () => {
+            statusEl.textContent = 'Connected';
+            statusEl.className = 'status connected';
+        };
+
+        source.onmessage = (event) => {
+            try {
+                const data = JSON.parse(event.data);
+                const line = document.createElement('div');
+                line.className = 'event-line';
+                line.textContent = `[${new Date().toLocaleTimeString()}] ${data.type || 'event'}: ${data.name || JSON.stringify(data).slice(0, 100)}`;
+                el.appendChild(line);
+
+                // Keep only last 100 events
+                while (el.children.length > 100) {
+                    el.removeChild(el.firstChild);
+                }
+
+                // Auto-scroll
+                el.scrollTop = el.scrollHeight;
+
+                // Refresh data on relevant events
+                if (data.name && (data.name.includes('workspace') || data.name.includes('surface'))) {
+                    loadTree();
+                    loadWorkspaces();
+                }
+            } catch (e) {
+                // Ignore parse errors (keepalive pings)
+            }
+        };
+
+        source.onerror = () => {
+            statusEl.textContent = 'Disconnected';
+            statusEl.className = 'status disconnected';
+        };
+    }
+
+    // ── Init ─────────────────────────────────────────────
+
+    async function init() {
+        await Promise.all([
+            loadTree(),
+            loadWorkspaces(),
+            loadAgents(),
+            loadNotifications()
+        ]);
+        connectEvents();
+
+        // Refresh data every 10 seconds
+        setInterval(() => {
+            loadTree();
+            loadWorkspaces();
+            loadAgents();
+            loadNotifications();
+        }, 10000);
+    }
+
+    init();
+    </script>
+</body>
+</html>

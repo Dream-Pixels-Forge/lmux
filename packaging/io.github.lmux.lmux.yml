@@ -1,0 +1,140 @@
+app-id: io.github.lmux.lmux
+runtime: org.gnome.Platform
+runtime-version: '46'
+sdk: org.gnome.Sdk
+command: lmux
+
+finish-args:
+  # Display server access
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --socket=x11
+  # Audio for terminal bell and notifications
+  - --socket=pulseaudio
+  # GPU access for GPU-accelerated rendering
+  - --device=dri
+  # IPC for shared memory between lmux processes
+  - --share=ipc
+  # Network for SSH, Tailscale VPN, and companion features
+  - --share=network
+  # D-Bus access for secret storage (SSH keys, tokens)
+  - --talk-name=org.freedesktop.secrets
+  # Let the Python GUI find its modules
+  - --env=PYTHONPATH=/app/lib/lmux
+
+build-options:
+  env:
+    PIP_NO_BUILD_ISOLATION: '1'
+  build-args:
+    - --build-arg=VERSION=1.0.0
+
+modules:
+  # Python packages not bundled in the GNOME runtime
+  - name: python3-requirements
+    buildsystem: simple
+    build-commands:
+      - pip3 install --no-build-isolation --prefix=/app --no-deps pynacl qrcode[pil]
+    cleanup:
+      - /lib/python3*/site-packages/nacl/tests
+      - /lib/python3*/site-packages/PIL/tests
+
+  - name: lmux
+    buildsystem: simple
+    build-commands:
+      # --- Build the C core binary ---
+      - >
+        gcc -std=c17 -Wall -Wextra -Wpedantic -fPIC -O2 -DNDEBUG
+        -Isrc/core -Iinclude
+        -c src/core/model.c -o model.o
+      - >
+        gcc -std=c17 -Wall -Wextra -Wpedantic -fPIC -O2 -DNDEBUG
+        -Isrc/core -Iinclude
+        -c src/core/osc.c -o osc.o
+      - >
+        gcc -std=c17 -Wall -Wextra -Wpedantic -fPIC -O2 -DNDEBUG
+        -Isrc/core -Iinclude
+        -c src/core/server.c -o server.o
+      - >
+        gcc -std=c17 -Wall -Wextra -Wpedantic -fPIC -O2 -DNDEBUG
+        -Isrc/core -Iinclude
+        -c src/core/config.c -o config.o
+      - ar rcs liblmux_core.a model.o osc.o server.o config.o
+      - >
+        gcc -std=c17 -Wall -Wextra -O2 -DNDEBUG
+        -Iinclude
+        -o lmux src/cli/main.c liblmux_core.a -pthread
+
+      # --- Install binary ---
+      - install -Dm755 lmux /app/bin/lmux
+
+      # --- Install Python GUI ---
+      - mkdir -p /app/lib/lmux
+      - cp -r gui/* /app/lib/lmux/
+      - find /app/lib/lmux -name '__pycache__' -exec rm -rf {} + || true
+
+      # --- GUI launcher script ---
+      - mkdir -p /app/bin
+      - |
+        cat > /app/bin/lmux-gui << 'EOF'
+        #!/bin/sh
+        exec python3 /app/lib/lmux/main.py "$@"
+        EOF
+      - chmod 755 /app/bin/lmux-gui
+
+      # --- Desktop entry ---
+      - mkdir -p /app/share/applications
+      - |
+        cat > /app/share/applications/io.github.lmux.lmux.desktop << 'EOF'
+        [Desktop Entry]
+        Name=lmux
+        Comment=Native Linux terminal for AI coding agents
+        Exec=lmux-gui
+        Terminal=false
+        Type=Application
+        Categories=Utility;TerminalEmulator;
+        Icon=io.github.lmux.lmux
+        Keywords=terminal;ai;agents;multiplexer;
+        EOF
+
+      # --- AppStream metainfo ---
+      - mkdir -p /app/share/metainfo
+      - |
+        cat > /app/share/metainfo/io.github.lmux.lmux.metainfo.xml << 'EOF'
+        <?xml version="1.0" encoding="UTF-8"?>
+        <component type="desktop-application">
+          <id>io.github.lmux.lmux</id>
+          <name>lmux</name>
+          <summary>Native Linux terminal for AI coding agents</summary>
+          <metadata_license>MIT</metadata_license>
+          <project_license>MIT</project_license>
+          <description>
+            <p>
+              A native Linux terminal purpose-built for developers running multiple
+              AI coding agents in parallel. Features workspace multiplexing, embedded
+              process monitoring, VPN integration, SSH workspaces, and a phone
+              companion for QR-code pairing.
+            </p>
+          </description>
+          <url type="homepage">https://github.com/lmux/lmux</url>
+          <url type="bugtracker">https://github.com/lmux/lmux/issues</url>
+          <releases>
+            <release version="1.0.0" date="2026-01-01"/>
+          </releases>
+          <content_rating type="oars-1.1"/>
+        </component>
+        EOF
+
+      # --- Placeholder icon (SVG) ---
+      - mkdir -p /app/share/icons/hicolor/scalable/apps
+      - |
+        cat > /app/share/icons/hicolor/scalable/apps/io.github.lmux.lmux.svg << 'EOF'
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+          <rect width="128" height="128" rx="16" fill="#1a1a2e"/>
+          <text x="64" y="76" text-anchor="middle" font-family="monospace"
+                font-size="48" font-weight="bold" fill="#00d4aa">lm</text>
+        </svg>
+        EOF
+
+    sources:
+      - type: dir
+        path: ..

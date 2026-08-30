@@ -1,0 +1,63 @@
+name: Release
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            gcc \
+            pkg-config \
+            libgtk-3-dev \
+            libvte-2.91-dev \
+            python3 \
+            python3-gi \
+            python3-gi-cairo \
+            gir1.2-vte-2.91 \
+            gir1.2-gtk-3.0 \
+            gir1.2-glib-2.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Extract version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Build release binaries
+        run: node scripts/build-core.mjs && node scripts/build-cli.mjs
+
+      - name: Run tests
+        run: node scripts/test.mjs --unit
+
+      - name: Run sanitizer tests
+        run: |
+          rm -f build/*.o build/*.a
+          node scripts/test.mjs --sanitize --unit
+
+      - name: Build Debian package
+        run: bash packaging/build-deb.sh
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: lmux v${{ steps.version.outputs.VERSION }}
+          generate_release_notes: true
+          files: |
+            dist/deb/*.deb
+            build/lmux
+          draft: false
+          prerelease: ${{ contains(steps.version.outputs.VERSION, '-') }}

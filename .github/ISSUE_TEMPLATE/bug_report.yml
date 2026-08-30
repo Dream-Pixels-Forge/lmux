@@ -1,0 +1,79 @@
+name: Bug Report
+description: Report a bug in lmux
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: A clear and concise description of the bug.
+      placeholder: Describe what happened...
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps-to-reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Steps to reproduce the behavior.
+      placeholder: |
+        1. Run `lmux ...`
+        2. Press `Ctrl+...`
+        3. See error...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected-behavior
+    attributes:
+      label: Expected behavior
+      description: What you expected to happen.
+      placeholder: Describe the expected behavior...
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual-behavior
+    attributes:
+      label: Actual behavior
+      description: What actually happened.
+      placeholder: Describe the actual behavior...
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      description: "e.g., Ubuntu 24.04, Fedora 40, macOS 14"
+      placeholder: "Ubuntu 24.04"
+    validations:
+      required: true
+
+  - type: input
+    id: compiler-version
+    attributes:
+      label: Compiler version
+      description: "e.g., GCC 13.2, Clang 17"
+      placeholder: "GCC 13.2"
+    validations:
+      required: true
+
+  - type: input
+    id: lmux-version
+    attributes:
+      label: lmux version
+      description: Output of `lmux --version` or the git commit.
+      placeholder: "0.1.0"
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional context
+      description: Any other context, screenshots, or log output.
+      placeholder: Paste logs, screenshots, or other helpful info...
+    validations:
+      required: false

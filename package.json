@@ -1,0 +1,39 @@
+{
+  "version": "1.0.0",
+  "description": "A native Linux terminal for running AI coding agents in parallel",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "deps:apt": "sudo apt-get install -y libgtk-4-dev libwebkit2gtk-4.1-dev libvte-2.91-dev libgtk-3-dev libgtk-3-0 libwebkit2gtk-4.0-dev libnotify-dev libjson-glib-dev pkg-config",
+    "deps:zig": "node scripts/install-zig.mjs",
+    "deps:ghostty": "node scripts/vendor-ghostty.mjs",
+    "deps:all": "pnpm deps:apt && pnpm deps:zig && pnpm deps:ghostty",
+    "build:core": "node scripts/build-core.mjs",
+    "build:app": "node scripts/build-app.mjs",
+    "build:cli": "node scripts/build-cli.mjs",
+    "build": "pnpm build:core && pnpm build:app && pnpm build:cli",
+    "run": "node scripts/run.mjs",
+    "dev": "node scripts/dev.mjs",
+    "test": "node scripts/test.mjs",
+    "clean": "node scripts/clean.mjs",
+    "package:appimage": "node scripts/package-appimage.mjs",
+    "package:deb": "node scripts/package-deb.mjs"
+  },
+  "keywords": [
+    "terminal",
+    "linux",
+    "gtk3",
+    "ghostty",
+    "ai",
+    "agents",
+    "claude-code",
+    "codex",
+    "opencode"
+  ],
+  "license": "MIT",
+  "author": "lmux contributors",
+  "homepage": "https://github.com/lmux/lmux"
+}

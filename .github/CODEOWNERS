@@ -1,0 +1,8 @@
+# Default owners for everything
+* @dimona
+
+# CI/CD workflows require owner review
+.github/workflows/ @dimona
+
+# Packaging requires owner review
+packaging/ @dimona
