@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/banner.png" alt="lmux banner" width="100%">
+</p>
+
 # lmux — Terminal Multiplexer
 
 **lmux** is a modern terminal multiplexer with a client-server architecture over Unix domain sockets. It combines a lightweight C core daemon with a GTK3/VTE graphical frontend, supporting SSH workspaces, AI agent integration, and OSC terminal notifications.
