@@ -4394,7 +4394,6 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             if (days > 365) days = 365;
         }
 
-        time_t now = time(NULL);
         char buf[16384];
         int n = snprintf(buf, sizeof buf,
             "{\"ok\":true,\"result\":{\"days\":%d,\"events\":[", days);
