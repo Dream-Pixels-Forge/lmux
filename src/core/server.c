@@ -19,6 +19,7 @@
  *   cc -c server.c -I../include -o server.o
  */
 
+#define _GNU_SOURCE      /* SO_PEERCRED, struct ucred */
 #define _POSIX_C_SOURCE 200809L
 
 #include "lmux.h"
@@ -33,14 +34,140 @@
 #include <sys/un.h>
 #include <sys/stat.h>
 #include <poll.h>
+#include <pwd.h>
 
 /* Maximum request body we accept (including newline). */
 #define LMUX_MAX_REQUEST 65536
+
+/* Rate limiting constants */
+#define RATE_LIMIT_MAX_REQUESTS 1000   /* Max requests per window */
+#define RATE_LIMIT_WINDOW_SECONDS 60   /* Window duration in seconds */
+
+/* ------------------------------------------------------------------ */
+/* Rate limiting: token bucket per UID                                 */
+/* ------------------------------------------------------------------ */
+typedef struct {
+    uid_t uid;
+    int   tokens;
+    time_t window_start;
+} rate_limit_entry;
+
+/* Simple rate limiter: track requests per UID */
+static rate_limit_entry rate_limit_table[64] = {0};
+static int rate_limit_count = 0;
+
+/**
+ * Check if a request from the given UID is allowed under rate limits.
+ * Uses a sliding window counter approach.
+ * 
+ * @param uid  The UID of the requesting process.
+ * @return 0 if allowed, -1 if rate limit exceeded.
+ */
+static int check_rate_limit(uid_t uid) {
+    time_t now = time(NULL);
+    
+    /* Find existing entry or create new one */
+    for (int i = 0; i < rate_limit_count; i++) {
+        if (rate_limit_table[i].uid == uid) {
+            /* Reset window if expired */
+            if (now - rate_limit_table[i].window_start >= RATE_LIMIT_WINDOW_SECONDS) {
+                rate_limit_table[i].tokens = RATE_LIMIT_MAX_REQUESTS - 1;
+                rate_limit_table[i].window_start = now;
+                return 0;
+            }
+            
+            /* Check if rate limit exceeded */
+            if (rate_limit_table[i].tokens <= 0) {
+                return -1;
+            }
+            
+            rate_limit_table[i].tokens--;
+            return 0;
+        }
+    }
+    
+    /* Create new entry if table not full */
+    if (rate_limit_count < 64) {
+        rate_limit_table[rate_limit_count].uid = uid;
+        rate_limit_table[rate_limit_count].tokens = RATE_LIMIT_MAX_REQUESTS - 1;
+        rate_limit_table[rate_limit_count].window_start = now;
+        rate_limit_count++;
+        return 0;
+    }
+    
+    /* Table full, deny to prevent untracked abuse (fail closed) */
+    lmux_log(LMUX_LOG_WARN, "server: rate limit table full, denying UID %u", uid);
+    return -1;
+}
+
+/* ------------------------------------------------------------------ */
+/* Socket authentication: verify client credentials                    */
+/* ------------------------------------------------------------------ */
+/**
+ * Verify that the connected client has the same UID as the server owner.
+ * This prevents other users on the same system from accessing the socket.
+ * 
+ * @param client_fd  File descriptor of the connected client socket.
+ * @return 0 if authentication succeeds, -1 if auth fails, -2 if rate limited.
+ */
+static int verify_socket_credentials(int client_fd, const char *socket_path) {
+    struct ucred cred;
+    socklen_t len = sizeof(cred);
+    
+    if (getsockopt(client_fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) < 0) {
+        lmux_log(LMUX_LOG_ERROR, "server: getsockopt(SO_PEERCRED) failed: %s", strerror(errno));
+        return -1;
+    }
+    
+    /* Get the UID of the socket file owner */
+    struct stat st;
+    if (stat(socket_path, &st) < 0) {
+        lmux_log(LMUX_LOG_ERROR, "server: stat(%s) failed: %s", socket_path, strerror(errno));
+        return -1;
+    }
+    
+    uid_t socket_owner_uid = st.st_uid;
+    
+    lmux_log(LMUX_LOG_DEBUG, "server: client UID=%u, socket owner UID=%u", cred.uid, socket_owner_uid);
+    
+    if (cred.uid != socket_owner_uid) {
+        lmux_log(LMUX_LOG_WARN, "server: rejected connection from UID %u (expected %u)", 
+                 cred.uid, socket_owner_uid);
+        return -1;
+    }
+    
+    /* Check rate limit for this UID */
+    if (check_rate_limit(cred.uid) < 0) {
+        lmux_log(LMUX_LOG_WARN, "server: rate limit exceeded for UID %u", cred.uid);
+        return -2;
+    }
+    
+    return 0;
+}
 
 /* ------------------------------------------------------------------ */
 /* Internal: accept and serve one client connection.                   */
 /* ------------------------------------------------------------------ */
 static void serve_client(lmux_app *app, int client_fd) {
+    /* Track connection */
+    lmux_metrics_inc_connections(app);
+
+    /* Authenticate the client before processing any request */
+    const char *socket_path = lmux_socket_path(app);
+    int auth_rc = verify_socket_credentials(client_fd, socket_path);
+    if (auth_rc < 0) {
+        lmux_metrics_inc_errors(app);
+        const char *err;
+        if (auth_rc == -2) {
+            err = "{\"ok\":false,\"error\":{\"type\":\"urn:lmux:rate-limited\",\"title\":\"Rate Limited\",\"code\":\"rate_limited\",\"detail\":\"rate limit exceeded, try again later\",\"trace_id\":\"null\"}}\n";
+        } else {
+            err = "{\"ok\":false,\"error\":{\"type\":\"urn:lmux:auth-failed\",\"title\":\"Authentication Failed\",\"code\":\"auth_failed\",\"detail\":\"authentication failed: UID mismatch\",\"trace_id\":\"null\"}}\n";
+        }
+        ssize_t _w = write(client_fd, err, strlen(err)); (void)_w;
+        close(client_fd);
+        return;
+    }
+    
     char buf[LMUX_MAX_REQUEST];
     size_t total = 0;
     bool got_newline = false;
@@ -75,7 +202,8 @@ static void serve_client(lmux_app *app, int client_fd) {
     const char *p = buf;
     while (*p == ' ' || *p == '\t') p++;
     if (*p != '{') {
-        const char *err = "{\"ok\":false,\"error\":{\"code\":\"invalid_request\",\"message\":\"request must be a JSON object\"}}\n";
+        lmux_metrics_inc_errors(app);
+        const char *err = "{\"ok\":false,\"error\":{\"type\":\"urn:lmux:invalid-request\",\"title\":\"Invalid Request\",\"code\":\"invalid_request\",\"detail\":\"request must be a JSON object\",\"trace_id\":\"null\"}}\n";
         ssize_t _w = write(client_fd, err, strlen(err)); (void)_w;
         close(client_fd);
         return;
@@ -83,6 +211,7 @@ static void serve_client(lmux_app *app, int client_fd) {
 
     /* Dispatch. */
     char *response = lmux_dispatch_json(app, buf);
+    lmux_metrics_inc_requests(app);
 
     /* Check for event streaming response. */
     int is_events = response && strstr(response, "\"stream\":\"events\"") != NULL;
@@ -112,6 +241,14 @@ static void serve_client(lmux_app *app, int client_fd) {
         ignored = write(client_fd, response, rlen);
         ignored = write(client_fd, "\n", 1);
         (void)ignored;
+
+        /* Signal EOF to client so recv() returns 0 and the client's
+         * read loop terminates immediately instead of waiting for
+         * close() to propagate through the kernel.  Skip this for
+         * event-streaming connections which must stay open. */
+        if (!is_events) {
+            shutdown(client_fd, SHUT_WR);
+        }
 
         /* If events command, keep connection open and stream events. */
         if (is_events) {
@@ -260,9 +397,6 @@ int lmux_server_start(lmux_app *app) {
     const char *socket_path = lmux_socket_path(app);
     if (!socket_path || !socket_path[0]) return -1;
 
-    /* Remove any existing socket file. */
-    unlink(socket_path);
-
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) {
         lmux_log(LMUX_LOG_ERROR, "server: socket() failed: %s", strerror(errno));
@@ -274,11 +408,36 @@ int lmux_server_start(lmux_app *app) {
     addr.sun_family = AF_UNIX;
     strncpy(addr.sun_path, socket_path, sizeof addr.sun_path - 1);
 
+    /* Try bind first to avoid TOCTOU race between unlink and bind. */
     if (bind(fd, (struct sockaddr *)&addr, sizeof addr) < 0) {
-        lmux_log(LMUX_LOG_ERROR, "server: bind(%s) failed: %s",
-                 socket_path, strerror(errno));
-        close(fd);
-        return -1;
+        if (errno == EADDRINUSE) {
+            /* Socket exists — check if it's a stale orphan by connecting. */
+            int probe = socket(AF_UNIX, SOCK_STREAM, 0);
+            if (probe >= 0) {
+                int rc = connect(probe, (struct sockaddr *)&addr, sizeof addr);
+                close(probe);
+                if (rc == 0) {
+                    /* Active daemon owns this socket — refuse to overwrite. */
+                    lmux_log(LMUX_LOG_ERROR, "server: daemon already running on %s", socket_path);
+                    close(fd);
+                    return -1;
+                }
+            }
+            /* Stale socket (no active daemon) — safe to remove and retry. */
+            lmux_log(LMUX_LOG_WARN, "server: removing stale socket %s", socket_path);
+            unlink(socket_path);
+            if (bind(fd, (struct sockaddr *)&addr, sizeof addr) < 0) {
+                lmux_log(LMUX_LOG_ERROR, "server: bind(%s) failed after stale removal: %s",
+                         socket_path, strerror(errno));
+                close(fd);
+                return -1;
+            }
+        } else {
+            lmux_log(LMUX_LOG_ERROR, "server: bind(%s) failed: %s",
+                     socket_path, strerror(errno));
+            close(fd);
+            return -1;
+        }
     }
 
     /* Restrict socket to owner-only. */

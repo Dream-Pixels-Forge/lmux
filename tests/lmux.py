@@ -59,9 +59,9 @@ class LmuxClient:
                     if not chunk:
                         break
                     chunks.append(chunk)
-                    if len(chunk) < 65536:
-                        break
                 except socket.timeout:
+                    break
+                except OSError:
                     break
             raw = b"".join(chunks)
         if not raw:
@@ -73,10 +73,14 @@ class LmuxClient:
         resp = self.send(cmd, args)
         if not resp.get("ok"):
             err = resp.get("error", {})
-            raise LmuxError(
-                err.get("code", "unknown"),
-                err.get("message", "no message"),
-            )
+            # Handle both structured dict errors and plain string errors
+            if isinstance(err, dict):
+                raise LmuxError(
+                    err.get("code", "unknown"),
+                    err.get("message", "no message"),
+                )
+            else:
+                raise LmuxError("unknown", str(err))
         return resp.get("result", {})
 
     # ── Workspace operations ─────────────────────────────────
@@ -149,6 +153,29 @@ class LmuxClient:
             "rows": str(rows),
         })
 
+    # ── Copy mode operations ──────────────────────────────────
+
+    def pane_copy_mode_enter(self) -> dict:
+        return self.assert_ok("pane.copy_mode.enter")
+
+    def pane_copy_mode_exit(self) -> dict:
+        return self.assert_ok("pane.copy_mode.exit")
+
+    def pane_copy_mode_move(self, key: str) -> dict:
+        return self.assert_ok("pane.copy_mode.move", {"key": key})
+
+    def pane_copy_mode_select_start(self) -> dict:
+        return self.assert_ok("pane.copy_mode.select_start")
+
+    def pane_copy_mode_select_end(self) -> dict:
+        return self.assert_ok("pane.copy_mode.select_end")
+
+    def pane_copy_mode_yank(self) -> dict:
+        return self.assert_ok("pane.copy_mode.yank")
+
+    def pane_copy_mode_paste(self) -> dict:
+        return self.assert_ok("pane.copy_mode.paste")
+
     # ── Notification operations ──────────────────────────────
 
     def notification_create(self, text: str) -> dict:
@@ -204,6 +231,47 @@ class LmuxClient:
 
     def agent_stop(self, agent_id: int) -> dict:
         return self.assert_ok("agent.stop", {"id": str(agent_id)})
+
+    # ── File explorer operations ─────────────────────────────
+
+    def file_explorer_open(self, path: Optional[str] = None) -> dict:
+        args = {}
+        if path:
+            args["path"] = path
+        return self.assert_ok("file_explorer.open", args)
+
+    def file_explorer_navigate(self, path: str) -> dict:
+        return self.assert_ok("file_explorer.navigate", {"path": path})
+
+    def file_explorer_list(self) -> dict:
+        return self.assert_ok("file_explorer.list")
+
+    def file_explorer_refresh(self) -> dict:
+        return self.assert_ok("file_explorer.refresh")
+
+    def file_explorer_filter(self, filter_str: str) -> dict:
+        return self.assert_ok("file_explorer.filter", {"filter": filter_str})
+
+    def file_explorer_sort(self, mode: str) -> dict:
+        return self.assert_ok("file_explorer.sort", {"mode": mode})
+
+    def file_explorer_open_file(self, name: str) -> dict:
+        return self.assert_ok("file_explorer.open_file", {"name": name})
+
+    def file_explorer_create_dir(self, name: str) -> dict:
+        return self.assert_ok("file_explorer.create_dir", {"name": name})
+
+    def file_explorer_delete(self, name: str) -> dict:
+        return self.assert_ok("file_explorer.delete", {"name": name})
+
+    def file_explorer_rename(self, old_name: str, new_name: str) -> dict:
+        return self.assert_ok("file_explorer.rename", {"old_name": old_name, "new_name": new_name})
+
+    def file_explorer_search(self, query: str) -> dict:
+        return self.assert_ok("file_explorer.search", {"query": query})
+
+    def file_explorer_close(self) -> dict:
+        return self.assert_ok("file_explorer.close")
 
     # ── Utility operations ───────────────────────────────────
 

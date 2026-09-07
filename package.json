@@ -14,7 +14,7 @@
     "build:core": "node scripts/build-core.mjs",
     "build:app": "node scripts/build-app.mjs",
     "build:cli": "node scripts/build-cli.mjs",
-    "build": "pnpm build:core && pnpm build:app && pnpm build:cli",
+    "build": "pnpm build:core && pnpm build:cli",
     "run": "node scripts/run.mjs",
     "dev": "node scripts/dev.mjs",
     "test": "node scripts/test.mjs",

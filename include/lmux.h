@@ -58,6 +58,7 @@ typedef enum {
 void lmux_log_set_level(lmux_log_level level);
 void lmux_log(lmux_log_level level, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));
+void lmux_log_request(const char *request_id, const char *cmd, bool ok, const char *detail);
 
 /* ------------------------------------------------------------------ */
 /* Opaque handles                                                      */
@@ -163,7 +164,8 @@ typedef enum {
 } lmux_split_dir;
 
 lmux_pane *lmux_pane_split(lmux_workspace *ws, lmux_surface *s,
-                           lmux_split_dir dir, const char *command);
+                           lmux_split_dir dir, const char *command,
+                           bool spawn_pty);
 void       lmux_pane_close(lmux_workspace *ws, lmux_pane *p);
 size_t     lmux_pane_count(lmux_workspace *ws);
 lmux_pane *lmux_pane_focused(lmux_workspace *ws);
@@ -195,6 +197,24 @@ typedef struct {
     time_t   created_at;      /* time of creation (time(NULL))         */
 } lmux_notification;
 
+/* Notification ring — visual indicator that a pane needs attention */
+typedef struct {
+    lmux_id  pane_id;
+    bool     active;          /* true if ring is showing */
+    time_t   activated_at;    /* when ring was activated */
+    char     reason[256];     /* why ring was activated */
+} lmux_notification_ring;
+
+/* Notification hook — composable filter/transform/redirect */
+#define LMUX_MAX_HOOKS 32
+typedef struct {
+    char event[64];           /* "agent.output", "agent.error", etc. */
+    char filter[256];         /* JSONPath filter expression */
+    char transform[512];      /* transform script */
+    char redirect[256];       /* redirect target */
+    bool enabled;
+} lmux_notification_hook;
+
 void lmux_notify(lmux_app *app, const char *text, bool waiting);
 void lmux_workspace_notify(lmux_workspace *ws, const char *text, bool waiting);
 void lmux_desktop_notify(const char *title, const char *body);
@@ -202,6 +222,104 @@ void lmux_desktop_notify(const char *title, const char *body);
 size_t               lmux_notification_count(lmux_app *app);
 const lmux_notification *lmux_notification_at(lmux_app *app, size_t index);
 void                 lmux_notification_mark_read(lmux_app *app, uint64_t seq);
+
+/* Notification rings */
+bool lmux_notification_ring_add(lmux_app *app, lmux_id pane_id, const char *reason);
+bool lmux_notification_ring_clear(lmux_app *app, lmux_id pane_id);
+size_t lmux_notification_ring_count(lmux_app *app);
+const lmux_notification_ring *lmux_notification_ring_at(lmux_app *app, size_t index);
+
+/* Notification hooks */
+int  lmux_notification_hook_add(lmux_app *app, const char *event, const char *filter,
+                                 const char *transform, const char *redirect);
+bool lmux_notification_hook_remove(lmux_app *app, const char *event);
+size_t lmux_notification_hook_count(lmux_app *app);
+const lmux_notification_hook *lmux_notification_hook_at(lmux_app *app, size_t index);
+
+/* ------------------------------------------------------------------ */
+/* Window management                                                   */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    lmux_id  id;
+    char     title[256];
+    lmux_id  workspace_ids[64];   /* workspaces in this window */
+    size_t   workspace_count;     /* number of workspaces */
+    lmux_id  focused_workspace;   /* currently focused workspace in window */
+    int      x, y;               /* position */
+    int      width, height;      /* size */
+    bool     fullscreen;
+    time_t   created_at;
+} lmux_window;
+
+lmux_window *lmux_window_create(lmux_app *app, const char *title);
+void lmux_window_close(lmux_app *app, lmux_id window_id);
+lmux_window *lmux_window_by_id(lmux_app *app, lmux_id id);
+bool lmux_window_focus(lmux_app *app, lmux_id window_id);
+bool lmux_window_move_workspace(lmux_app *app, lmux_id window_id, lmux_id workspace_id);
+size_t lmux_window_count(lmux_app *app);
+const lmux_window *lmux_window_at(lmux_app *app, size_t index);
+
+/* ------------------------------------------------------------------ */
+/* Persistent SSH PTY                                                  */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    lmux_id  id;
+    char     host[256];           /* SSH host */
+    char     user[128];           /* SSH user */
+    char     key_path[512];       /* path to SSH key */
+    char     pane_id_str[64];     /* associated pane */
+    pid_t    ssh_pid;             /* SSH process ID */
+    time_t   connected_at;        /* when connected */
+    time_t   last_activity;       /* last activity */
+    bool     active;              /* true if session is active */
+    char     session_file[512];   /* path to session file for persistence */
+} lmux_ssh_session;
+
+lmux_ssh_session *lmux_ssh_session_create(lmux_app *app, const char *host,
+                                            const char *user, const char *key_path);
+bool lmux_ssh_session_attach(lmux_ssh_session *s, lmux_id pane_id);
+bool lmux_ssh_session_detach(lmux_app *app, lmux_id session_id);
+bool lmux_ssh_session_kill(lmux_app *app, lmux_id session_id);
+size_t lmux_ssh_session_count(lmux_app *app);
+const lmux_ssh_session *lmux_ssh_session_at(lmux_app *app, size_t index);
+bool lmux_ssh_session_save(lmux_app *app, const char *path);
+bool lmux_ssh_session_restore(lmux_app *app, const char *path);
+
+/* ------------------------------------------------------------------ */
+/* Feed Panel                                                          */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    lmux_id  id;
+    char     title[256];
+    char     filter[256];          /* filter expression (event type, agent, etc. */
+    size_t   max_entries;          /* max entries to keep */
+    bool     auto_scroll;          /* auto-scroll to bottom */
+    time_t   created_at;
+} lmux_feed_panel;
+
+typedef struct {
+    lmux_id  panel_id;
+    uint64_t seq;                  /* monotonic sequence */
+    char     event_type[64];       /* "agent.output", "notification", etc. */
+    char     source[128];          /* source agent/workspace */
+    char     text[2048];           /* content */
+    time_t   timestamp;
+} lmux_feed_entry;
+
+lmux_feed_panel *lmux_feed_panel_create(lmux_app *app, const char *title, const char *filter);
+bool lmux_feed_panel_close(lmux_app *app, lmux_id panel_id);
+lmux_feed_panel *lmux_feed_panel_by_id(lmux_app *app, lmux_id id);
+size_t lmux_feed_panel_count(lmux_app *app);
+const lmux_feed_panel *lmux_feed_panel_at(lmux_app *app, size_t index);
+
+bool lmux_feed_entry_add(lmux_app *app, lmux_id panel_id, const char *event_type,
+                          const char *source, const char *text);
+size_t lmux_feed_entry_count(lmux_app *app, lmux_id panel_id);
+const lmux_feed_entry *lmux_feed_entry_at(lmux_app *app, lmux_id panel_id, size_t index);
+bool lmux_feed_panel_clear(lmux_app *app, lmux_id panel_id);
 
 /* ------------------------------------------------------------------ */
 /* Event queue                                                         */
@@ -245,6 +363,7 @@ typedef struct {
 
 bool lmux_snapshot_save (const lmux_app *app, const char *path);
 bool lmux_snapshot_load (lmux_app *app, const char *path);
+bool lmux_snapshot_load_with_recovery(lmux_app *app, const char *path);
 
 /* ------------------------------------------------------------------ */
 /* OSC escape parser - public for testing and reuse.                  */
@@ -294,6 +413,11 @@ void lmux_server_stop(lmux_app *app);
 /* Accessors for server internals (used by server.c, opaque to callers). */
 int  lmux_server_get_listen_fd(const lmux_app *app);
 void lmux_server_set_listen_fd(lmux_app *app, int fd);
+
+/* Metrics accessors (server.c increments, model.c reads). */
+void lmux_metrics_inc_requests(lmux_app *app);
+void lmux_metrics_inc_errors(lmux_app *app);
+void lmux_metrics_inc_connections(lmux_app *app);
 
 /* ------------------------------------------------------------------ */
 /* Configuration                                                        */
@@ -364,6 +488,11 @@ typedef struct {
     lmux_id  pane_id;            /* pane the agent runs in */
     time_t   started_at;         /* when agent was started */
     lmux_id  id;                 /* unique agent id */
+    /* Hibernation support */
+    bool     hibernated;         /* true if agent is hibernated (killed to save resources) */
+    time_t   last_activity;      /* timestamp of last activity */
+    time_t   hibernated_at;      /* when agent was hibernated */
+    char     resume_cmd[1024];   /* command to resume the agent */
 } lmux_agent;
 
 /* Spawn an agent process in a new pane. Returns the agent id, or 0 on failure. */
@@ -380,6 +509,15 @@ lmux_agent *lmux_agent_get(lmux_app *app, lmux_id agent_id);
 
 /* Update agent status (called when pane process exits) */
 void lmux_agent_update_status(lmux_app *app, pid_t pid, int status);
+
+/* Hibernate an agent — kills process to save resources */
+bool lmux_agent_hibernate(lmux_app *app, lmux_id agent_id);
+
+/* Resume a hibernated agent — restarts with saved command */
+bool lmux_agent_resume(lmux_app *app, lmux_id agent_id);
+
+/* Check and hibernate idle agents (called from event loop) */
+void lmux_hibernation_check(lmux_app *app);
 
 /* ------------------------------------------------------------------ */
 /* Wait points (synchronization primitive)                              */

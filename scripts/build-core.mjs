@@ -31,6 +31,13 @@ const CFLAGS = [
     debug ? "-g -O0" : "-O2 -DNDEBUG",
     sanitize ? "-fsanitize=address,undefined -fno-omit-frame-pointer" : "",
     `-I${join(ROOT, "include")}`,
+    // WebKit2GTK flags (optional — browser module)
+    ...(function() {
+        try {
+            const pkg = execSync("pkg-config --cflags webkit2gtk-4.1 2>/dev/null", { encoding: "utf8" }).trim();
+            return pkg ? pkg.split(" ") : [];
+        } catch { return []; }
+    })(),
 ].filter(Boolean).join(" ");
 
 const sources = [
@@ -38,6 +45,7 @@ const sources = [
     join(ROOT, "src", "core", "osc.c"),
     join(ROOT, "src", "core", "server.c"),
     join(ROOT, "src", "core", "config.c"),
+    join(ROOT, "src", "browser.c"),
 ];
 
 if (!existsSync(BUILD)) mkdirSync(BUILD, { recursive: true });

@@ -8,6 +8,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <sys/stat.h>
 
 static int tests_run = 0;
 static int tests_pass = 0;
@@ -42,6 +43,8 @@ static lmux_app *make_app(void) {
     if (home) {
         char snap[512];
         snprintf(snap, sizeof snap, "%s/.local/share/lmux/snapshot.json", home);
+        unlink(snap);
+        snprintf(snap, sizeof snap, "%s/.local/share/lmux/snapshot.json.bak", home);
         unlink(snap);
     }
     return lmux_app_new(sock_path);
@@ -144,7 +147,7 @@ static void test_pane_split(void) {
     lmux_workspace *ws = lmux_workspace_create(app, "ws");
     lmux_surface *surf = lmux_surface_create(ws, "surf");
     size_t before = lmux_pane_count(ws);
-    lmux_pane *new_pane = lmux_pane_split(ws, surf, LMUX_SPLIT_HORIZONTAL, "echo test");
+    lmux_pane *new_pane = lmux_pane_split(ws, surf, LMUX_SPLIT_HORIZONTAL, "echo test", false);
     ASSERT(new_pane != NULL, "split should succeed");
     ASSERT(lmux_pane_count(ws) == before + 1, "should have one more pane");
     lmux_app_free(app); teardown(); PASS();
@@ -155,7 +158,7 @@ static void test_pane_focused(void) {
     lmux_app *app = make_app();
     lmux_workspace *ws = lmux_workspace_create(app, "ws");
     lmux_surface *surf = lmux_surface_create(ws, "surf");
-    lmux_pane_split(ws, surf, LMUX_SPLIT_HORIZONTAL, NULL);
+    lmux_pane_split(ws, surf, LMUX_SPLIT_HORIZONTAL, NULL, false);
     ASSERT(lmux_pane_focused(ws) != NULL, "pane_focused should return a pane");
     lmux_app_free(app); teardown(); PASS();
 }
@@ -238,6 +241,105 @@ static void test_keybinding_find(void) {
     lmux_config_free(cfg); PASS();
 }
 
+/* Dispatch / command tests */
+static void test_dispatch_ping(void) {
+    TEST("dispatch ping returns version");
+    lmux_app *app = make_app();
+    char *resp = lmux_dispatch_json(app, "{\"cmd\":\"ping\",\"args\":{}}");
+    ASSERT(resp != NULL, "response should not be NULL");
+    ASSERT(strstr(resp, "\"ok\":true"), "ping should succeed");
+    ASSERT(strstr(resp, LMUX_VERSION), "should contain version");
+    free(resp);
+    lmux_app_free(app); teardown(); PASS();
+}
+
+static void test_dispatch_health_live(void) {
+    TEST("dispatch health.live returns alive status");
+    lmux_app *app = make_app();
+    char *resp = lmux_dispatch_json(app, "{\"cmd\":\"health.live\",\"args\":{}}");
+    ASSERT(resp != NULL, "response should not be NULL");
+    ASSERT(strstr(resp, "\"ok\":true"), "health.live should succeed");
+    ASSERT(strstr(resp, "\"status\":\"alive\""), "should report alive");
+    ASSERT(strstr(resp, "\"pid\":"), "should contain pid");
+    free(resp);
+    lmux_app_free(app); teardown(); PASS();
+}
+
+static void test_dispatch_health_ready(void) {
+    TEST("dispatch health.ready returns status");
+    lmux_app *app = make_app();
+    char *resp = lmux_dispatch_json(app, "{\"cmd\":\"health.ready\",\"args\":{}}");
+    ASSERT(resp != NULL, "response should not be NULL");
+    /* No server running → listen_fd == -1 → not_ready is expected */
+    ASSERT(strstr(resp, "\"status\":\"not_ready\""), "should report not_ready without server");
+    ASSERT(strstr(resp, "\"workspaces\":"), "should contain workspaces count");
+    free(resp);
+    lmux_app_free(app); teardown(); PASS();
+}
+
+static void test_dispatch_metrics(void) {
+    TEST("dispatch metrics returns counters");
+    lmux_app *app = make_app();
+    /* Run a ping to bump counters */
+    free(lmux_dispatch_json(app, "{\"cmd\":\"ping\",\"args\":{}}"));
+    char *resp = lmux_dispatch_json(app, "{\"cmd\":\"metrics\",\"args\":{}}");
+    ASSERT(resp != NULL, "response should not be NULL");
+    ASSERT(strstr(resp, "\"ok\":true"), "metrics should succeed");
+    ASSERT(strstr(resp, "\"requests\":"), "should contain requests");
+    ASSERT(strstr(resp, "\"connections\":"), "should contain connections");
+    free(resp);
+    lmux_app_free(app); teardown(); PASS();
+}
+
+static void test_dispatch_unknown_cmd(void) {
+    TEST("dispatch unknown command returns error");
+    lmux_app *app = make_app();
+    char *resp = lmux_dispatch_json(app, "{\"cmd\":\"nope.zzz\",\"args\":{}}");
+    ASSERT(resp != NULL, "response should not be NULL");
+    ASSERT(strstr(resp, "\"ok\":false"), "unknown cmd should fail");
+    free(resp);
+    lmux_app_free(app); teardown(); PASS();
+}
+
+static void test_snapshot_backup_recovery(void) {
+    TEST("snapshot save creates .bak and load recovers from it");
+    lmux_app *app = make_app();
+    /* Create a workspace so we have something to save */
+    lmux_workspace *ws = lmux_workspace_create(app, "backup-test");
+    ASSERT(ws != NULL, "workspace created");
+    size_t count_before = lmux_workspace_count(app);
+
+    /* Save snapshot */
+    char path[256];
+    snprintf(path, sizeof path, "/tmp/lmux-snap-test-%d.json", getpid());
+    ASSERT(lmux_snapshot_save(app, path), "snapshot_save should succeed");
+
+    /* .bak should exist */
+    char bak[260];
+    snprintf(bak, sizeof bak, "%s.bak", path);
+    struct stat st;
+    ASSERT(stat(bak, &st) == 0, ".bak file should exist");
+
+    /* Corrupt the main file */
+    FILE *f = fopen(path, "w");
+    fprintf(f, "NOT_JSON");
+    fclose(f);
+
+    /* Load into a fresh app — should recover from .bak */
+    unlink("/tmp/lmux-snap-recovery.sock");
+    lmux_app *app2 = lmux_app_new("/tmp/lmux-snap-recovery.sock");
+    bool ok = lmux_snapshot_load_with_recovery(app2, path);
+    ASSERT(ok, "load_with_recovery should succeed from .bak");
+    size_t count_after = lmux_workspace_count(app2);
+    ASSERT(count_after >= count_before, "should have restored workspaces");
+
+    unlink(path);
+    unlink(bak);
+    lmux_app_free(app);
+    lmux_app_free(app2);
+    teardown(); PASS();
+}
+
 int main(void) {
     printf("lmux Model Unit Tests\n");
     printf("=====================\n\n");
@@ -257,6 +359,12 @@ int main(void) {
     test_config_defaults();
     test_config_load_missing_file();
     test_keybinding_find();
+    test_dispatch_ping();
+    test_dispatch_health_live();
+    test_dispatch_health_ready();
+    test_dispatch_metrics();
+    test_dispatch_unknown_cmd();
+    test_snapshot_backup_recovery();
     printf("\n=====================\n");
     printf("Tests: %d passed, %d failed, %d total\n\n",
            tests_pass, tests_fail, tests_run);

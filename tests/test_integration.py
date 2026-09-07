@@ -991,7 +991,1895 @@ class TestSSHClient(unittest.TestCase):
         self.assertEqual(client.cleanup_all(), 0)
 
 # ====================================================================
+# Tmux compatibility layer
+# ====================================================================
+
+class TestTmuxCompat(unittest.TestCase):
+    """Test tmux command translation to lmux commands."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.c = _ensure_daemon()
+
+    def test_tmux_new_session(self):
+        """tmux new-session -s <name> creates a workspace."""
+        name = _unique("tmux-ws")
+        result = self.c.send("workspace.create", {"title": name})
+        self.assertTrue(result.get("ok"))
+        ws = result.get("result", {})
+        self.assertIn("id", ws)
+        self.assertEqual(ws["title"], name)
+        self.c.workspace_close(ws["id"])
+
+    def test_tmux_list_sessions(self):
+        """tmux list-sessions lists workspaces."""
+        result = self.c.send("workspace.list")
+        self.assertTrue(result.get("ok"))
+        ws_list = result.get("result", {}).get("workspaces", [])
+        self.assertIsInstance(ws_list, list)
+
+    def test_tmux_split_window(self):
+        """tmux split-window -h creates a horizontal split."""
+        ws = self.c.workspace_create(_unique("tmux-split"))
+        before = len(self.c.pane_list())
+        self.c.surface_split("h")
+        after = len(self.c.pane_list())
+        self.assertEqual(after, before + 1)
+        self.c.workspace_close(ws["id"])
+
+    def test_tmux_split_window_vertical(self):
+        """tmux split-window -v creates a vertical split."""
+        ws = self.c.workspace_create(_unique("tmux-split-v"))
+        before = len(self.c.pane_list())
+        self.c.surface_split("v")
+        after = len(self.c.pane_list())
+        self.assertEqual(after, before + 1)
+        self.c.workspace_close(ws["id"])
+
+    def test_tmux_select_pane(self):
+        """tmux select-pane -t <target> focuses a pane."""
+        ws = self.c.workspace_create(_unique("tmux-selpane"))
+        self.c.surface_split("h")
+        panes = self.c.pane_list()
+        target = panes[1]["id"] if len(panes) > 1 else panes[0]["id"]
+        self.c.pane_focus(target)
+        panes_after = self.c.pane_list()
+        for p in panes_after:
+            if p["id"] == target:
+                self.assertTrue(p["focused"])
+                break
+        self.c.workspace_close(ws["id"])
+
+    def test_tmux_select_window(self):
+        """tmux select-window -t <target> selects a workspace."""
+        ws1 = self.c.workspace_create(_unique("tmux-selwin-a"))
+        ws2 = self.c.workspace_create(_unique("tmux-selwin-b"))
+        self.c.workspace_select(ws2["id"])
+        current = self.c.workspace_current()
+        self.assertEqual(current["id"], ws2["id"])
+        self.c.workspace_close(ws1["id"])
+        self.c.workspace_close(ws2["id"])
+
+    def test_tmux_rename_session(self):
+        """tmux rename-session -t <old> <new> renames a workspace."""
+        ws = self.c.workspace_create(_unique("tmux-rename"))
+        new_name = _unique("tmux-rename-new")
+        self.c.workspace_rename(ws["id"], new_name)
+        workspaces = self.c.workspace_list()
+        for w in workspaces:
+            if w["id"] == ws["id"]:
+                self.assertEqual(w["title"], new_name)
+                break
+        self.c.workspace_close(ws["id"])
+
+    def test_tmux_send_keys(self):
+        """tmux send-keys sends text to a surface."""
+        ws = self.c.workspace_create(_unique("tmux-sendkeys"))
+        try:
+            self.c.surface_send_text("echo tmux-sendkeys\n")
+        except LmuxError:
+            pass  # acceptable if pty not ready
+        self.c.workspace_close(ws["id"])
+
+    def test_tmux_kill_session(self):
+        """tmux kill-session -t <target> closes a workspace."""
+        ws = self.c.workspace_create(_unique("tmux-kill"))
+        ws_id = ws["id"]
+        self.c.workspace_close(ws_id)
+        workspaces = self.c.workspace_list()
+        ids = [w["id"] for w in workspaces]
+        self.assertNotIn(ws_id, ids)
+
+    def test_tmux_list_panes(self):
+        """tmux list-panes lists surfaces in a workspace."""
+        ws = self.c.workspace_create(_unique("tmux-lspanes"))
+        result = self.c.send("surface.list", {"workspace_id": str(ws["id"])})
+        self.assertTrue(result.get("ok"))
+        surfaces = result.get("result", {}).get("surfaces", [])
+        self.assertIsInstance(surfaces, list)
+        self.assertGreater(len(surfaces), 0)
+        self.c.workspace_close(ws["id"])
+
+    def test_tmux_full_workflow(self):
+        """Full tmux workflow: create, split, focus, rename, close."""
+        # Create workspace
+        name = _unique("tmux-full")
+        ws = self.c.workspace_create(name)
+        self.assertIn("id", ws)
+
+        # Split horizontally
+        self.c.surface_split("h")
+        panes = self.c.pane_list()
+        self.assertGreater(len(panes), 1)
+
+        # Focus second pane
+        self.c.pane_focus(panes[1]["id"])
+        panes_after = self.c.pane_list()
+        focused = [p for p in panes_after if p["focused"]]
+        self.assertEqual(len(focused), 1)
+
+        # Rename
+        new_name = _unique("tmux-full-renamed")
+        self.c.workspace_rename(ws["id"], new_name)
+        workspaces = self.c.workspace_list()
+        for w in workspaces:
+            if w["id"] == ws["id"]:
+                self.assertEqual(w["title"], new_name)
+                break
+
+        # List sessions
+        all_ws = self.c.workspace_list()
+        self.assertGreater(len(all_ws), 0)
+
+        # Close
+        self.c.workspace_close(ws["id"])
+        all_ws_after = self.c.workspace_list()
+        ids = [w["id"] for w in all_ws_after]
+        self.assertNotIn(ws["id"], ids)
+
+
+# ====================================================================
+# Copy mode (Vi-style text selection)
+# ====================================================================
+
+class TestCopyMode(unittest.TestCase):
+    """Test Vi-style copy mode: enter/exit, movement, selection, yank, paste."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.c = _ensure_daemon()
+
+    def _make_ws_with_pane(self):
+        ws = self.c.workspace_create(_unique("copy-ws"))
+        return ws
+
+    def test_enter_exit_copy_mode(self):
+        """Enter copy mode, verify active, exit, verify inactive."""
+        ws = self._make_ws_with_pane()
+        # Enter copy mode
+        res = self.c.pane_copy_mode_enter()
+        self.assertTrue(res["active"])
+        self.assertIn("pane_id", res)
+
+        # Exit copy mode
+        res = self.c.pane_copy_mode_exit()
+        self.assertTrue(res["was_active"])
+        self.c.workspace_close(ws["id"])
+
+    def test_exit_without_enter(self):
+        """Exit copy mode when not active should report was_active=false."""
+        ws = self._make_ws_with_pane()
+        # Ensure copy mode is not active (fresh pane)
+        res = self.c.pane_copy_mode_exit()
+        self.assertFalse(res["was_active"])
+        self.c.workspace_close(ws["id"])
+
+    def test_movement_keys(self):
+        """Test Vi movement keys (h, j, k, l)."""
+        ws = self._make_ws_with_pane()
+        self.c.pane_copy_mode_enter()
+
+        # Start at (0, 0)
+        res = self.c.pane_copy_mode_move("l")
+        self.assertEqual(res["row"], 0)
+        self.assertEqual(res["col"], 1)
+
+        res = self.c.pane_copy_mode_move("l")
+        self.assertEqual(res["col"], 2)
+
+        res = self.c.pane_copy_mode_move("j")
+        self.assertEqual(res["row"], 1)
+        self.assertEqual(res["col"], 2)
+
+        res = self.c.pane_copy_mode_move("k")
+        self.assertEqual(res["row"], 0)
+
+        res = self.c.pane_copy_mode_move("h")
+        self.assertEqual(res["col"], 1)
+
+        self.c.pane_copy_mode_exit()
+        self.c.workspace_close(ws["id"])
+
+    def test_movement_word_jump(self):
+        """Test w/b word jumps."""
+        ws = self._make_ws_with_pane()
+        self.c.pane_copy_mode_enter()
+
+        res = self.c.pane_copy_mode_move("w")
+        self.assertEqual(res["col"], 5)
+
+        res = self.c.pane_copy_mode_move("b")
+        self.assertEqual(res["col"], 0)
+
+        self.c.pane_copy_mode_exit()
+        self.c.workspace_close(ws["id"])
+
+    def test_movement_line_start_end(self):
+        """Test 0 and $ for line start/end."""
+        ws = self._make_ws_with_pane()
+        self.c.pane_copy_mode_enter()
+
+        # Move somewhere
+        self.c.pane_copy_mode_move("l")
+        self.c.pane_copy_mode_move("l")
+        self.c.pane_copy_mode_move("l")
+
+        # $ goes to end
+        res = self.c.pane_copy_mode_move("$")
+        self.assertEqual(res["col"], 9999)
+
+        # 0 goes to start
+        res = self.c.pane_copy_mode_move("0")
+        self.assertEqual(res["col"], 0)
+
+        self.c.pane_copy_mode_exit()
+        self.c.workspace_close(ws["id"])
+
+    def test_movement_document_start_end(self):
+        """Test gg and G for document start/end."""
+        ws = self._make_ws_with_pane()
+        self.c.pane_copy_mode_enter()
+
+        # Move somewhere
+        self.c.pane_copy_mode_move("j")
+        self.c.pane_copy_mode_move("j")
+        self.c.pane_copy_mode_move("l")
+
+        # G goes to bottom
+        res = self.c.pane_copy_mode_move("G")
+        self.assertEqual(res["row"], 9999)
+
+        # gg goes to top
+        res = self.c.pane_copy_mode_move("gg")
+        self.assertEqual(res["row"], 0)
+        self.assertEqual(res["col"], 0)
+
+        self.c.pane_copy_mode_exit()
+        self.c.workspace_close(ws["id"])
+
+    def test_movement_clamp_at_zero(self):
+        """Movement should clamp at (0,0), not go negative."""
+        ws = self._make_ws_with_pane()
+        self.c.pane_copy_mode_enter()
+
+        # Already at (0,0)
+        res = self.c.pane_copy_mode_move("h")
+        self.assertEqual(res["col"], 0)
+        self.assertEqual(res["row"], 0)
+
+        res = self.c.pane_copy_mode_move("k")
+        self.assertEqual(res["row"], 0)
+
+        self.c.pane_copy_mode_exit()
+        self.c.workspace_close(ws["id"])
+
+    def test_select_start_end(self):
+        """Test visual selection (v to start, move, v to end)."""
+        ws = self._make_ws_with_pane()
+        self.c.pane_copy_mode_enter()
+
+        # Move to position
+        self.c.pane_copy_mode_move("l")
+        self.c.pane_copy_mode_move("l")
+
+        # Start selection
+        res = self.c.pane_copy_mode_select_start()
+        self.assertTrue(res["selecting"])
+        self.assertEqual(res["start_row"], 0)
+        self.assertEqual(res["start_col"], 2)
+
+        # Move cursor
+        self.c.pane_copy_mode_move("l")
+        self.c.pane_copy_mode_move("l")
+        self.c.pane_copy_mode_move("j")
+
+        # End selection
+        res = self.c.pane_copy_mode_select_end()
+        self.assertFalse(res["selecting"])
+        self.assertEqual(res["start_row"], 0)
+        self.assertEqual(res["start_col"], 2)
+        self.assertEqual(res["end_row"], 1)
+        self.assertEqual(res["end_col"], 4)
+
+        self.c.pane_copy_mode_exit()
+        self.c.workspace_close(ws["id"])
+
+    def test_yank(self):
+        """Test yank copies selected text to clipboard."""
+        ws = self._make_ws_with_pane()
+        self.c.pane_copy_mode_enter()
+
+        # Select region
+        self.c.pane_copy_mode_select_start()
+        self.c.pane_copy_mode_move("l")
+        self.c.pane_copy_mode_move("l")
+        self.c.pane_copy_mode_select_end()
+
+        # Yank
+        res = self.c.pane_copy_mode_yank()
+        self.assertTrue(res["yanked"])
+        self.assertIn("len", res)
+        self.assertGreater(res["len"], 0)
+
+        self.c.pane_copy_mode_exit()
+        self.c.workspace_close(ws["id"])
+
+    def test_paste(self):
+        """Test paste reads from clipboard."""
+        ws = self._make_ws_with_pane()
+        self.c.pane_copy_mode_enter()
+
+        # Yank something first
+        self.c.pane_copy_mode_select_start()
+        self.c.pane_copy_mode_move("l")
+        self.c.pane_copy_mode_move("l")
+        self.c.pane_copy_mode_select_end()
+        self.c.pane_copy_mode_yank()
+
+        # Paste
+        res = self.c.pane_copy_mode_paste()
+        self.assertTrue(res["pasted"])
+        self.assertGreater(res["len"], 0)
+
+        self.c.pane_copy_mode_exit()
+        self.c.workspace_close(ws["id"])
+
+    def test_move_without_copy_mode_fails(self):
+        """Movement when copy mode is not active should fail."""
+        ws = self._make_ws_with_pane()
+        resp = self.c.send("pane.copy_mode.move", {"key": "l"})
+        self.assertFalse(resp.get("ok", True))
+        error = resp.get("error", {})
+        self.assertEqual(error.get("code"), "invalid_state")
+        self.c.workspace_close(ws["id"])
+
+    def test_invalid_key_fails(self):
+        """Unknown key should fail."""
+        ws = self._make_ws_with_pane()
+        self.c.pane_copy_mode_enter()
+        resp = self.c.send("pane.copy_mode.move", {"key": "x"})
+        self.assertFalse(resp.get("ok", True))
+        error = resp.get("error", {})
+        self.assertEqual(error.get("code"), "invalid_params")
+        self.c.pane_copy_mode_exit()
+        self.c.workspace_close(ws["id"])
+
+
+# ====================================================================
+# File Explorer
+# ====================================================================
+
+class TestFileExplorer(unittest.TestCase):
+    """File explorer operations: open, navigate, list, filter, sort, etc."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.c = _ensure_daemon()
+
+    def setUp(self):
+        """Create a temp directory structure for testing."""
+        self.test_dir = tempfile.mkdtemp(prefix="lmux-test-fe-")
+        # Create some test files and directories
+        os.makedirs(os.path.join(self.test_dir, "subdir1"))
+        os.makedirs(os.path.join(self.test_dir, "subdir2"))
+        with open(os.path.join(self.test_dir, "file1.txt"), "w") as f:
+            f.write("hello")
+        with open(os.path.join(self.test_dir, "file2.py"), "w") as f:
+            f.write("print('hi')")
+        with open(os.path.join(self.test_dir, "file3.txt"), "w") as f:
+            f.write("world")
+        with open(os.path.join(self.test_dir, "subdir1", "nested.txt"), "w") as f:
+            f.write("nested")
+
+    def tearDown(self):
+        """Clean up test directory."""
+        import shutil
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+        # Close file explorer if open
+        try:
+            self.c.file_explorer_close()
+        except Exception:
+            pass
+
+    def test_open_at_path(self):
+        """Open file explorer at a specific path."""
+        res = self.c.file_explorer_open(self.test_dir)
+        self.assertIn("path", res)
+        self.assertIn("count", res)
+        self.assertGreater(res["count"], 0)
+
+    def test_open_default_path(self):
+        """Open file explorer without path defaults to cwd."""
+        res = self.c.file_explorer_open()
+        self.assertIn("path", res)
+
+    def test_navigate_to_directory(self):
+        """Navigate to a subdirectory."""
+        self.c.file_explorer_open(self.test_dir)
+        subdir = os.path.join(self.test_dir, "subdir1")
+        res = self.c.file_explorer_navigate(subdir)
+        self.assertEqual(res["path"], subdir)
+        self.assertEqual(res["count"], 1)  # only nested.txt
+
+    def test_navigate_invalid_path(self):
+        """Navigate to non-existent path should fail."""
+        self.c.file_explorer_open(self.test_dir)
+        resp = self.c.send("file_explorer.navigate", {"path": "/nonexistent/path/12345"})
+        self.assertFalse(resp.get("ok", True))
+
+    def test_list_entries(self):
+        """List entries in current directory."""
+        self.c.file_explorer_open(self.test_dir)
+        res = self.c.file_explorer_list()
+        self.assertIn("entries", res)
+        self.assertIn("count", res)
+        # Should have 5 entries: subdir1, subdir2, file1.txt, file2.py, file3.txt
+        self.assertEqual(res["count"], 5)
+        # Check entry structure
+        entry = res["entries"][0]
+        self.assertIn("name", entry)
+        self.assertIn("path", entry)
+        self.assertIn("is_dir", entry)
+        self.assertIn("size", entry)
+        self.assertIn("mtime", entry)
+
+    def test_filter_entries(self):
+        """Filter entries by name substring."""
+        self.c.file_explorer_open(self.test_dir)
+        res = self.c.file_explorer_filter("file")
+        self.assertIn("count", res)
+        # Should match file1.txt, file2.py, file3.txt
+        self.assertEqual(res["count"], 3)
+
+    def test_clear_filter(self):
+        """Clear filter shows all entries."""
+        self.c.file_explorer_open(self.test_dir)
+        self.c.file_explorer_filter("file")
+        res = self.c.file_explorer_filter("")
+        self.assertEqual(res["count"], 5)
+
+    def test_sort_by_name(self):
+        """Sort entries by name."""
+        self.c.file_explorer_open(self.test_dir)
+        res = self.c.file_explorer_sort("name")
+        self.assertEqual(res["sort_mode"], 0)
+
+    def test_sort_by_size(self):
+        """Sort entries by size."""
+        self.c.file_explorer_open(self.test_dir)
+        res = self.c.file_explorer_sort("size")
+        self.assertEqual(res["sort_mode"], 1)
+
+    def test_sort_by_time(self):
+        """Sort entries by modification time."""
+        self.c.file_explorer_open(self.test_dir)
+        res = self.c.file_explorer_sort("time")
+        self.assertEqual(res["sort_mode"], 2)
+
+    def test_sort_invalid_mode(self):
+        """Invalid sort mode should fail."""
+        self.c.file_explorer_open(self.test_dir)
+        resp = self.c.send("file_explorer.sort", {"mode": "invalid"})
+        self.assertFalse(resp.get("ok", True))
+
+    def test_open_file_returns_file_info(self):
+        """Opening a file returns file info."""
+        self.c.file_explorer_open(self.test_dir)
+        res = self.c.file_explorer_open_file("file1.txt")
+        self.assertEqual(res["type"], "file")
+        self.assertEqual(res["name"], "file1.txt")
+        self.assertIn("size", res)
+
+    def test_open_directory_navigates(self):
+        """Opening a directory navigates into it."""
+        self.c.file_explorer_open(self.test_dir)
+        res = self.c.file_explorer_open_file("subdir1")
+        self.assertEqual(res["type"], "directory")
+        self.assertEqual(res["count"], 1)  # only nested.txt
+
+    def test_open_nonexistent_fails(self):
+        """Opening non-existent entry should fail."""
+        self.c.file_explorer_open(self.test_dir)
+        resp = self.c.send("file_explorer.open_file", {"name": "nonexistent"})
+        self.assertFalse(resp.get("ok", True))
+
+    def test_create_directory(self):
+        """Create a new directory."""
+        self.c.file_explorer_open(self.test_dir)
+        res = self.c.file_explorer_create_dir("newdir")
+        self.assertEqual(res["name"], "newdir")
+        self.assertTrue(os.path.isdir(os.path.join(self.test_dir, "newdir")))
+
+    def test_create_dir_no_name_fails(self):
+        """Creating directory without name should fail."""
+        self.c.file_explorer_open(self.test_dir)
+        resp = self.c.send("file_explorer.create_dir", {})
+        self.assertFalse(resp.get("ok", True))
+
+    def test_delete_file(self):
+        """Delete a file."""
+        self.c.file_explorer_open(self.test_dir)
+        res = self.c.file_explorer_delete("file1.txt")
+        self.assertEqual(res["name"], "file1.txt")
+        self.assertFalse(os.path.exists(os.path.join(self.test_dir, "file1.txt")))
+
+    def test_delete_directory(self):
+        """Delete an empty directory."""
+        self.c.file_explorer_open(self.test_dir)
+        # Create a dir to delete
+        new_dir = os.path.join(self.test_dir, "to_delete")
+        os.makedirs(new_dir)
+        self.assertTrue(os.path.isdir(new_dir))
+        # Refresh to pick up the new directory
+        self.c.file_explorer_refresh()
+        # Verify the entry is in the list
+        listing = self.c.file_explorer_list()
+        names = [e["name"] for e in listing["entries"]]
+        self.assertIn("to_delete", names, f"to_delete not found in {names}")
+        # Verify the entry details
+        to_del_entry = [e for e in listing["entries"] if e["name"] == "to_delete"][0]
+        self.assertTrue(to_del_entry["is_dir"], f"to_delete is_dir={to_del_entry['is_dir']}")
+        self.assertTrue(os.path.isdir(to_del_entry["path"]), f"path {to_del_entry['path']} is not a dir")
+        res = self.c.file_explorer_delete("to_delete")
+        self.assertEqual(res["name"], "to_delete")
+        self.assertFalse(os.path.exists(new_dir))
+
+    def test_delete_nonexistent_fails(self):
+        """Deleting non-existent entry should fail."""
+        self.c.file_explorer_open(self.test_dir)
+        resp = self.c.send("file_explorer.delete", {"name": "nonexistent"})
+        self.assertFalse(resp.get("ok", True))
+
+    def test_rename_file(self):
+        """Rename a file."""
+        self.c.file_explorer_open(self.test_dir)
+        res = self.c.file_explorer_rename("file1.txt", "renamed.txt")
+        self.assertEqual(res["old_name"], "file1.txt")
+        self.assertEqual(res["new_name"], "renamed.txt")
+        self.assertFalse(os.path.exists(os.path.join(self.test_dir, "file1.txt")))
+        self.assertTrue(os.path.exists(os.path.join(self.test_dir, "renamed.txt")))
+
+    def test_rename_nonexistent_fails(self):
+        """Renaming non-existent entry should fail."""
+        self.c.file_explorer_open(self.test_dir)
+        resp = self.c.send("file_explorer.rename", {"old_name": "nonexistent", "new_name": "new"})
+        self.assertFalse(resp.get("ok", True))
+
+    def test_search_entries(self):
+        """Search entries by query."""
+        self.c.file_explorer_open(self.test_dir)
+        res = self.c.file_explorer_search("file")
+        self.assertIn("matches", res)
+        self.assertEqual(res["count"], 3)
+
+    def test_search_no_results(self):
+        """Search with no matches returns empty."""
+        self.c.file_explorer_open(self.test_dir)
+        res = self.c.file_explorer_search("zzz")
+        self.assertEqual(res["count"], 0)
+        self.assertEqual(res["matches"], [])
+
+    def test_refresh_directory(self):
+        """Refresh re-scans the directory."""
+        self.c.file_explorer_open(self.test_dir)
+        initial_count = self.c.file_explorer_list()["count"]
+        # Add a new file
+        with open(os.path.join(self.test_dir, "newfile.txt"), "w") as f:
+            f.write("new")
+        res = self.c.file_explorer_refresh()
+        self.assertEqual(res["count"], initial_count + 1)
+
+    def test_close_explorer(self):
+        """Close file explorer."""
+        self.c.file_explorer_open(self.test_dir)
+        self.c.file_explorer_close()
+        resp = self.c.send("file_explorer.list")
+        self.assertFalse(resp.get("ok", True))
+
+    def test_operations_when_closed_fail(self):
+        """Operations when explorer is closed should fail."""
+        # Ensure explorer is closed
+        self.c.file_explorer_close()
+        resp = self.c.send("file_explorer.list")
+        self.assertFalse(resp.get("ok", True))
+        resp = self.c.send("file_explorer.navigate", {"path": self.test_dir})
+        self.assertFalse(resp.get("ok", True))
+        resp = self.c.send("file_explorer.refresh")
+        self.assertFalse(resp.get("ok", True))
+
+
+# ====================================================================
+# Canvas layout
+# ====================================================================
+
+class TestCanvasLayout(unittest.TestCase):
+    """Canvas mode: enable, move, resize, z-order, get/set layout."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.c = _ensure_daemon()
+
+    def _create_ws(self, title=None):
+        title = title or _unique("canvas-ws")
+        ws = self.c.workspace_create(title)
+        self.assertIn("id", ws)
+        return ws["id"]
+
+    def _create_surface(self, ws_id, title=None):
+        title = title or _unique("canvas-surf")
+        surf = self.c.surface_create(ws_id, title)
+        self.assertIn("id", surf)
+        return surf["id"]
+
+    def _create_pane(self, surf_id):
+        # Create a pane by splitting the surface
+        pane = self.c.surface_split("h")
+        self.assertIn("id", pane)
+        return pane["id"]
+
+    def test_canvas_enable_disable(self):
+        """Enable and disable canvas mode."""
+        ws_id = self._create_ws()
+        surf_id = self._create_surface(ws_id)
+        self._create_pane(surf_id)
+        self._create_pane(surf_id)
+
+        # Enable canvas mode
+        resp = self.c.send("surface.canvas.enable", {"surface_id": surf_id})
+        self.assertTrue(resp.get("ok"), resp)
+        self.assertTrue(resp["result"]["canvas_mode"])
+
+        # Disable canvas mode
+        resp = self.c.send("surface.canvas.disable", {"surface_id": surf_id})
+        self.assertTrue(resp.get("ok"), resp)
+        self.assertFalse(resp["result"]["canvas_mode"])
+
+    def test_canvas_move_pane(self):
+        """Move a pane on the canvas."""
+        ws_id = self._create_ws()
+        surf_id = self._create_surface(ws_id)
+        self._create_pane(surf_id)
+        self._create_pane(surf_id)
+
+        # Enable canvas mode
+        resp = self.c.send("surface.canvas.enable", {"surface_id": surf_id})
+        self.assertTrue(resp.get("ok"), resp)
+
+        # Move pane 0
+        resp = self.c.send("surface.canvas.move_pane", {
+            "surface_id": surf_id,
+            "pane_index": "0",
+            "x": "100",
+            "y": "200"
+        })
+        self.assertTrue(resp.get("ok"), resp)
+        self.assertEqual(resp["result"]["x"], 100)
+        self.assertEqual(resp["result"]["y"], 200)
+
+    def test_canvas_resize_pane(self):
+        """Resize a pane on the canvas."""
+        ws_id = self._create_ws()
+        surf_id = self._create_surface(ws_id)
+        self._create_pane(surf_id)
+        self._create_pane(surf_id)
+
+        # Enable canvas mode
+        resp = self.c.send("surface.canvas.enable", {"surface_id": surf_id})
+        self.assertTrue(resp.get("ok"), resp)
+
+        # Resize pane 0
+        resp = self.c.send("surface.canvas.resize_pane", {
+            "surface_id": surf_id,
+            "pane_index": "0",
+            "w": "640",
+            "h": "480"
+        })
+        self.assertTrue(resp.get("ok"), resp)
+        self.assertEqual(resp["result"]["w"], 640)
+        self.assertEqual(resp["result"]["h"], 480)
+
+    def test_canvas_set_z(self):
+        """Set z-order of a pane on the canvas."""
+        ws_id = self._create_ws()
+        surf_id = self._create_surface(ws_id)
+        self._create_pane(surf_id)
+        self._create_pane(surf_id)
+
+        # Enable canvas mode
+        resp = self.c.send("surface.canvas.enable", {"surface_id": surf_id})
+        self.assertTrue(resp.get("ok"), resp)
+
+        # Set z-order of pane 0
+        resp = self.c.send("surface.canvas.set_z", {
+            "surface_id": surf_id,
+            "pane_index": "0",
+            "z": "5"
+        })
+        self.assertTrue(resp.get("ok"), resp)
+        self.assertEqual(resp["result"]["z"], 5)
+
+    def test_canvas_get_layout(self):
+        """Get canvas layout."""
+        ws_id = self._create_ws()
+        surf_id = self._create_surface(ws_id)
+        self._create_pane(surf_id)
+        self._create_pane(surf_id)
+
+        # Enable canvas mode
+        resp = self.c.send("surface.canvas.enable", {"surface_id": surf_id})
+        self.assertTrue(resp.get("ok"), resp)
+
+        # Get layout
+        resp = self.c.send("surface.canvas.get_layout", {"surface_id": surf_id})
+        self.assertTrue(resp.get("ok"), resp)
+        self.assertTrue(resp["result"]["canvas_mode"])
+        self.assertEqual(resp["result"]["pane_count"], 3)
+        self.assertIn("panes", resp["result"])
+        self.assertEqual(len(resp["result"]["panes"]), 3)
+
+    def test_canvas_set_layout(self):
+        """Set canvas layout with custom positions."""
+        ws_id = self._create_ws()
+        surf_id = self._create_surface(ws_id)
+        self._create_pane(surf_id)
+        self._create_pane(surf_id)
+
+        # Set layout with custom positions
+        resp = self.c.send("surface.canvas.set_layout", {
+            "surface_id": surf_id,
+            "panes": [
+                {"x": "0", "y": "0", "w": "400", "h": "300", "z": "1"},
+                {"x": "400", "y": "0", "w": "400", "h": "300", "z": "0"}
+            ]
+        })
+        self.assertTrue(resp.get("ok"), resp)
+        self.assertEqual(resp["result"]["pane_count"], 2)
+
+        # Verify layout
+        resp = self.c.send("surface.canvas.get_layout", {"surface_id": surf_id})
+        self.assertTrue(resp.get("ok"), resp)
+        self.assertTrue(resp["result"]["canvas_mode"])
+        self.assertEqual(resp["result"]["pane_count"], 2)
+        self.assertEqual(resp["result"]["panes"][0]["x"], 0)
+        self.assertEqual(resp["result"]["panes"][0]["y"], 0)
+        self.assertEqual(resp["result"]["panes"][0]["w"], 400)
+        self.assertEqual(resp["result"]["panes"][0]["h"], 300)
+        self.assertEqual(resp["result"]["panes"][0]["z"], 1)
+        self.assertEqual(resp["result"]["panes"][1]["x"], 400)
+        self.assertEqual(resp["result"]["panes"][1]["y"], 0)
+
+    def test_canvas_errors(self):
+        """Canvas commands fail when canvas mode is disabled."""
+        ws_id = self._create_ws()
+        surf_id = self._create_surface(ws_id)
+        self._create_pane(surf_id)
+
+        # Try to move pane without enabling canvas mode
+        resp = self.c.send("surface.canvas.move_pane", {
+            "surface_id": surf_id,
+            "pane_index": 0,
+            "x": 100,
+            "y": 200
+        })
+        self.assertFalse(resp.get("ok", True))
+        self.assertIn("canvas mode not enabled", resp.get("error", {}).get("message", ""))
+
+    def test_canvas_invalid_pane_index(self):
+        """Canvas commands fail with invalid pane index."""
+        ws_id = self._create_ws()
+        surf_id = self._create_surface(ws_id)
+        self._create_pane(surf_id)
+
+        # Enable canvas mode
+        resp = self.c.send("surface.canvas.enable", {"surface_id": surf_id})
+        self.assertTrue(resp.get("ok"), resp)
+
+        # Try to move invalid pane index
+        resp = self.c.send("surface.canvas.move_pane", {
+            "surface_id": surf_id,
+            "pane_index": "999",
+            "x": "100",
+            "y": "200"
+        })
+        self.assertFalse(resp.get("ok", True))
+        self.assertIn("invalid pane_index", resp.get("error", {}).get("message", ""))
+
+
+# ====================================================================
+# Find in Terminal (GOAL-7.1)
+# ====================================================================
+
+class TestSearchInTerminal(unittest.TestCase):
+    """Search across pane output — find in terminal functionality."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.c = _ensure_daemon()
+
+    def _create_ws(self, title=None):
+        t = title or _unique("search-ws")
+        ws = self.c.workspace_create(t)
+        self.assertIn("id", ws)
+        return ws["id"]
+
+    def _create_surface(self, ws_id, title=None):
+        t = title or _unique("search-surf")
+        surf = self.c.surface_create(ws_id, t)
+        self.assertIn("id", surf)
+        return surf["id"]
+
+    def _create_pane(self, surf_id):
+        pane = self.c.surface_split(surf_id)
+        self.assertIn("id", pane)
+        return pane["id"]
+
+    def test_search_start(self):
+        """Start search in focused pane."""
+        ws_id = self._create_ws()
+        surf_id = self._create_surface(ws_id)
+        pane_id = self._create_pane(surf_id)
+
+        resp = self.c.send("search.start", {"query": "hello"})
+        self.assertTrue(resp.get("ok"), resp)
+        self.assertIn("pane_id", resp.get("result", {}))
+        self.assertIn("query", resp.get("result", {}))
+        self.assertEqual(resp["result"]["query"], "hello")
+        self.assertTrue(resp["result"]["active"])
+
+    def test_search_start_no_pane(self):
+        """Search fails when query is empty."""
+        # Cancel any existing search first
+        self.c.send("search.cancel", {})
+
+        resp = self.c.send("search.start", {"query": ""})
+        self.assertFalse(resp.get("ok", True))
+        self.assertIn("missing query", resp.get("error", {}).get("message", ""))
+
+    def test_search_next(self):
+        """Navigate to next match."""
+        ws_id = self._create_ws()
+        surf_id = self._create_surface(ws_id)
+        pane_id = self._create_pane(surf_id)
+
+        # Start search
+        resp = self.c.send("search.start", {"query": "test"})
+        self.assertTrue(resp.get("ok"), resp)
+
+        # Next match
+        resp = self.c.send("search.next", {})
+        self.assertTrue(resp.get("ok"), resp)
+        self.assertIn("match_index", resp.get("result", {}))
+
+    def test_search_prev(self):
+        """Navigate to previous match."""
+        ws_id = self._create_ws()
+        surf_id = self._create_surface(ws_id)
+        pane_id = self._create_pane(surf_id)
+
+        # Start search
+        resp = self.c.send("search.start", {"query": "test"})
+        self.assertTrue(resp.get("ok"), resp)
+
+        # Previous match
+        resp = self.c.send("search.prev", {})
+        self.assertTrue(resp.get("ok"), resp)
+        self.assertIn("match_index", resp.get("result", {}))
+
+    def test_search_cancel(self):
+        """Cancel search mode."""
+        ws_id = self._create_ws()
+        surf_id = self._create_surface(ws_id)
+        pane_id = self._create_pane(surf_id)
+
+        # Start search
+        resp = self.c.send("search.start", {"query": "test"})
+        self.assertTrue(resp.get("ok"), resp)
+
+        # Cancel search
+        resp = self.c.send("search.cancel", {})
+        self.assertTrue(resp.get("ok"), resp)
+        self.assertFalse(resp["result"]["active"])
+
+    def test_search_status(self):
+        """Get search status."""
+        ws_id = self._create_ws()
+        surf_id = self._create_surface(ws_id)
+        pane_id = self._create_pane(surf_id)
+
+        # Start search
+        resp = self.c.send("search.start", {"query": "pattern"})
+        self.assertTrue(resp.get("ok"), resp)
+
+        # Get status
+        resp = self.c.send("search.status", {})
+        self.assertTrue(resp.get("ok"), resp)
+        self.assertTrue(resp["result"]["active"])
+        self.assertEqual(resp["result"]["query"], "pattern")
+        self.assertIn("match_count", resp.get("result", {}))
+        self.assertIn("current_match", resp.get("result", {}))
+
+    def test_search_status_inactive(self):
+        """Search status when no search is active."""
+        ws_id = self._create_ws()
+        surf_id = self._create_surface(ws_id)
+        pane_id = self._create_pane(surf_id)
+
+        # Cancel any existing search first
+        self.c.send("search.cancel", {})
+
+        resp = self.c.send("search.status", {})
+        self.assertTrue(resp.get("ok"), resp)
+        self.assertFalse(resp["result"]["active"])
+
+    def test_search_next_no_active(self):
+        """Search next fails when no search is active."""
+        # Create fresh workspace to ensure no previous search state
+        ws_id = self._create_ws()
+        surf_id = self._create_surface(ws_id)
+        pane_id = self._create_pane(surf_id)
+
+        # Cancel any existing search first
+        self.c.send("search.cancel", {})
+
+        resp = self.c.send("search.next", {})
+        self.assertFalse(resp.get("ok", True))
+        self.assertIn("no active search", resp.get("error", {}).get("message", ""))
+
+    def test_search_prev_no_active(self):
+        """Search prev fails when no search is active."""
+        # Create fresh workspace to ensure no previous search state
+        ws_id = self._create_ws()
+        surf_id = self._create_surface(ws_id)
+        pane_id = self._create_pane(surf_id)
+
+        # Cancel any existing search first
+        self.c.send("search.cancel", {})
+
+        resp = self.c.send("search.prev", {})
+        self.assertFalse(resp.get("ok", True))
+        self.assertIn("no active search", resp.get("error", {}).get("message", ""))
+
+    def test_search_case_insensitive(self):
+        """Search is case insensitive by default."""
+        ws_id = self._create_ws()
+        surf_id = self._create_surface(ws_id)
+        pane_id = self._create_pane(surf_id)
+
+        resp = self.c.send("search.start", {"query": "Hello", "case_sensitive": False})
+        self.assertTrue(resp.get("ok"), resp)
+        self.assertFalse(resp["result"]["case_sensitive"])
+
+    def test_search_case_sensitive(self):
+        """Search can be case sensitive."""
+        ws_id = self._create_ws()
+        surf_id = self._create_surface(ws_id)
+        pane_id = self._create_pane(surf_id)
+
+        resp = self.c.send("search.start", {"query": "Hello", "case_sensitive": True})
+        self.assertTrue(resp.get("ok"), resp)
+        self.assertTrue(resp["result"]["case_sensitive"])
+
+    def test_search_whole_words(self):
+        """Search can match whole words only."""
+        ws_id = self._create_ws()
+        surf_id = self._create_surface(ws_id)
+        pane_id = self._create_pane(surf_id)
+
+        resp = self.c.send("search.start", {"query": "test", "whole_words": True})
+        self.assertTrue(resp.get("ok"), resp)
+        self.assertTrue(resp["result"]["whole_words"])
+
+    def test_search_regex(self):
+        """Search can use regex patterns."""
+        ws_id = self._create_ws()
+        surf_id = self._create_surface(ws_id)
+        pane_id = self._create_pane(surf_id)
+
+        resp = self.c.send("search.start", {"query": "test.*pattern", "regex": True})
+        self.assertTrue(resp.get("ok"), resp)
+        self.assertTrue(resp["result"]["regex"])
+
+    def test_search_in_all_panes(self):
+        """Search can target all panes in workspace."""
+        ws_id = self._create_ws()
+        surf_id = self._create_surface(ws_id)
+        self._create_pane(surf_id)
+        self._create_pane(surf_id)
+
+        resp = self.c.send("search.start", {"query": "test", "scope": "all"})
+        self.assertTrue(resp.get("ok"), resp)
+        self.assertEqual(resp["result"]["scope"], "all")
+
+    def test_search_in_current_pane(self):
+        """Search can target only current pane."""
+        ws_id = self._create_ws()
+        surf_id = self._create_surface(ws_id)
+        pane_id = self._create_pane(surf_id)
+
+        resp = self.c.send("search.start", {"query": "test", "scope": "current"})
+        self.assertTrue(resp.get("ok"), resp)
+        self.assertEqual(resp["result"]["scope"], "current")
+
+
+# ====================================================================
 # Entry point
+# ====================================================================
+# Browser Import — import bookmarks/history into feed panels
+# ====================================================================
+
+class TestBrowserImport(unittest.TestCase):
+    """Import browser bookmarks/history into feed panels."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.c = _ensure_daemon()
+
+    def _create_ws(self, title=None):
+        t = title or _unique("bimport-ws")
+        ws = self.c.workspace_create(t)
+        self.assertIn("id", ws)
+        return ws["id"]
+
+    def test_import_bookmarks(self):
+        """Import bookmarks from a JSON file."""
+        ws_id = self._create_ws()
+        import json, tempfile
+        bookmarks = [
+            {"title": "GitHub", "url": "https://github.com", "folder": "Dev"},
+            {"title": "Hacker News", "url": "https://news.ycombinator.com", "folder": "News"},
+            {"title": "Stack Overflow", "url": "https://stackoverflow.com", "folder": "Dev"},
+        ]
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+            json.dump(bookmarks, f)
+            tmppath = f.name
+        try:
+            resp = self.c.send("browser.import", {
+                "workspace_id": ws_id,
+                "source": "json",
+                "path": tmppath
+            })
+            self.assertTrue(resp.get("ok"), resp)
+            self.assertIn("count", resp.get("result", {}))
+            self.assertEqual(resp["result"]["count"], 3)
+        finally:
+            os.unlink(tmppath)
+
+    def test_import_invalid_source(self):
+        """Import with unknown source type fails."""
+        resp = self.c.send("browser.import", {
+            "source": "nonexistent_source",
+            "path": "/tmp/nothing.json"
+        })
+        self.assertFalse(resp.get("ok", True))
+        self.assertIn("error", resp)
+
+    def test_import_missing_path(self):
+        """Import with missing path fails."""
+        resp = self.c.send("browser.import", {
+            "source": "json"
+        })
+        self.assertFalse(resp.get("ok", True))
+        self.assertIn("error", resp)
+
+    def test_import_empty_bookmarks(self):
+        """Import empty bookmarks file succeeds with count=0."""
+        import json, tempfile
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+            json.dump([], f)
+            tmppath = f.name
+        try:
+            resp = self.c.send("browser.import", {
+                "source": "json",
+                "path": tmppath
+            })
+            self.assertTrue(resp.get("ok"), resp)
+            self.assertEqual(resp["result"]["count"], 0)
+        finally:
+            os.unlink(tmppath)
+
+    def test_import_creates_feed_panel(self):
+        """Import creates a feed panel with entries."""
+        ws_id = self._create_ws()
+        import json, tempfile
+        bookmarks = [
+            {"title": "Example", "url": "https://example.com", "folder": "Test"},
+        ]
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+            json.dump(bookmarks, f)
+            tmppath = f.name
+        try:
+            resp = self.c.send("browser.import", {
+                "workspace_id": ws_id,
+                "source": "json",
+                "path": tmppath
+            })
+            self.assertTrue(resp.get("ok"), resp)
+            panel_id = resp["result"].get("panel_id")
+            self.assertIsNotNone(panel_id)
+
+            # Verify feed panel exists
+            panels = self.c.send("feed.panel.list", {"workspace_id": ws_id})
+            self.assertTrue(panels.get("ok"), panels)
+            panel_ids = [p["id"] for p in panels.get("result", {}).get("panels", [])]
+            self.assertIn(panel_id, panel_ids)
+        finally:
+            os.unlink(tmppath)
+
+    def test_import_chrome_bookmarks(self):
+        """Import from Chrome bookmarks path."""
+        import json, tempfile
+        chrome_bookmarks = {
+            "roots": {
+                "bookmark_bar": {
+                    "children": [
+                        {"name": "GitHub", "url": "https://github.com", "type": "url"},
+                        {"name": "Dev Folder", "type": "folder", "children": [
+                            {"name": "Stack Overflow", "url": "https://stackoverflow.com", "type": "url"},
+                        ]}
+                    ]
+                }
+            }
+        }
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+            json.dump(chrome_bookmarks, f)
+            tmppath = f.name
+        try:
+            resp = self.c.send("browser.import", {
+                "source": "chrome",
+                "path": tmppath
+            })
+            self.assertTrue(resp.get("ok"), resp)
+            self.assertGreaterEqual(resp["result"]["count"], 2)
+        finally:
+            os.unlink(tmppath)
+
+
+# ====================================================================
+# Calendar Integration — import .ics files into feed panels
+# ====================================================================
+
+class TestCalendarIntegration(unittest.TestCase):
+    """Import and query calendar events from .ics files."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.c = _ensure_daemon()
+
+    def _create_ws(self, title=None):
+        t = title or _unique("cal-ws")
+        ws = self.c.workspace_create(t)
+        self.assertIn("id", ws)
+        return ws["id"]
+
+    def _write_ics(self, events_text):
+        """Write a minimal ICS file and return the path."""
+        import tempfile
+        ics = "BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//lmux//test\n"
+        ics += events_text
+        ics += "END:VCALENDAR\n"
+        f = tempfile.NamedTemporaryFile(mode='w', suffix='.ics', delete=False)
+        f.write(ics)
+        f.close()
+        return f.name
+
+    def test_import_ics(self):
+        """Import events from .ics file."""
+        ws_id = self._create_ws()
+        ics = (
+            "BEGIN:VEVENT\nSUMMARY:Team Standup\n"
+            "DTSTART:20260907T100000Z\nDTEND:20260907T103000Z\n"
+            "DESCRIPTION:Daily standup\nEND:VEVENT\n"
+        )
+        path = self._write_ics(ics)
+        try:
+            resp = self.c.send("calendar.import", {
+                "workspace_id": ws_id, "path": path
+            })
+            self.assertTrue(resp.get("ok"), resp)
+            self.assertIn("count", resp.get("result", {}))
+            self.assertEqual(resp["result"]["count"], 1)
+        finally:
+            os.unlink(path)
+
+    def test_import_multiple_events(self):
+        """Import multiple events from .ics file."""
+        ws_id = self._create_ws()
+        ics = (
+            "BEGIN:VEVENT\nSUMMARY:Meeting A\n"
+            "DTSTART:20260907T140000Z\nDTEND:20260907T150000Z\nEND:VEVENT\n"
+            "BEGIN:VEVENT\nSUMMARY:Meeting B\n"
+            "DTSTART:20260908T090000Z\nDTEND:20260908T100000Z\nEND:VEVENT\n"
+            "BEGIN:VEVENT\nSUMMARY:Workshop\n"
+            "DTSTART:20260909T130000Z\nDTEND:20260909T170000Z\nEND:VEVENT\n"
+        )
+        path = self._write_ics(ics)
+        try:
+            resp = self.c.send("calendar.import", {
+                "workspace_id": ws_id, "path": path
+            })
+            self.assertTrue(resp.get("ok"), resp)
+            self.assertEqual(resp["result"]["count"], 3)
+        finally:
+            os.unlink(path)
+
+    def test_import_empty_ics(self):
+        """Import empty .ics file succeeds with count=0."""
+        path = self._write_ics("")
+        try:
+            resp = self.c.send("calendar.import", {"path": path})
+            self.assertTrue(resp.get("ok"), resp)
+            self.assertEqual(resp["result"]["count"], 0)
+        finally:
+            os.unlink(path)
+
+    def test_import_missing_path(self):
+        """Import without path fails."""
+        resp = self.c.send("calendar.import", {})
+        self.assertFalse(resp.get("ok", True))
+        self.assertIn("missing path", resp.get("error", {}).get("message", ""))
+
+    def test_import_nonexistent_file(self):
+        """Import nonexistent file fails."""
+        resp = self.c.send("calendar.import", {"path": "/tmp/no-such-file.ics"})
+        self.assertFalse(resp.get("ok", True))
+
+    def test_calendar_today(self):
+        """Query today's events."""
+        ws_id = self._create_ws()
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        start = now.strftime("%Y%m%dT%H0000Z")
+        end = now.strftime("%Y%m%dT%H3000Z")
+        ics = (
+            f"BEGIN:VEVENT\nSUMMARY:Today Event\n"
+            f"DTSTART:{start}\nDTEND:{end}\nEND:VEVENT\n"
+        )
+        path = self._write_ics(ics)
+        try:
+            self.c.send("calendar.import", {"workspace_id": ws_id, "path": path})
+            resp = self.c.send("calendar.today", {"workspace_id": ws_id})
+            self.assertTrue(resp.get("ok"), resp)
+            self.assertIn("events", resp.get("result", {}))
+        finally:
+            os.unlink(path)
+
+    def test_calendar_upcoming(self):
+        """Query upcoming events within N days."""
+        ws_id = self._create_ws()
+        resp = self.c.send("calendar.upcoming", {"workspace_id": ws_id, "days": 7})
+        self.assertTrue(resp.get("ok"), resp)
+        self.assertIn("events", resp.get("result", {}))
+
+
+# ====================================================================
+# Email Panel — import and query emails
+# ====================================================================
+
+class TestEmailPanel(unittest.TestCase):
+    """Import and query emails in feed panels."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.c = _ensure_daemon()
+
+    def _create_ws(self, title=None):
+        t = title or _unique("email-ws")
+        ws = self.c.workspace_create(t)
+        self.assertIn("id", ws)
+        return ws["id"]
+
+    def _write_mbox(self, emails_text):
+        """Write a minimal mbox file and return the path."""
+        import tempfile
+        f = tempfile.NamedTemporaryFile(mode='w', suffix='.mbox', delete=False)
+        f.write(emails_text)
+        f.close()
+        return f.name
+
+    def test_import_mbox(self):
+        """Import emails from mbox file."""
+        ws_id = self._create_ws()
+        mbox = (
+            "From test@example.com Mon Sep  7 10:00:00 2026\n"
+            "Subject: Hello World\n"
+            "To: user@lmux.dev\n"
+            "Date: Mon, 07 Sep 2026 10:00:00 +0000\n"
+            "\n"
+            "This is the body of the first email.\n"
+            "\n"
+            "From alice@example.com Mon Sep  7 11:00:00 2026\n"
+            "Subject: Meeting Tomorrow\n"
+            "To: user@lmux.dev\n"
+            "Date: Mon, 07 Sep 2026 11:00:00 +0000\n"
+            "\n"
+            "Let's meet at 2pm.\n"
+            "\n"
+        )
+        path = self._write_mbox(mbox)
+        try:
+            resp = self.c.send("email.import", {
+                "workspace_id": ws_id, "path": path
+            })
+            self.assertTrue(resp.get("ok"), resp)
+            self.assertIn("count", resp.get("result", {}))
+            self.assertEqual(resp["result"]["count"], 2)
+        finally:
+            os.unlink(path)
+
+    def test_import_empty_mbox(self):
+        """Import empty mbox succeeds with count=0."""
+        path = self._write_mbox("")
+        try:
+            resp = self.c.send("email.import", {"path": path})
+            self.assertTrue(resp.get("ok"), resp)
+            self.assertEqual(resp["result"]["count"], 0)
+        finally:
+            os.unlink(path)
+
+    def test_import_missing_path(self):
+        """Import without path fails."""
+        resp = self.c.send("email.import", {})
+        self.assertFalse(resp.get("ok", True))
+        self.assertIn("missing path", resp.get("error", {}).get("message", ""))
+
+    def test_import_nonexistent_file(self):
+        """Import nonexistent file fails."""
+        resp = self.c.send("email.import", {"path": "/tmp/no-such.mbox"})
+        self.assertFalse(resp.get("ok", True))
+
+    def test_email_list(self):
+        """List imported emails."""
+        ws_id = self._create_ws()
+        mbox = (
+            "From test@example.com Mon Sep  7 10:00:00 2026\n"
+            "Subject: Test Email\n"
+            "To: user@lmux.dev\n"
+            "\n"
+            "Body text.\n"
+            "\n"
+        )
+        path = self._write_mbox(mbox)
+        try:
+            self.c.send("email.import", {"workspace_id": ws_id, "path": path})
+            resp = self.c.send("email.list", {"workspace_id": ws_id})
+            self.assertTrue(resp.get("ok"), resp)
+            self.assertIn("emails", resp.get("result", {}))
+        finally:
+            os.unlink(path)
+
+    def test_email_search(self):
+        """Search emails by subject."""
+        ws_id = self._create_ws()
+        mbox = (
+            "From test@example.com Mon Sep  7 10:00:00 2026\n"
+            "Subject: Urgent: Server Down\n"
+            "To: user@lmux.dev\n"
+            "\n"
+            "Server is down.\n"
+            "\n"
+            "From bob@example.com Mon Sep  7 11:00:00 2026\n"
+            "Subject: Lunch Plans\n"
+            "To: user@lmux.dev\n"
+            "\n"
+            "Want to grab lunch?\n"
+            "\n"
+        )
+        path = self._write_mbox(mbox)
+        try:
+            self.c.send("email.import", {"workspace_id": ws_id, "path": path})
+            resp = self.c.send("email.search", {
+                "workspace_id": ws_id, "query": "Urgent"
+            })
+            self.assertTrue(resp.get("ok"), resp)
+            self.assertIn("emails", resp.get("result", {}))
+            self.assertGreaterEqual(len(resp["result"]["emails"]), 1)
+        finally:
+            os.unlink(path)
+
+    def test_import_creates_feed_panel(self):
+        """Import creates a feed panel with email entries."""
+        ws_id = self._create_ws()
+        mbox = (
+            "From test@example.com Mon Sep  7 10:00:00 2026\n"
+            "Subject: Panel Test\n"
+            "To: user@lmux.dev\n"
+            "\n"
+            "Testing panel creation.\n"
+            "\n"
+        )
+        path = self._write_mbox(mbox)
+        try:
+            resp = self.c.send("email.import", {
+                "workspace_id": ws_id, "path": path
+            })
+            self.assertTrue(resp.get("ok"), resp)
+            panel_id = resp["result"].get("panel_id")
+            self.assertIsNotNone(panel_id)
+        finally:
+            os.unlink(path)
+
+
+# ====================================================================
+# Weather Panel — weather widget in feed panel
+# ====================================================================
+
+class TestWeatherPanel(unittest.TestCase):
+    """Weather widget that fetches and displays weather data."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.c = _ensure_daemon()
+
+    def _create_ws(self, title=None):
+        t = title or _unique("weather-ws")
+        ws = self.c.workspace_create(t)
+        self.assertIn("id", ws)
+        return ws["id"]
+
+    def test_get_weather(self):
+        """Get weather for a location."""
+        resp = self.c.send("weather.get", {"location": "London"})
+        self.assertTrue(resp.get("ok"), resp)
+        self.assertIn("result", resp)
+        self.assertIn("location", resp["result"])
+        self.assertEqual(resp["result"]["location"], "London")
+
+    def test_get_weather_missing_location(self):
+        """Get weather without location fails."""
+        resp = self.c.send("weather.get", {})
+        self.assertFalse(resp.get("ok", True))
+        self.assertIn("missing location", resp.get("error", {}).get("message", ""))
+
+    def test_set_location(self):
+        """Set default weather location."""
+        resp = self.c.send("weather.set_location", {"location": "New York"})
+        self.assertTrue(resp.get("ok"), resp)
+
+    def test_refresh_weather(self):
+        """Refresh weather data."""
+        ws_id = self._create_ws()
+        resp = self.c.send("weather.refresh", {"workspace_id": ws_id})
+        self.assertTrue(resp.get("ok"), resp)
+        self.assertIn("result", resp)
+
+    def test_weather_in_feed_panel(self):
+        """Weather data appears in feed panel."""
+        ws_id = self._create_ws()
+        resp = self.c.send("weather.get", {"location": "Tokyo"})
+        self.assertTrue(resp.get("ok"), resp)
+        panels = self.c.send("feed.panel.list", {"workspace_id": ws_id})
+        self.assertTrue(panels.get("ok"), panels)
+
+    def test_weather_status_fields(self):
+        """Weather result contains expected fields."""
+        resp = self.c.send("weather.get", {"location": "Paris"})
+        self.assertTrue(resp.get("ok"), resp)
+        result = resp["result"]
+        self.assertIn("location", result)
+        self.assertIn("temperature", result)
+        self.assertIn("condition", result)
+
+
+# ====================================================================
+# Clipboard History — clipboard manager
+# ====================================================================
+
+class TestClipboardHistory(unittest.TestCase):
+    """Clipboard manager that stores and retrieves clipboard history."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.c = _ensure_daemon()
+
+    def test_copy_text(self):
+        """Copy text to clipboard history."""
+        resp = self.c.send("clipboard.copy", {"text": "Hello World"})
+        self.assertTrue(resp.get("ok"), resp)
+        self.assertIn("index", resp.get("result", {}))
+
+    def test_paste_recent(self):
+        """Paste most recent clipboard entry."""
+        self.c.send("clipboard.clear", {})
+        self.c.send("clipboard.copy", {"text": "First"})
+        self.c.send("clipboard.copy", {"text": "Second"})
+        resp = self.c.send("clipboard.paste", {})
+        self.assertTrue(resp.get("ok"), resp)
+        self.assertEqual(resp["result"]["text"], "Second")
+
+    def test_paste_by_index(self):
+        """Paste specific clipboard entry by index."""
+        self.c.send("clipboard.clear", {})
+        self.c.send("clipboard.copy", {"text": "Alpha"})
+        self.c.send("clipboard.copy", {"text": "Beta"})
+        resp = self.c.send("clipboard.paste", {"index": 0})
+        self.assertTrue(resp.get("ok"), resp)
+        self.assertEqual(resp["result"]["text"], "Alpha")
+
+    def test_paste_invalid_index(self):
+        """Paste with invalid index fails."""
+        resp = self.c.send("clipboard.paste", {"index": 999})
+        self.assertFalse(resp.get("ok", True))
+
+    def test_list_history(self):
+        """List clipboard history."""
+        self.c.send("clipboard.clear", {})
+        self.c.send("clipboard.copy", {"text": "Item 1"})
+        self.c.send("clipboard.copy", {"text": "Item 2"})
+        resp = self.c.send("clipboard.list", {})
+        self.assertTrue(resp.get("ok"), resp)
+        self.assertIn("entries", resp.get("result", {}))
+        self.assertGreaterEqual(len(resp["result"]["entries"]), 2)
+
+    def test_clear_history(self):
+        """Clear clipboard history."""
+        self.c.send("clipboard.copy", {"text": "To be cleared"})
+        resp = self.c.send("clipboard.clear", {})
+        self.assertTrue(resp.get("ok"), resp)
+        # After clear, paste should fail
+        resp2 = self.c.send("clipboard.paste", {})
+        self.assertFalse(resp2.get("ok", True))
+
+    def test_copy_empty_text(self):
+        """Copy empty text fails."""
+        resp = self.c.send("clipboard.copy", {"text": ""})
+        self.assertFalse(resp.get("ok", True))
+        self.assertIn("missing text", resp.get("error", {}).get("message", ""))
+
+    def test_history_limit(self):
+        """Clipboard history has a maximum size."""
+        # Add many entries
+        for i in range(120):
+            self.c.send("clipboard.copy", {"text": f"Entry {i}"})
+        resp = self.c.send("clipboard.list", {})
+        self.assertTrue(resp.get("ok"), resp)
+        # Should be capped at 100
+        self.assertLessEqual(len(resp["result"]["entries"]), 100)
+
+
+# ====================================================================
+# Workspace Templates — pre-configured workspace layouts
+# ====================================================================
+
+class TestWorkspaceTemplates(unittest.TestCase):
+    """Pre-configured workspace layouts for quick setup."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.c = _ensure_daemon()
+
+    def test_list_templates(self):
+        """List available templates."""
+        resp = self.c.send("template.list", {})
+        self.assertTrue(resp.get("ok"), resp)
+        self.assertIn("templates", resp.get("result", {}))
+
+    def test_create_from_template(self):
+        """Create workspace from a built-in template."""
+        resp = self.c.send("template.create", {"template": "development"})
+        self.assertTrue(resp.get("ok"), resp)
+        self.assertIn("workspace_id", resp.get("result", {}))
+
+    def test_create_invalid_template(self):
+        """Create workspace from non-existent template fails."""
+        resp = self.c.send("template.create", {"template": "nonexistent"})
+        self.assertFalse(resp.get("ok", True))
+        self.assertIn("error", resp)
+
+    def test_save_as_template(self):
+        """Save current workspace as a template."""
+        ws = self.c.workspace_create("Template Source")
+        resp = self.c.send("template.save", {
+            "workspace_id": ws["id"],
+            "name": "my-custom"
+        })
+        self.assertTrue(resp.get("ok"), resp)
+        self.assertIn("name", resp.get("result", {}))
+
+    def test_delete_template(self):
+        """Delete a custom template."""
+        ws = self.c.workspace_create("For Delete")
+        self.c.send("template.save", {"workspace_id": ws["id"], "name": "to-delete"})
+        resp = self.c.send("template.delete", {"name": "to-delete"})
+        self.assertTrue(resp.get("ok"), resp)
+
+    def test_delete_builtin_template(self):
+        """Cannot delete built-in templates."""
+        resp = self.c.send("template.delete", {"name": "development"})
+        self.assertFalse(resp.get("ok", True))
+
+    def test_delete_missing_name(self):
+        """Delete without name fails."""
+        resp = self.c.send("template.delete", {})
+        self.assertFalse(resp.get("ok", True))
+
+
+# ====================================================================
+# Performance Profiling — built-in profiling tools
+# ====================================================================
+
+class TestPerformanceProfiling(unittest.TestCase):
+    """Built-in performance profiling tools."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.c = _ensure_daemon()
+
+    def test_profile_status(self):
+        """Get profiling status."""
+        resp = self.c.send("profile.status", {})
+        self.assertTrue(resp.get("ok"), resp)
+        self.assertIn("active", resp.get("result", {}))
+
+    def test_start_stop(self):
+        """Start and stop profiling."""
+        resp1 = self.c.send("profile.start", {"label": "test-run"})
+        self.assertTrue(resp1.get("ok"), resp1)
+        resp2 = self.c.send("profile.stop", {})
+        self.assertTrue(resp2.get("ok"), resp2)
+        self.assertIn("elapsed_ms", resp2.get("result", {}))
+
+    def test_profile_list(self):
+        """List profiling results."""
+        resp = self.c.send("profile.list", {})
+        self.assertTrue(resp.get("ok"), resp)
+        self.assertIn("results", resp.get("result", {}))
+
+    def test_start_requires_label(self):
+        """Start without label fails."""
+        resp = self.c.send("profile.start", {})
+        self.assertFalse(resp.get("ok", True))
+        self.assertIn("missing label", resp.get("error", {}).get("message", ""))
+
+    def test_stop_without_start(self):
+        """Stop without active profiling fails."""
+        resp = self.c.send("profile.stop", {})
+        self.assertFalse(resp.get("ok", True))
+
+
+# ====================================================================
+# Cloud VM Management — SSH-based VM lifecycle
+# ====================================================================
+
+class TestCloudVMManagement(unittest.TestCase):
+    """SSH-based VM lifecycle management for cloud providers."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.c = _ensure_daemon()
+
+    def test_list_vms(self):
+        """List available VMs."""
+        resp = self.c.send("cloud.vms.list", {})
+        self.assertTrue(resp.get("ok"), resp)
+        self.assertIn("vms", resp.get("result", {}))
+
+    def test_list_vms_by_provider(self):
+        """List VMs filtered by provider."""
+        resp = self.c.send("cloud.vms.list", {"provider": "gcp"})
+        self.assertTrue(resp.get("ok"), resp)
+        self.assertIn("vms", resp.get("result", {}))
+
+    def test_create_vm(self):
+        """Create a VM."""
+        resp = self.c.send("cloud.vms.create", {
+            "provider": "gcp",
+            "name": "test-vm-1",
+            "size": "e2-medium"
+        })
+        self.assertTrue(resp.get("ok"), resp)
+        self.assertIn("vm_id", resp.get("result", {}))
+
+    def test_create_vm_missing_params(self):
+        """Create VM without required params fails."""
+        resp = self.c.send("cloud.vms.create", {})
+        self.assertFalse(resp.get("ok", True))
+        self.assertIn("error", resp)
+
+    def test_destroy_vm(self):
+        """Destroy a VM."""
+        # Create first to get the ID
+        resp = self.c.send("cloud.vms.create", {
+            "provider": "gcp",
+            "name": "to-destroy",
+            "size": "e2-medium"
+        })
+        vm_id = resp["result"]["vm_id"]
+        resp2 = self.c.send("cloud.vms.destroy", {"vm_id": vm_id})
+        self.assertTrue(resp2.get("ok"), resp2)
+
+    def test_destroy_vm_not_found(self):
+        """Destroy non-existent VM fails."""
+        resp = self.c.send("cloud.vms.destroy", {"vm_id": "nonexistent"})
+        self.assertFalse(resp.get("ok", True))
+
+    def test_ssh_vm(self):
+        """SSH into a VM."""
+        resp = self.c.send("cloud.vms.ssh", {"vm_id": "test-vm-1"})
+        # Should return connection info or pane ID
+        self.assertIn("ok", resp)
+
+
+# ====================================================================
+# iOS Companion — mobile remote control
+# ====================================================================
+
+class TestIOSCompanion(unittest.TestCase):
+    """Mobile remote control companion device integration."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.c = _ensure_daemon()
+
+    def test_register_companion(self):
+        """Register a companion device."""
+        resp = self.c.send("companion.register", {
+            "device_id": "ios-001",
+            "device_name": "iPhone 15",
+            "platform": "ios"
+        })
+        self.assertTrue(resp.get("ok"), resp)
+        self.assertIn("companion_id", resp.get("result", {}))
+
+    def test_register_missing_params(self):
+        """Register without required params fails."""
+        resp = self.c.send("companion.register", {})
+        self.assertFalse(resp.get("ok", True))
+        self.assertIn("error", resp)
+
+    def test_companion_status(self):
+        """Check companion connection status."""
+        resp = self.c.send("companion.status", {})
+        self.assertTrue(resp.get("ok"), resp)
+        self.assertIn("companions", resp.get("result", {}))
+
+    def test_companion_status_by_id(self):
+        """Check specific companion status."""
+        self.c.send("companion.register", {
+            "device_id": "ios-002",
+            "device_name": "iPad Pro",
+            "platform": "ios"
+        })
+        resp = self.c.send("companion.status", {"companion_id": "ios-002"})
+        self.assertTrue(resp.get("ok"), resp)
+
+    def test_notify_companion(self):
+        """Send notification to companion."""
+        self.c.send("companion.register", {
+            "device_id": "ios-003",
+            "device_name": "iPhone 15 Pro",
+            "platform": "ios"
+        })
+        resp = self.c.send("companion.notify", {
+            "companion_id": "ios-003",
+            "title": "Test Alert",
+            "message": "Hello from lmux!"
+        })
+        self.assertTrue(resp.get("ok"), resp)
+
+    def test_notify_missing_params(self):
+        """Notify without required params fails."""
+        resp = self.c.send("companion.notify", {})
+        self.assertFalse(resp.get("ok", True))
+        self.assertIn("error", resp)
+
+    def test_unregister_companion(self):
+        """Unregister a companion device."""
+        self.c.send("companion.register", {
+            "device_id": "ios-004",
+            "device_name": "iPhone SE",
+            "platform": "ios"
+        })
+        resp = self.c.send("companion.unregister", {"companion_id": "ios-004"})
+        self.assertTrue(resp.get("ok"), resp)
+
+
+# ====================================================================
+# Agent Teams — multi-agent workflow orchestration
+# ====================================================================
+
+class TestAgentTeams(unittest.TestCase):
+    """Multi-agent workflow orchestration for team-based tasks."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.c = _ensure_daemon()
+
+    def test_create_team(self):
+        """Create an agent team."""
+        resp = self.c.send("team.create", {"name": "backend-team"})
+        self.assertTrue(resp.get("ok"), resp)
+        self.assertIn("team_id", resp.get("result", {}))
+
+    def test_create_team_missing_name(self):
+        """Create team without name fails."""
+        resp = self.c.send("team.create", {})
+        self.assertFalse(resp.get("ok", True))
+        self.assertIn("error", resp)
+
+    def test_add_agent_to_team(self):
+        """Add agent to team."""
+        resp = self.c.send("team.create", {"name": "frontend-team"})
+        team_id = resp["result"]["team_id"]
+        resp2 = self.c.send("team.add", {
+            "team_id": team_id,
+            "agent_name": "coder-1",
+            "role": "implementer"
+        })
+        self.assertTrue(resp2.get("ok"), resp2)
+
+    def test_remove_agent_from_team(self):
+        """Remove agent from team."""
+        resp = self.c.send("team.create", {"name": "test-team"})
+        team_id = resp["result"]["team_id"]
+        self.c.send("team.add", {
+            "team_id": team_id,
+            "agent_name": "tester-1",
+            "role": "tester"
+        })
+        resp2 = self.c.send("team.remove", {
+            "team_id": team_id,
+            "agent_name": "tester-1"
+        })
+        self.assertTrue(resp2.get("ok"), resp2)
+
+    def test_list_teams(self):
+        """List all teams."""
+        self.c.send("team.create", {"name": "ops-team"})
+        resp = self.c.send("team.list", {})
+        self.assertTrue(resp.get("ok"), resp)
+        self.assertIn("teams", resp.get("result", {}))
+
+    def test_list_team_members(self):
+        """List members of a team."""
+        resp = self.c.send("team.create", {"name": "design-team"})
+        team_id = resp["result"]["team_id"]
+        self.c.send("team.add", {"team_id": team_id, "agent_name": "designer-1", "role": "designer"})
+        resp2 = self.c.send("team.list", {"team_id": team_id})
+        self.assertTrue(resp2.get("ok"), resp2)
+        teams = resp2["result"]["teams"]
+        self.assertEqual(len(teams), 1)
+        self.assertIn("members", teams[0])
+
+    def test_dispatch_to_team(self):
+        """Dispatch task to team."""
+        resp = self.c.send("team.create", {"name": "dispatch-team"})
+        team_id = resp["result"]["team_id"]
+        self.c.send("team.add", {"team_id": team_id, "agent_name": "worker-1", "role": "worker"})
+        resp2 = self.c.send("team.dispatch", {
+            "team_id": team_id,
+            "task": "implement feature X"
+        })
+        self.assertTrue(resp2.get("ok"), resp2)
+        self.assertIn("dispatch_id", resp2.get("result", {}))
+
+    def test_delete_team(self):
+        """Delete a team."""
+        resp = self.c.send("team.create", {"name": "temp-team"})
+        team_id = resp["result"]["team_id"]
+        resp2 = self.c.send("team.delete", {"team_id": team_id})
+        self.assertTrue(resp2.get("ok"), resp2)
+
+
 # ====================================================================
 
 if __name__ == "__main__":

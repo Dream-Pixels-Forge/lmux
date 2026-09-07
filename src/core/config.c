@@ -301,6 +301,11 @@ bool lmux_config_load_buf(lmux_config *cfg, const char *buf, size_t len) {
 
 bool lmux_config_load(lmux_config *cfg, const char *path) {
     if (!cfg || !path) return false;
+    /* Security: reject paths with traversal sequences */
+    if (strstr(path, "..")) {
+        lmux_log(LMUX_LOG_WARN, "config: rejected path with traversal: %s", path);
+        return false;
+    }
     FILE *f = fopen(path, "r");
     if (!f) return false; /* Not an error — simply no config yet */
     char buf[32768];

@@ -275,6 +275,213 @@ lmux/
 └── package.json       # Project metadata
 ```
 
+## Advanced Features
+
+### Tmux Compatibility
+
+Use familiar tmux commands with lmux:
+
+```bash
+# Create a new workspace
+lmux tmux new-session -s myproject
+
+# Split window
+lmux tmux split-window -h
+lmux tmux split-window -v
+
+# Select pane/window
+lmux tmux select-pane -t 1
+lmux tmux select-window -t 2
+
+# Send keys to a surface
+lmux tmux send-keys "ls -la" Enter
+
+# Rename session
+lmux tmux rename-session -t old-name new-name
+
+# List sessions/panes
+lmux tmux list-sessions
+lmux tmux list-panes
+
+# Close workspace
+lmux tmux kill-session -t myproject
+```
+
+### Copy Mode (Vi-style)
+
+Enter copy mode for text selection:
+
+```bash
+# Enter copy mode
+lmux pane.copy_mode.enter
+
+# Movement: h/j/k/l (left/down/up/right)
+# Word: w (next word), b (prev word)
+# Line: 0 (start), $ (end)
+# Document: gg (top), G (bottom)
+
+# Start visual selection
+lmux pane.copy_mode.select_start
+
+# End selection and yank
+lmux pane.copy_mode.select_end
+lmux pane.copy_mode.yank
+
+# Paste
+lmux pane.copy_mode.paste
+
+# Exit copy mode
+lmux pane.copy_mode.exit
+```
+
+### File Explorer
+
+Browse files within lmux:
+
+```bash
+# Open file explorer at path
+lmux file_explorer.open /path/to/dir
+
+# List entries
+lmux file_explorer.list
+
+# Navigate to subdirectory
+lmux file_explorer.navigate subdir
+
+# Filter by name
+lmux file_explorer.filter "test"
+
+# Sort by name/size/time
+lmux file_explorer.sort name
+
+# Create directory
+lmux file_explorer.create_dir mydir
+
+# Delete/rename
+lmux file_explorer.delete filename
+lmux file_explorer.rename oldname newname
+
+# Search
+lmux file_explorer.search "pattern"
+
+# Refresh
+lmux file_explorer.refresh
+
+# Close
+lmux file_explorer.close
+```
+
+### Canvas Layout
+
+Freeform pane positioning:
+
+```bash
+# Enable canvas mode
+lmux canvas.enable
+
+# Move pane to position
+lmux canvas.move_pane 0 100 200
+
+# Resize pane
+lmux canvas.resize_pane 0 800 600
+
+# Set z-order
+lmux canvas.set_z 0 5
+
+# Get layout
+lmux canvas.get_layout
+
+# Set full layout
+lmux canvas.set_layout '{"panes":[{"id":0,"x":0,"y":0,"w":800,"h":600,"z":1}]}'
+
+# Disable canvas mode
+lmux canvas.disable
+```
+
+### Multi-Window Support
+
+Create multiple windows for different workspaces:
+
+```bash
+# Create window
+lmux window.create "Dev Window"
+
+# List windows
+lmux window.list
+
+# Focus window
+lmux window.focus 1
+
+# Move workspace to window
+lmux window.move_workspace 1 2
+
+# Close window
+lmux window.close 1
+```
+
+### SSH PTY Sessions
+
+Persistent SSH sessions:
+
+```bash
+# Create SSH session
+lmux ssh.create user@host 22
+
+# List sessions
+lmux ssh.list
+
+# Attach session to pane
+lmux ssh.attach 1 0
+
+# Detach session
+lmux ssh.detach 1
+
+# Kill session
+lmux ssh.kill 1
+
+# Save/restore sessions
+lmux ssh.save /path/to/sessions.json
+lmux ssh.restore /path/to/sessions.json
+```
+
+### Agent Hibernation
+
+Automatic resource savings for idle agents:
+
+```bash
+# Agents auto-hibernate after 300s of inactivity
+# Resume automatically when workspace is focused
+
+# Manual hibernate/resume
+lmux agent.hibernate <agent_id>
+lmux agent.resume <agent_id>
+
+# Check hibernation status
+lmux agent.list
+```
+
+### Notifications
+
+Enhanced notification system:
+
+```bash
+# List notifications
+lmux notification.list
+
+# Mark as read
+lmux notification.mark_read <seq>
+
+# Clear all
+lmux notification.clear
+
+# Notification rings (visual indicators)
+lmux notification_ring.add <pane_id> "Waiting for input"
+lmux notification_ring.clear <pane_id>
+
+# Hooks (trigger actions on events)
+lmux notification_hook.add "agent.output" "" "notify-send"
+```
+
 ## Packaging
 
 ### Debian/Ubuntu

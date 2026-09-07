@@ -50,13 +50,27 @@ lmux applies the following hardening practices:
 - **Socket ownership verification** — The daemon refuses connections to
   sockets not owned by the current user, preventing impersonation.
   (`gui/daemon_client.py`)
+- **Rate limiting** — 1000 requests per 60 seconds per UID. When the
+  rate limit table is full, new UIDs are denied (fail-closed).
+  (`src/core/server.c`)
+- **Path traversal prevention** — All file paths from client commands
+  are validated against `..` sequences and absolute path escapes.
+  Affected: snapshot save/load, file explorer create/delete/rename,
+  SSH session save/restore, config load. (`src/core/model.c`)
 - **JSON input validation** — All JSON received over the socket is
   validated for structural integrity before parsing. (`src/core/config.c`)
+- **Structured error responses** — RFC 7807 format errors with no
+  stack traces or internal paths leaked to clients.
+- **CWD validation** — Shell injection prevention in workspace refresh
+  validates current working directory exists and is accessible.
+  (`src/core/model.c`)
 - **ASan / USan in CI** — Every pull request and nightly build compiles
   and runs the test suite with AddressSanitizer and UndefinedBehaviorSanitizer
   enabled. (`.github/workflows/ci.yml`)
 - **No hardcoded secrets** — Credentials and tokens are never stored in
   source. Auth fields are reserved for future use only.
+- **Atomic config writes** — Config files are written to a temporary file
+  then renamed, preventing corruption on crash. (`src/core/config.c`)
 
 ## Scope
 
