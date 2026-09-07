@@ -306,52 +306,6 @@ python3 tests/benchmarks.py
 
 ---
 
-## Development
-
-### Prerequisites
-
-- **C17** compiler (GCC or Clang)
-- **Node.js** 18+ (build scripts)
-- **Python 3** with PyGObject + VTE (GUI)
-- **meson** / ninja (optional native build)
-
-### Build scripts
-
-```bash
-node scripts/build-core.mjs          # Build core library
-node scripts/build-cli.mjs           # Build CLI binary
-node scripts/dev.mjs                 # Watch mode (auto-rebuild)
-node scripts/test.mjs                # Run tests
-node scripts/clean.mjs               # Clean artifacts
-node scripts/run.mjs                 # Build + run
-```
-
-### Directory structure
-
-```
-lmux/
-├── src/
-│   ├── core/              # C17 core library
-│   │   ├── model.c        # Workspace/surface/pane model
-│   │   ├── server.c       # UDS JSON server + auth
-│   │   ├── config.c       # Configuration loader
-│   │   └── osc.c          # OSC notification parser
-│   ├── cli/
-│   │   └── main.c         # CLI entry point
-│   └── browser.c          # Browser integration
-├── include/
-│   ├── lmux.h             # Public API
-│   └── lmux_browser.h     # Browser API
-├── gui/                   # Python GTK3/VTE GUI
-├── tests/                 # Test suite
-├── scripts/               # Build scripts
-├── packaging/             # Debian/AppImage packaging
-├── dev-notes/             # Development documentation
-└── .github/workflows/     # CI/CD (SBOM, signing, Trivy)
-```
-
----
-
 ## Comparison with cmux
 
 | Feature | cmux | lmux |
@@ -394,6 +348,8 @@ make install-deb
 # Build with musl for fully static binary
 node scripts/build-cli.mjs --static
 ```
+
+See [DEVELOPMENT.md](DEVELOPMENT.md) for build instructions, test commands, and architecture details.
 
 ---
 

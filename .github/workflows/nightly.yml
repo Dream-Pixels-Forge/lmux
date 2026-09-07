@@ -1,7 +1,7 @@
 name: Nightly Build
 on:
   push:
-    branches: [main]
+    branches: [master]
   schedule:
     - cron: '0 4 * * *'  # 4 AM UTC daily
 
