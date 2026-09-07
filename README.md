@@ -2,137 +2,54 @@
   <img src="assets/banner.png" alt="lmux banner" width="100%">
 </p>
 
-# lmux — Terminal Multiplexer
+<h1 align="center">lmux</h1>
 
-**lmux** is a modern terminal multiplexer with a client-server architecture over Unix domain sockets. It combines a lightweight C core daemon with a GTK3/VTE graphical frontend, supporting SSH workspaces, AI agent integration, and OSC terminal notifications.
+<p align="center">
+  <strong>Terminal multiplexer for AI coding agents — Linux-native, enterprise-grade</strong>
+</p>
+
+<p align="center">
+  <a href="https://github.com/Dream-Pixels-Forge/lmux/releases/tag/v1.0.0-beta.1"><img src="https://img.shields.io/badge/release-v1.0.0--beta.1-blue" alt="Release"></a>
+  <img src="https://img.shields.io/badge/tests-217%20passing-brightgreen" alt="Tests">
+  <img src="https://img.shields.io/badge/core-C17-orange" alt="Core">
+  <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
+</p>
+
+---
+
+## What is lmux?
+
+lmux is a modern terminal multiplexer designed for running multiple AI coding agents in parallel. It combines a **C17 core daemon** with a **GTK3/VTE GUI**, communicating over Unix domain sockets with a JSON wire protocol.
+
+**Key advantages:**
+- **Linux-native** — cross-platform C core (cmux is macOS-only)
+- **Enterprise security** — path traversal prevention, rate limiting, TOCTOU protection
+- **Agent-optimized** — hibernation, teams, cloud VMs, clipboard history
+- **Tmux-compatible** — familiar commands work out of the box
+- **Embeddable** — `liblmux_core.a` static library
+
+---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────┐
-│  lmux (CLI)        lmux-gui (Python)    │
-│  C binary           GTK3/VTE GUI        │
-└────────┬────────────────────┬───────────┘
-         │ Unix domain socket │ (JSON)
-         ▼                    ▼
-┌─────────────────────────────────────────┐
-│  lmuxd (Core Daemon)                    │
-│  liblmux_core.a — C17 static library    │
-│    ├── model.c  — workspace/surface/    │
-│    │              pane lifecycle         │
-│    ├── server.c — UDS JSON server       │
-│    ├── config.c — configuration loader  │
-│    └── osc.c    — OSC notification      │
-│                  parser                 │
-└─────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────┐
+│  lmux (CLI)              lmux-gui (Python GTK3/VTE)  │
+│  C binary                 GUI frontend               │
+└────────┬───────────────────────────┬─────────────────┘
+         │ Unix domain socket (JSON) │
+         ▼                           ▼
+┌──────────────────────────────────────────────────────┐
+│  lmuxd — Core Daemon                                 │
+│  liblmux_core.a (C17 static library)                 │
+│    ├── model.c   — workspace/surface/pane lifecycle  │
+│    ├── server.c  — UDS JSON server + auth            │
+│    ├── config.c  — configuration loader              │
+│    └── osc.c     — OSC notification parser           │
+└──────────────────────────────────────────────────────┘
 ```
 
-### Key design decisions
-
-- **No external JSON library** — all JSON is assembled with `snprintf` to keep dependencies minimal
-- **Client-server over UDS** — single daemon process manages all sessions, clients connect via Unix domain sockets
-- **JSON wire protocol** — commands and events are JSON messages over a newline-delimited stream
-- **Static library core** — `liblmux_core.a` can be embedded in other tools
-
-## Quick Start
-
-### Build from source
-
-```bash
-# Install dependencies (Debian/Ubuntu)
-sudo apt install build-essential python3 python3-gi gir1.2-vte-2.91
-
-# Build the core library
-node scripts/build-core.mjs
-
-# Build the CLI binary
-node scripts/build-cli.mjs
-
-# Build both with one command
-node scripts/run.mjs
-```
-
-### CLI usage
-
-```bash
-# Show version
-./build/lmux version
-
-# List workspaces
-./build/lmux workspace list
-
-# Create a workspace
-./build/lmux workspace create
-
-# Show available commands
-./build/lmux help
-
-# Daemon mode (background)
-./build/lmux daemon --detach
-
-# Daemon mode (foreground)
-./build/lmux daemon
-```
-
-### GUI usage
-
-```bash
-# Run the GUI (requires GTK3 + VTE)
-./build/lmux-gui
-```
-
-Or via Python directly:
-```bash
-python3 gui/main.py
-```
-
-## GPU Rendering (GTK4)
-
-lmux has an experimental GTK4 frontend with GPU-accelerated rendering. GTK4 renders through GSK (Gtk Scene Graph) which uses OpenGL/Vulkan by default, giving hardware-accelerated terminal rendering.
-
-### Install GTK4 dependencies
-
-```bash
-# Ubuntu/Debian
-sudo apt install gir1.2-gtk-4.0 gir1.2-vte-2.91
-
-# Fedora
-sudo dnf install gtk4 vte291-gtk4
-
-# Arch
-sudo pacman -S gtk4 vte4
-```
-
-### Run with GPU rendering
-
-```bash
-# Auto-detect GPU backend
-./scripts/launch-gtk4.sh
-
-# Force OpenGL
-./scripts/launch-gtk4.sh --opengl
-
-# Force Vulkan
-./scripts/launch-gtk4.sh --vulkan
-
-# Software fallback
-./scripts/launch-gtk4.sh --software
-
-# Or directly
-GSK_RENDERER=opengl python3 gui/gtk4/main.py
-```
-
-### GTK4 vs GTK3
-
-| Feature | GTK3 | GTK4 |
-|---------|------|------|
-| Rendering | CPU (Cairo/Pango) | GPU (GSK OpenGL/Vulkan) |
-| Terminal | VTE 2.91 (CPU) | VTE 4.1 (GPU via GSK) |
-| Compositing | Window manager | Built-in compositor |
-| Input | X11/Wayland separate | Wayland-native |
-| Animations | Manual | Automatic (GSK) |
-
-## Workspace Model
+### Workspace Model
 
 ```
 lmuxd
@@ -148,34 +65,146 @@ lmuxd
  └── ...
 ```
 
-- **Workspace** — a named collection of surfaces
-- **Surface** — a tab within a workspace, containing one or more panes
-- **Pane** — a terminal session (local shell or SSH)
+- **Workspace** — named collection of surfaces
+- **Surface** — tab within a workspace, containing one or more panes
+- **Pane** — terminal session (local shell or SSH)
+
+---
+
+## Quick Start
+
+### Build from source
+
+```bash
+# Install dependencies (Debian/Ubuntu)
+sudo apt install build-essential python3 python3-gi gir1.2-vte-2.91 nodejs
+
+# Build everything
+node scripts/run.mjs
+```
+
+### CLI usage
+
+```bash
+# Start daemon
+./build/lmux daemon --detach
+
+# Create a workspace
+./build/lmux workspace create --name "my-project"
+
+# List workspaces
+./build/lmux workspace list
+
+# Show all commands
+./build/lmux help
+```
+
+### GUI usage
+
+```bash
+# Requires GTK3 + VTE
+python3 gui/main.py
+```
+
+### Install (Debian/Ubuntu)
+
+```bash
+# Build + install in one step
+make install-deb
+
+# Or build AppImage
+./packaging/build-appimage.sh
+```
+
+---
+
+## Features
+
+### Core
+
+| Feature | Commands |
+|---------|----------|
+| **Workspace management** | `workspace.create`, `workspace.list`, `workspace.close`, `workspace.select`, `workspace.rename` |
+| **Surface (tabs)** | `surface.create`, `surface.list`, `surface.close`, `surface.focus` |
+| **Pane splits** | `surface.split`, `pane.focus`, `pane.close` |
+| **Multi-window** | `window.create`, `window.list`, `window.close`, `window.focus`, `window.move_workspace` |
+
+### Agent Features
+
+| Feature | Commands |
+|---------|----------|
+| **Agent hibernation** | Auto-hibernate after 300s idle; `agent.hibernate`, `agent.resume`, `agent.list` |
+| **Agent teams** | `team.create`, `team.add`, `team.remove`, `team.list`, `team.dispatch`, `team.delete` |
+| **Cloud VMs** | `cloud_vm.list`, `cloud_vm.create`, `cloud_vm.destroy`, `cloud_vm.ssh` |
+| **iOS companion** | `ios.register`, `ios.status`, `ios.notify`, `ios.unregister` |
+
+### Productivity
+
+| Feature | Commands |
+|---------|----------|
+| **Tmux compatibility** | `tmux.new-session`, `tmux.split-window`, `tmux.select-pane`, `tmux.send-keys`, etc. |
+| **Copy mode (vi)** | `pane.copy_mode.enter/exit`, `h/j/k/l/w/b/0/$/gg/G`, `select_start/end`, `yank`, `paste` |
+| **File explorer** | `file_explorer.open/list/navigate/filter/sort/create_dir/delete/rename/search` |
+| **Canvas layout** | `canvas.enable/disable/move_pane/resize_pane/set_z/get_layout/set_layout` |
+| **Find in terminal** | `search.start`, `search.next`, `search.prev`, `search.cancel`, `search.status` |
+| **Clipboard history** | `clipboard.copy`, `clipboard.paste`, `clipboard.list`, `clipboard.clear` |
+| **Workspace templates** | `template.list`, `template.create`, `template.save`, `template.delete` |
+
+### Information Panels
+
+| Feature | Commands |
+|---------|----------|
+| **Feed panel** | `feed.create`, `feed.list`, `feed.close`, `feed.entry_add/list` |
+| **Calendar** | `calendar.import`, `calendar.today`, `calendar.upcoming` |
+| **Email** | `email.import`, `email.list`, `email.search` |
+| **Weather** | `weather.get`, `weather.set_location`, `weather.refresh` |
+| **Performance profiling** | `profile.status`, `profile.start`, `profile.stop`, `profile.list` |
+
+### Notifications
+
+| Feature | Commands |
+|---------|----------|
+| **OSC notifications** | Automatic terminal bell detection |
+| **Visual rings** | `notification_ring.add`, `notification_ring.clear` |
+| **Event hooks** | `notification_hook.add` — trigger commands on events |
+
+---
+
+## Security
+
+lmux applies defense-in-depth hardening:
+
+| Measure | Description |
+|---------|-------------|
+| **Socket authentication** | `SO_PEERCRED` UID verification — only owner can connect |
+| **Socket permissions** | `chmod(0600)` — owner-only access |
+| **Rate limiting** | 1000 req/60s per UID, fail-closed on table full |
+| **Path traversal prevention** | All file paths validated against `..` sequences |
+| **TOCTOU protection** | Bind-first pattern with stale socket detection |
+| **Input validation** | JSON structure validated before dispatch |
+| **Structured errors** | RFC 7807 format, no stack traces leaked |
+| **CWD validation** | Shell injection prevention in workspace refresh |
+| **Atomic writes** | Config files use write-to-temp + rename |
+| **Structured logging** | JSON logging via `LMUX_LOG_JSON=1` |
+
+See [SECURITY.md](SECURITY.md) for the full security policy.
+
+---
 
 ## Configuration
 
-lmux reads configuration from `~/.config/lmux/config.json`. The config supports:
-
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `font_family` | string | `monospace` | Terminal font family |
-| `font_size` | int | `12` | Terminal font size |
-| `theme` | string | `"dark"` | Color theme (`"dark"` or `"light"`) |
-| `default_shell` | string | system SHELL | Default shell for new panes |
-| `agent_claude_code` | string | `""` | Path to Claude Code binary |
-| `agent_opencode` | string | `""` | Path to OpenCode binary |
-| `agent_codex` | string | `""` | Path to Codex CLI binary |
-| `agent_aider` | string | `""` | Path to Aider binary |
-| `agent_goose` | string | `""` | Path to Goose binary |
-| `auto_save_session` | bool | `true` | Save/restore sessions automatically |
-
-### Workspace groups
+lmux reads configuration from `~/.config/lmux/config.json`:
 
 ```json
 {
+  "font_family": "Fira Code",
+  "font_size": 14,
+  "theme": "dark",
+  "default_shell": "/bin/zsh",
+  "auto_save_session": true,
   "groups": {
-    "dev": ["ws-1", "ws-2"],
-    "ops": ["ws-3"]
+    "dev": ["workspace-1", "workspace-2"],
+    "ops": ["workspace-3"]
   },
   "keybindings": {
     "split-v": "C-b %",
@@ -184,24 +213,36 @@ lmux reads configuration from `~/.config/lmux/config.json`. The config supports:
 }
 ```
 
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `font_family` | string | `monospace` | Terminal font |
+| `font_size` | int | `12` | Font size |
+| `theme` | string | `"dark"` | `"dark"` or `"light"` |
+| `default_shell` | string | system `$SHELL` | Shell for new panes |
+| `auto_save_session` | bool | `true` | Auto-save/restore sessions |
+
+---
+
 ## CLI Commands
 
 | Command | Description |
 |---------|-------------|
-| `version` | Print version and exit |
+| `version` | Print version |
 | `help` | Show available commands |
-| `workspace list` | List all workspaces |
-| `workspace create [--name <name>]` | Create new workspace |
-| `workspace close <id>` | Close a workspace |
-| `surface create <workspace_id>` | Create new surface in workspace |
-| `surface list <workspace_id>` | List surfaces in workspace |
-| `surface close <workspace_id> <surface_id>` | Close a surface |
-| `pane create <workspace_id> <surface_id>` | Create new pane |
-| `pane list <workspace_id> <surface_id>` | List panes in workspace |
-| `pane close <workspace_id> <surface_id> <pane_id>` | Close a pane |
-| `notification list` | List pending notifications |
-| `notification clear <id>` | Clear a notification |
 | `daemon` | Run in daemon mode |
+| `daemon --detach` | Run daemon in background |
+| `workspace list` | List all workspaces |
+| `workspace create [--name <name>]` | Create workspace |
+| `workspace close <id>` | Close workspace |
+| `workspace select <id>` | Switch to workspace |
+| `workspace rename <id> <name>` | Rename workspace |
+| `surface create <workspace_id>` | Create surface (tab) |
+| `surface split <ws_id> <surf_id> [h\|v]` | Split pane |
+| `pane.create` | Create pane |
+| `notification list` | List notifications |
+| `notification clear` | Clear all |
+
+---
 
 ## GUI Keyboard Shortcuts
 
@@ -213,34 +254,76 @@ lmux reads configuration from `~/.config/lmux/config.json`. The config supports:
 | `Ctrl+Shift+=` | Split pane horizontal |
 | `Ctrl+Shift+N` | New workspace |
 | `Ctrl+Shift+Q` | Quit |
-| `Ctrl+Shift+Up/Down` | Focus prev/next pane |
-| `Ctrl+Shift+Left/Right` | Focus prev/next pane |
-| `Ctrl+Shift+Alt+Up/Down` | Focus prev/next pane |
+| `Ctrl+Shift+Arrow` | Focus prev/next pane |
+
+---
+
+## GPU Rendering (Experimental)
+
+lmux has an experimental GTK4 frontend with GPU-accelerated rendering:
+
+```bash
+# Auto-detect GPU backend
+./scripts/launch-gtk4.sh
+
+# Force specific renderer
+GSK_RENDERER=opengl python3 gui/gtk4/main.py
+GSK_RENDERER=vulkan python3 gui/gtk4/main.py
+```
+
+| Feature | GTK3 | GTK4 |
+|---------|------|------|
+| Rendering | CPU (Cairo) | GPU (OpenGL/Vulkan) |
+| Compositing | Window manager | Built-in |
+| Animations | Manual | Automatic (GSK) |
+
+---
+
+## Testing
+
+```bash
+# Run all tests
+make test
+
+# Run C unit tests only
+node scripts/test.mjs --unit
+
+# Run integration tests only
+python3 tests/test_integration.py -v
+
+# Run fuzz tests
+./tests/fuzz_json
+
+# Run benchmarks
+python3 tests/benchmarks.py
+```
+
+**Test results:**
+- 217 integration tests (Python)
+- 37 C unit tests
+- 20K+ fuzz iterations
+- Performance benchmarks (p99 < 50ms)
+
+---
 
 ## Development
 
 ### Prerequisites
 
-- **C17** compiler (GCC, Clang)
-- **Node.js** 18+ (for build scripts)
-- **Python 3** with PyGObject + VTE (for GUI)
-- **meson** / ninja (optional, for native build)
+- **C17** compiler (GCC or Clang)
+- **Node.js** 18+ (build scripts)
+- **Python 3** with PyGObject + VTE (GUI)
+- **meson** / ninja (optional native build)
 
 ### Build scripts
 
 ```bash
-# Debug build
-node scripts/build-core.mjs --debug
-node scripts/build-cli.mjs --debug
-
-# Watch mode (auto-rebuild on source changes)
-node scripts/dev.mjs
-
-# Clean build artifacts
-node scripts/clean.mjs
-
-# Run tests
-node scripts/test.mjs
+node scripts/build-core.mjs          # Build core library
+node scripts/build-cli.mjs           # Build CLI binary
+node scripts/dev.mjs                 # Watch mode (auto-rebuild)
+node scripts/test.mjs                # Run tests
+node scripts/clean.mjs               # Clean artifacts
+node scripts/run.mjs                 # Build + run
 ```
 
 ### Directory structure
@@ -248,260 +331,84 @@ node scripts/test.mjs
 ```
 lmux/
 ├── src/
-│   ├── core/          # C17 core library
-│   │   ├── model.c    # Workspace/surface/pane model
-│   │   ├── server.c   # UDS JSON server
-│   │   ├── config.c   # Configuration loader
-│   │   └── osc.c      # OSC notification parser
-│   └── cli/
-│        └── main.c    # CLI entry point + daemon mode
+│   ├── core/              # C17 core library
+│   │   ├── model.c        # Workspace/surface/pane model
+│   │   ├── server.c       # UDS JSON server + auth
+│   │   ├── config.c       # Configuration loader
+│   │   └── osc.c          # OSC notification parser
+│   ├── cli/
+│   │   └── main.c         # CLI entry point
+│   └── browser.c          # Browser integration
 ├── include/
-│   └── lmux.h         # Public API header
-├── gui/
-│   ├── main.py        # GTK window entry
-│   ├── daemon_client.py # UDS socket client
-│   ├── terminal.py    # VTE terminal widget
-│   ├── panes.py       # Tiled pane manager
-│   └── sidebar.py     # Workspace sidebar
-├── scripts/
-│   ├── build-core.mjs # Core C build
-│   ├── build-cli.mjs  # CLI C build
-│   ├── dev.mjs        # Watch-mode rebuild
-│   ├── run.mjs        # Build + run
-│   ├── test.mjs       # Test runner
-│   └── clean.mjs      # Clean artifacts
-├── tests/             # Test directory
-├── ARCHITECTURE.md    # Architecture documentation
-└── package.json       # Project metadata
+│   ├── lmux.h             # Public API
+│   └── lmux_browser.h     # Browser API
+├── gui/                   # Python GTK3/VTE GUI
+├── tests/                 # Test suite
+├── scripts/               # Build scripts
+├── packaging/             # Debian/AppImage packaging
+├── dev-notes/             # Development documentation
+└── .github/workflows/     # CI/CD (SBOM, signing, Trivy)
 ```
 
-## Advanced Features
-
-### Tmux Compatibility
-
-Use familiar tmux commands with lmux:
-
-```bash
-# Create a new workspace
-lmux tmux new-session -s myproject
-
-# Split window
-lmux tmux split-window -h
-lmux tmux split-window -v
-
-# Select pane/window
-lmux tmux select-pane -t 1
-lmux tmux select-window -t 2
-
-# Send keys to a surface
-lmux tmux send-keys "ls -la" Enter
-
-# Rename session
-lmux tmux rename-session -t old-name new-name
-
-# List sessions/panes
-lmux tmux list-sessions
-lmux tmux list-panes
-
-# Close workspace
-lmux tmux kill-session -t myproject
-```
-
-### Copy Mode (Vi-style)
-
-Enter copy mode for text selection:
-
-```bash
-# Enter copy mode
-lmux pane.copy_mode.enter
-
-# Movement: h/j/k/l (left/down/up/right)
-# Word: w (next word), b (prev word)
-# Line: 0 (start), $ (end)
-# Document: gg (top), G (bottom)
-
-# Start visual selection
-lmux pane.copy_mode.select_start
-
-# End selection and yank
-lmux pane.copy_mode.select_end
-lmux pane.copy_mode.yank
-
-# Paste
-lmux pane.copy_mode.paste
-
-# Exit copy mode
-lmux pane.copy_mode.exit
-```
-
-### File Explorer
-
-Browse files within lmux:
-
-```bash
-# Open file explorer at path
-lmux file_explorer.open /path/to/dir
-
-# List entries
-lmux file_explorer.list
-
-# Navigate to subdirectory
-lmux file_explorer.navigate subdir
-
-# Filter by name
-lmux file_explorer.filter "test"
-
-# Sort by name/size/time
-lmux file_explorer.sort name
-
-# Create directory
-lmux file_explorer.create_dir mydir
-
-# Delete/rename
-lmux file_explorer.delete filename
-lmux file_explorer.rename oldname newname
-
-# Search
-lmux file_explorer.search "pattern"
-
-# Refresh
-lmux file_explorer.refresh
-
-# Close
-lmux file_explorer.close
-```
-
-### Canvas Layout
-
-Freeform pane positioning:
-
-```bash
-# Enable canvas mode
-lmux canvas.enable
-
-# Move pane to position
-lmux canvas.move_pane 0 100 200
-
-# Resize pane
-lmux canvas.resize_pane 0 800 600
-
-# Set z-order
-lmux canvas.set_z 0 5
-
-# Get layout
-lmux canvas.get_layout
-
-# Set full layout
-lmux canvas.set_layout '{"panes":[{"id":0,"x":0,"y":0,"w":800,"h":600,"z":1}]}'
-
-# Disable canvas mode
-lmux canvas.disable
-```
-
-### Multi-Window Support
-
-Create multiple windows for different workspaces:
-
-```bash
-# Create window
-lmux window.create "Dev Window"
-
-# List windows
-lmux window.list
-
-# Focus window
-lmux window.focus 1
-
-# Move workspace to window
-lmux window.move_workspace 1 2
-
-# Close window
-lmux window.close 1
-```
-
-### SSH PTY Sessions
-
-Persistent SSH sessions:
-
-```bash
-# Create SSH session
-lmux ssh.create user@host 22
-
-# List sessions
-lmux ssh.list
-
-# Attach session to pane
-lmux ssh.attach 1 0
-
-# Detach session
-lmux ssh.detach 1
-
-# Kill session
-lmux ssh.kill 1
-
-# Save/restore sessions
-lmux ssh.save /path/to/sessions.json
-lmux ssh.restore /path/to/sessions.json
-```
-
-### Agent Hibernation
-
-Automatic resource savings for idle agents:
-
-```bash
-# Agents auto-hibernate after 300s of inactivity
-# Resume automatically when workspace is focused
-
-# Manual hibernate/resume
-lmux agent.hibernate <agent_id>
-lmux agent.resume <agent_id>
-
-# Check hibernation status
-lmux agent.list
-```
-
-### Notifications
-
-Enhanced notification system:
-
-```bash
-# List notifications
-lmux notification.list
-
-# Mark as read
-lmux notification.mark_read <seq>
-
-# Clear all
-lmux notification.clear
-
-# Notification rings (visual indicators)
-lmux notification_ring.add <pane_id> "Waiting for input"
-lmux notification_ring.clear <pane_id>
-
-# Hooks (trigger actions on events)
-lmux notification_hook.add "agent.output" "" "notify-send"
-```
+---
+
+## Comparison with cmux
+
+| Feature | cmux | lmux |
+|---------|------|------|
+| **Platform** | macOS only | Linux (cross-platform core) |
+| **Core** | Swift/Ghostty | C17 static library |
+| **Security** | Basic auth | Rate limiting, path traversal, TOCTOU |
+| **Agent teams** | No | Yes (create/add/dispatch/delete) |
+| **Cloud VMs** | No | Yes (list/create/destroy/ssh) |
+| **Clipboard history** | No | Yes |
+| **Workspace templates** | No | Yes |
+| **Performance profiling** | No | Yes |
+| **Tmux compat** | Partial | Full (10 commands) |
+| **Tests** | ~100 | 217+ |
+| **Supply chain** | None | SBOM + signing + Trivy |
+
+See [dev-notes/COMPARISON.md](dev-notes/COMPARISON.md) for detailed analysis.
+
+---
 
 ## Packaging
 
 ### Debian/Ubuntu
 
 ```bash
-# Build + install in one step (auto-resolves deps, no _apt sandbox warning):
 make install-deb
-
-# Or build only (produces dist/deb/lmux_<version>_amd64.deb):
-# ./packaging/build-deb.sh
+# Produces: dist/deb/lmux_<version>_amd64.deb
 ```
 
 ### AppImage
 
 ```bash
-# Build AppImage
-./scripts/package-appimage.sh
+./packaging/build-appimage.sh
 # Produces: build/lmux-<version>-x86_64.AppImage
 ```
 
+### Static binary
+
+```bash
+# Build with musl for fully static binary
+node scripts/build-cli.mjs --static
+```
+
+---
+
+## Contributing
+
+1. Fork the repository
+2. Create a feature branch (`git checkout -b feat/my-feature`)
+3. Commit changes (`git commit -m 'feat: add my feature'`)
+4. Push to branch (`git push origin feat/my-feature`)
+5. Open a Pull Request
+
+All changes must pass the full test suite (`make test`) before merge.
+
+---
+
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE)
