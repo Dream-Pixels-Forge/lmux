@@ -14,8 +14,10 @@ Usage:
 """
 
 import os
+import socket
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -33,15 +35,65 @@ from lmux import LmuxClient, LmuxDaemon, LmuxError
 
 _daemon = None
 _client = None
+_test_home = None
 
 
 def _ensure_daemon():
-    global _daemon, _client
+    """Start (once) the daemon shared by all test classes.
+
+    The daemon runs against a throwaway HOME/XDG_DATA_HOME. Without this it
+    reads and writes the developer's real ~/.local/share/lmux/snapshot.json,
+    which makes the suite depend on whatever session happened to be saved:
+    a large leftover snapshot slows startup past the client timeout, and
+    restored workspaces leak into tests that assume a clean model (issue #14).
+    """
+    global _daemon, _client, _test_home
     if _client is None:
+        _test_home = tempfile.mkdtemp(prefix="lmux-itest-home-")
+        Path(_test_home, ".local", "share", "lmux").mkdir(parents=True, exist_ok=True)
+        env = dict(os.environ)
+        env["HOME"] = _test_home
+        env["XDG_DATA_HOME"] = str(Path(_test_home, ".local", "share"))
         sock = f"/tmp/lmux-integration-{os.getpid()}.sock"
-        _daemon = LmuxDaemon(sock)
-        _client = _daemon.start(timeout=10)
+        _daemon = LmuxDaemon(sock, env=env)
+        _client = _daemon.start(timeout=60)
     return _client
+
+
+_iso_seq = 0
+
+
+def _isolated_client():
+    """Start a private daemon with its own HOME, and return (client, daemon, home).
+
+    Use for operations that act on the whole model (session restore, snapshot
+    load) or that must not see state left behind by other tests.
+    """
+    global _iso_seq
+    _iso_seq += 1
+    home = tempfile.mkdtemp(prefix="lmux-iso-home-")
+    data = Path(home, ".local", "share")
+    (data / "lmux").mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ)
+    env["HOME"] = home
+    env["XDG_DATA_HOME"] = str(data)
+    sock = f"/tmp/lmux-iso-{os.getpid()}-{_iso_seq}.sock"
+    Path(sock).unlink(missing_ok=True)
+    daemon = LmuxDaemon(sock, env=env)
+    return daemon.start(timeout=60), daemon, Path(home)
+
+
+def _shutdown_isolated(daemon, home):
+    """Stop a private daemon and remove its socket/snapshot."""
+    try:
+        daemon.stop()
+    except Exception:  # noqa: BLE001 - teardown must not mask test failures
+        pass
+    try:
+        Path(daemon.socket_path).unlink(missing_ok=True)
+        Path(home, ".local", "share", "lmux", "snapshot.json").unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def _unique(prefix):
@@ -325,11 +377,28 @@ class TestSession(unittest.TestCase):
         self.c.workspace_close(ws["id"])
 
     def test_restore_returns_dict(self):
-        ws = self.c.workspace_create(_unique("sess-restore"))
-        self.c.session_save()
-        result = self.c.session_restore()
-        self.assertIsInstance(result, dict)
-        self.c.workspace_close(ws["id"])
+        # Restoring replaces the whole model and spawns a pty per restored
+        # pane, so it must not run against the shared daemon: by this point the
+        # shared model holds every workspace created by the earlier classes,
+        # and the rebuild can outlast the client timeout (which surfaces as a
+        # misleading "empty response"). A private daemon keeps the scope of
+        # this operation honest.
+        client, daemon, home = _isolated_client()
+        try:
+            ws = client.workspace_create(_unique("sess-restore"))
+            client.session_save()
+            result = client.session_restore()
+            self.assertIsInstance(result, dict)
+            # The restore that just ran rebuilt the model from the saved file,
+            # so the pre-restore workspace was replaced rather than kept
+            # alongside the restored copy (#8). If the close succeeds, the
+            # loader is still appending.
+            with self.assertRaises(LmuxError) as ctx:
+                client.workspace_close(ws["id"])
+            self.assertIn("not_found", str(ctx.exception),
+                          f"restore should have replaced ws {ws['id']}")
+        finally:
+            _shutdown_isolated(daemon, home)
 
 
 # ====================================================================
@@ -358,20 +427,30 @@ class TestSnapshot(unittest.TestCase):
             self.c.workspace_close(ws["id"])
 
     def test_load_from_saved_file(self):
-        ws = self.c.workspace_create(_unique("snap-load"))
+        # snapshot.load replaces the whole model, so run it on a private daemon
+        # rather than the shared one that other classes are still using.
+        client, daemon, home = _isolated_client()
         snap_path = os.path.join(tempfile.gettempdir(),
                                  f"lmux-test-snap-load-{os.getpid()}.json")
         try:
-            self.c.snapshot_save(snap_path)
+            ws = client.workspace_create(_unique("snap-load"))
+            client.snapshot_save(snap_path)
             # Load the file we just saved
-            result = self.c.snapshot_load(snap_path)
+            result = client.snapshot_load(snap_path)
             self.assertIsInstance(result, dict)
+            # Loading replaces the model (#8), so the workspace created above
+            # no longer exists. A successful close would mean the loader is
+            # still appending to the live model.
+            with self.assertRaises(LmuxError) as ctx:
+                client.workspace_close(ws["id"])
+            self.assertIn("not_found", str(ctx.exception),
+                          f"load should have replaced ws {ws['id']}")
         finally:
             try:
                 os.unlink(snap_path)
             except OSError:
                 pass
-            self.c.workspace_close(ws["id"])
+            _shutdown_isolated(daemon, home)
 
     def test_save_default_path(self):
         ws = self.c.workspace_create(_unique("snap-default"))
@@ -2878,6 +2957,107 @@ class TestAgentTeams(unittest.TestCase):
         team_id = resp["result"]["team_id"]
         resp2 = self.c.send("team.delete", {"team_id": team_id})
         self.assertTrue(resp2.get("ok"), resp2)
+
+
+class TestSessionRestoreConcurrency(unittest.TestCase):
+    """Regression tests for issue #9: session.restore frees the whole model
+    while client threads may be reading it.
+
+    Each client connection is served on its own thread (client_thread,
+    src/core/server.c). Restoring tears down every workspace, so without
+    holding the model rw_lock a concurrent reader walks freed memory. Under
+    ASan this reproduces immediately; without it, it shows up as an
+    intermittent SIGSEGV/double-free that varies run to run.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.c = _ensure_daemon()
+
+    def test_restore_while_other_clients_read(self):
+        """Restore repeatedly while other connections list workspaces/panes.
+
+        Before the fix the daemon aborts (ASan: heap-use-after-free in
+        dispatch_command reached from client_thread). After the fix every
+        restore returns and the daemon is still answering.
+        """
+        client, daemon, home = _isolated_client()
+        try:
+            # Seed a snapshot worth restoring.
+            for i in range(3):
+                client.send("workspace.create", {"title": f"race-{i}"})
+            client.send("session.save", {})
+
+            stop = threading.Event()
+            errors = []
+
+            def reader():
+                sock = client.socket_path
+                while not stop.is_set():
+                    try:
+                        s = socket.socket(socket.AF_UNIX)
+                        s.settimeout(2)
+                        s.connect(sock)
+                        payload = ('{"cmd":"workspace.list","args":{}}\n'
+                                   '{"cmd":"pane.list","args":{}}\n')
+                        s.sendall(payload.encode())
+                        s.recv(65536)
+                        s.close()
+                    except Exception as e:  # noqa: BLE001 - report, don't mask
+                        # A crash shows up here as a connect/send failure. Record
+                        # it and stop this reader rather than spinning.
+                        errors.append(e)
+                        return
+
+            threads = [threading.Thread(target=reader, daemon=True) for _ in range(4)]
+            for t in threads:
+                t.start()
+
+            # Restore repeatedly. This is the operation that used to crash.
+            # Kept small so the test stays fast in CI: against the unfixed
+            # additive loader each restore spawns a pty per restored pane, so
+            # a large loop would grow without bound. The race is reliably
+            # caught by the sanitizer job (issue #14), not by volume here.
+            for _ in range(5):
+                client.send("session.restore", {})
+                client.send("session.save", {})
+
+            stop.set()
+            for t in threads:
+                t.join(timeout=10)
+
+            self.assertEqual(errors, [], f"reader clients failed: {errors[:3]}")
+
+            # Daemon must still be alive and coherent.
+            pong = client.send("ping", {})
+            self.assertTrue(pong.get("ok"), pong)
+            ws = client.send("workspace.list", {})
+            self.assertTrue(ws.get("ok"), ws)
+        finally:
+            _shutdown_isolated(daemon, home)
+
+    def test_restore_twice_does_not_duplicate(self):
+        """Issue #8 regression: restoring twice must not append workspaces."""
+        client, daemon, home = _isolated_client()
+        try:
+            for i in range(3):
+                client.send("workspace.create", {"title": f"dup-{i}"})
+            client.send("session.save", {})
+
+            first = client.send("session.restore", {}).get("ok")
+            self.assertTrue(first)
+            n1 = len(client.send("workspace.list", {})["result"]["workspaces"])
+
+            second = client.send("session.restore", {}).get("ok")
+            self.assertTrue(second)
+            n2 = len(client.send("workspace.list", {})["result"]["workspaces"])
+
+            self.assertEqual(
+                n1, n2,
+                f"restore duplicated workspaces: {n1} -> {n2} (issue #8)",
+            )
+        finally:
+            _shutdown_isolated(daemon, home)
 
 
 # ====================================================================

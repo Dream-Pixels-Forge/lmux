@@ -33,11 +33,17 @@ class LmuxError(Exception):
 class LmuxClient:
     """Client for lmux daemon over Unix domain socket."""
 
-    def __init__(self, socket_path: Optional[str] = None, timeout: float = 5.0):
+    def __init__(self, socket_path: Optional[str] = None, timeout: Optional[float] = None):
         self.socket_path = socket_path or os.environ.get(
             "LMUX_SOCKET_PATH", "/tmp/lmux-test.sock"
         )
-        self.timeout = timeout
+        # Restoring a session rebuilds the whole model and spawns a pty per
+        # pane, so on a large session it legitimately takes many seconds. A
+        # 5s default produced spurious "empty response" failures that looked
+        # like daemon crashes but were only client-side timeouts.
+        self.timeout = timeout if timeout is not None else float(
+            os.environ.get("LMUX_TEST_TIMEOUT", "30")
+        )
         self._daemon_proc = None
 
     def _connect(self) -> socket.socket:
@@ -291,10 +297,14 @@ class LmuxClient:
 class LmuxDaemon:
     """Manage an lmux daemon process for testing."""
 
-    def __init__(self, socket_path: Optional[str] = None):
+    def __init__(self, socket_path: Optional[str] = None, env: Optional[dict] = None):
         self.socket_path = socket_path or f"/tmp/lmux-test-{os.getpid()}.sock"
         self._proc = None
         self._cli_path = None
+        # Extra environment for the daemon process. Tests use this to give each
+        # daemon its own HOME/XDG_DATA_HOME so a run cannot read or clobber the
+        # developer's real ~/.local/share/lmux/snapshot.json.
+        self.env = env
 
     def start(self, timeout: float = 5.0) -> LmuxClient:
         """Start the lmux daemon and return a connected client."""
@@ -316,9 +326,13 @@ class LmuxDaemon:
             [str(self._cli_path), "--socket", self.socket_path, "daemon"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            env=self.env,
         )
 
-        # Wait for socket to appear
+        # Wait for the socket to appear AND for the daemon to answer.
+        # Checking only for the socket file is not enough: with the restore
+        # happening before listen(), the file appears when the daemon is truly
+        # ready, but a stale socket from a crashed run can exist earlier.
         start = time.time()
         while time.time() - start < timeout:
             if os.path.exists(self.socket_path):
@@ -328,8 +342,11 @@ class LmuxDaemon:
                     s.settimeout(1)
                     s.connect(self.socket_path)
                     s.close()
-                    return LmuxClient(self.socket_path)
-                except (ConnectionRefusedError, FileNotFoundError):
+                    # Confirm it actually serves a command before returning.
+                    probe = LmuxClient(self.socket_path, timeout=5.0)
+                    if probe.send("ping", {}).get("ok"):
+                        return probe
+                except (ConnectionRefusedError, FileNotFoundError, TimeoutError, OSError):
                     pass
             time.sleep(0.1)
 
