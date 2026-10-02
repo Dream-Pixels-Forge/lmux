@@ -83,9 +83,18 @@ static int connect_socket(const char *path) {
 }
 
 static char *send_request(int fd, const char *json_request) {
-    /* Send request. */
+    /* Send request with trailing newline (server reads until \n). */
     size_t len = strlen(json_request);
-    if (write(fd, json_request, len) != (ssize_t)len) {
+    bool need_nl = (len == 0 || json_request[len - 1] != '\n');
+    size_t wlen = len + (need_nl ? 1 : 0);
+    char *wbuf = malloc(wlen + 1);
+    if (!wbuf) { fprintf(stderr, "lmux: out of memory\n"); return NULL; }
+    memcpy(wbuf, json_request, len);
+    if (need_nl) wbuf[len] = '\n';
+    wbuf[wlen] = '\0';
+    ssize_t wr = write(fd, wbuf, wlen);
+    free(wbuf);
+    if (wr != (ssize_t)wlen) {
         fprintf(stderr, "lmux: write failed: %s\n", strerror(errno));
         return NULL;
     }
@@ -903,6 +912,19 @@ static char *build_json_command(int argc, char **argv) {
             args_len = snprintf(args_buf, sizeof args_buf, "\"count\":\"%s\"", (json_escape(argv[1], _esc, sizeof _esc), _esc));
         }
     }
+
+    /* Shorthand mappings: bare command name → default subcommand */
+    if (strcmp(cmd, "workspace") == 0) { cmd = "workspace.list"; }
+    else if (strcmp(cmd, "surface") == 0) { cmd = "surface.list"; }
+    else if (strcmp(cmd, "pane") == 0) { cmd = "pane.list"; }
+    else if (strcmp(cmd, "notification") == 0) { cmd = "notification.list"; }
+    else if (strcmp(cmd, "window") == 0) { cmd = "window.list"; }
+    else if (strcmp(cmd, "ssh") == 0) { cmd = "ssh.list"; }
+    else if (strcmp(cmd, "agent") == 0) { cmd = "agent.list"; }
+    else if (strcmp(cmd, "feed") == 0) { cmd = "feed.panel.list"; }
+    else if (strcmp(cmd, "search") == 0) { cmd = "search.status"; }
+    else if (strcmp(cmd, "hooks") == 0) { cmd = "hooks.list"; }
+    else if (strcmp(cmd, "naming") == 0) { cmd = "naming.suggest"; }
 
     char *json = malloc(8192);
     if (args_len > 0) {

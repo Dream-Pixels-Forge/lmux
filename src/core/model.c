@@ -7098,7 +7098,9 @@ done:
 static bool is_readonly_cmd(const char *cmd) {
     /* Read-only commands: queries that don't mutate model state. */
     static const char *ro[] = {
-        "ping", "workspace.list", "workspace.current", "workspace.focused",
+        "ping", "version", "capabilities",
+        "health.live", "health.ready", "metrics",
+        "workspace.list", "workspace.current", "workspace.focused",
         "workspace.count", "workspace.get_info",
         "surface.list", "surface.focused", "surface.count",
         "pane.list", "pane.focused", "pane.count", "pane.get_info",
@@ -7106,11 +7108,25 @@ static bool is_readonly_cmd(const char *cmd) {
         "pane.copy_mode.select_start", "pane.copy_mode.select_end",
         "pane.copy_mode.yank", "pane.copy_mode.paste",
         "tree", "notification.list", "notification.count",
+        "notification.ring.list", "notification.hook.list",
         "agent.list", "agent.get", "config.get",
-        "events", "version",
+        "events",
         "file_explorer.list", "file_explorer.search",
         "surface.canvas.get_layout",
         "search.status",
+        "focus.history",
+        "ssh.list", "hooks.list",
+        "naming.suggest",
+        "last_pane", "last_window", "next_window", "previous_window",
+        "workspace.group.list",
+        "calendar.list", "calendar.today",
+        "email.unread",
+        "weather.get",
+        "clipboard.history",
+        "template.list",
+        "browser.list",
+        "feed.panel.list",
+        "profile.status",
     };
     for (size_t i = 0; i < sizeof ro / sizeof ro[0]; i++) {
         if (strcmp(cmd, ro[i]) == 0) return true;
@@ -7383,7 +7399,10 @@ bool lmux_snapshot_save(const lmux_app *app, const char *path) {
     FILE *f = fopen(tmp_path, "w");
     if (!f) return false;
     fprintf(f, "{\"version\":1,\"workspaces\":[\n");
-    for (size_t i = 0; i < app->workspaces.len; i++) {
+    /* Cap workspace count to prevent snapshot bloat from test runs */
+    const size_t max_ws = 50;
+    size_t ws_count = app->workspaces.len < max_ws ? app->workspaces.len : max_ws;
+    for (size_t i = 0; i < ws_count; i++) {
         const lmux_workspace *ws = app->workspaces.items[i];
         if (i > 0) fprintf(f, ",\n");
         char _te[512], _ce[1024], _be[256];
