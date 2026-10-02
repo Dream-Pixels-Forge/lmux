@@ -366,6 +366,8 @@ static void *server_thread(void *arg) {
             if (errno == EINTR) continue;
             break;
         }
+        /* Set FD_CLOEXEC so the client socket fd is not inherited by forked children */
+        fcntl(client_fd, F_SETFD, FD_CLOEXEC);
 
         /* Spawn a thread to handle this client so accept loop stays free. */
         client_thread_arg *cta = malloc(sizeof *cta);
@@ -402,6 +404,8 @@ int lmux_server_start(lmux_app *app) {
         lmux_log(LMUX_LOG_ERROR, "server: socket() failed: %s", strerror(errno));
         return -1;
     }
+    /* Set FD_CLOEXEC so the listening socket fd is not inherited by forked children */
+    fcntl(fd, F_SETFD, FD_CLOEXEC);
 
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof addr);

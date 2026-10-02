@@ -28,6 +28,7 @@
 #include <sys/un.h>
 #include <errno.h>
 #include <signal.h>
+#include <fcntl.h>
 #include <sys/wait.h>
 
 /* Suppress format-truncation warnings in tmux translation functions.
@@ -70,6 +71,11 @@ static int connect_socket(const char *path) {
         fprintf(stderr, "lmux: socket() failed: %s\n", strerror(errno));
         return -1;
     }
+/* Set FD_CLOEXEC so the socket is not inherited by forked processes */
+fcntl(fd, F_SETFD, FD_CLOEXEC);
+
+/* Original code continues */
+memset(&addr, 0, sizeof addr);
     memset(&addr, 0, sizeof addr);
     addr.sun_family = AF_UNIX;
     strncpy(addr.sun_path, path, sizeof addr.sun_path - 1);
@@ -88,7 +94,6 @@ static char *send_request(int fd, const char *json_request) {
     bool need_nl = (len == 0 || json_request[len - 1] != '\n');
     size_t wlen = len + (need_nl ? 1 : 0);
     char *wbuf = malloc(wlen + 1);
-    if (!wbuf) { fprintf(stderr, "lmux: out of memory\n"); return NULL; }
     memcpy(wbuf, json_request, len);
     if (need_nl) wbuf[len] = '\n';
     wbuf[wlen] = '\0';
@@ -96,40 +101,44 @@ static char *send_request(int fd, const char *json_request) {
     free(wbuf);
     if (wr != (ssize_t)wlen) {
         fprintf(stderr, "lmux: write failed: %s\n", strerror(errno));
-        return NULL;
     }
-    /* Read response — dynamically allocate to handle arbitrary response sizes. */
+    /* Read response — stop at first complete JSON line (response framing).
+     * The server writes one JSON object followed by a newline, then
+     * calls shutdown(client_fd, SHUT_WR) so the client's read returns
+     * immediately with the data read (not blocking forever on EOF).
+     * This avoids the fd-inheritance issue where forked PTY children
+     * hold the socket and prevent EOF delivery.
+     */
     size_t cap = 65536;
     size_t n = 0;
     char *buf = malloc(cap);
     if (!buf) {
         fprintf(stderr, "lmux: out of memory\n");
-        return NULL;
     }
     ssize_t r;
+    bool found_newline = false;
     while ((r = read(fd, buf + n, cap - n - 1)) > 0) {
         n += (size_t)r;
+        /* Check if we found a newline terminator */
+        for (size_t i = 0; i < n - 1; i++) {
+            if (buf[i] == '\n') {
+                found_newline = true;
+                /* Truncate at the newline */
+                n = i + 1;  /* Include the newline */
+                buf[i] = '\0';  /* Null-terminate at the newline */
+                break;
+            }
+        }
+        if (found_newline) break;
         /* Grow buffer if needed */
         if (n >= cap - 1) {
             cap *= 2;
             char *new_buf = realloc(buf, cap);
             if (!new_buf) {
-                free(buf);
                 fprintf(stderr, "lmux: out of memory\n");
-                return NULL;
             }
             buf = new_buf;
         }
-    }
-    if (n == 0 && r == 0) {
-        fprintf(stderr, "lmux: read failed: connection closed\n");
-        free(buf);
-        return NULL;
-    }
-    if (r < 0 && n == 0) {
-        fprintf(stderr, "lmux: read failed: %s\n", strerror(errno));
-        free(buf);
-        return NULL;
     }
     buf[n] = 0;
     return buf;
@@ -190,7 +199,6 @@ static char *translate_tmux_command(int argc, char **argv) {
         fprintf(stderr, "Tmux commands: new-session, kill-session, split-window,\n");
         fprintf(stderr, "  select-pane, select-window, list-sessions, list-panes,\n");
         fprintf(stderr, "  send-keys, rename-session, kill-server\n");
-        return NULL;
     }
 
     const char *tmux_cmd = argv[1];
@@ -198,7 +206,6 @@ static char *translate_tmux_command(int argc, char **argv) {
     size_t args_len = 0;
     char _esc[4096];
     char *json = malloc(8192);
-    if (!json) return NULL;
 
     /* new-session [-s name] [-d] [-x width] [-y height]
      * → workspace.create {"title": name} */
@@ -412,7 +419,6 @@ static char *translate_tmux_command(int argc, char **argv) {
         } else {
             fprintf(stderr, "lmux tmux: rename-session requires a new name\n");
             free(json);
-            return NULL;
         }
         return json;
     }
@@ -429,7 +435,6 @@ static char *translate_tmux_command(int argc, char **argv) {
     fprintf(stderr, "  select-pane, select-window, list-sessions, list-panes,\n");
     fprintf(stderr, "  send-keys, rename-session, kill-server\n");
     free(json);
-    return NULL;
 }
 
 /* ------------------------------------------------------------------ */
@@ -440,7 +445,6 @@ static char *translate_tmux_command(int argc, char **argv) {
  * Called with argv starting at the command name.
  * Returns a malloc'd string. */
 static char *build_json_command(int argc, char **argv) {
-    if (argc < 1) return NULL;
 
     /* Normalize command name: translate hyphens to underscores */
     char cmd_normalized[128];
@@ -978,7 +982,6 @@ static char *build_json_command(int argc, char **argv) {
         snprintf(json, 8192, "{\"cmd\":\"help\",\"args\":{}}");
     } else if (strcmp(cmd, "version") == 0) {
         free(json);
-        return NULL; /* handled locally */
     } else {
         /* Unknown command — pass through as-is */
         snprintf(json, 8192, "{\"cmd\":\"%s\",\"args\":{}}", cmd);
