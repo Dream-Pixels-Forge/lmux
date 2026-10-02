@@ -619,8 +619,15 @@ static char *build_json_command(int argc, char **argv) {
     }
     /* workspace rename <id> <title> */
     else if (strcmp(cmd, "workspace.rename") == 0 && argc >= 3) {
+        /* Escape both arguments (#5). Interpolating argv raw produced
+         * malformed JSON for any title containing a quote, truncating the
+         * title and allowing injection of extra protocol arguments.
+         * json_escape_str is not reentrant, so two buffers are required. */
+        static char _esc_id[1024], _esc_title[1024];
         args_len = snprintf(args_buf, sizeof args_buf,
-                            "\"id\":\"%s\",\"title\":\"%s\"", argv[1], argv[2]);
+                            "\"id\":\"%s\",\"title\":\"%s\"",
+                            (json_escape(argv[1], _esc_id, sizeof _esc_id), _esc_id),
+                            (json_escape(argv[2], _esc_title, sizeof _esc_title), _esc_title));
     }
     /* surface.create [workspace_id] [title] */
     else if (strcmp(cmd, "surface.create") == 0) {
@@ -983,6 +990,24 @@ static char *build_json_command(int argc, char **argv) {
 /* ------------------------------------------------------------------ */
 /* Pretty-print JSON response                                           */
 /* ------------------------------------------------------------------ */
+
+/* Map a daemon response to a process exit status (#4).
+ * Returns 0 on success and a distinct non-zero code per error class so that
+ * scripts, `set -e` and CI can detect failure. The printed output is
+ * unchanged; only the exit status differs. */
+static int exit_code_for_response(const char *response) {
+    if (!response) return 1;
+    if (!strstr(response, "\"ok\":false")) return 0;
+
+    const char *code = strstr(response, "\"code\":\"");
+    if (code) {
+        code += 8;
+        if (strncmp(code, "invalid_params", 14) == 0)   return 2;
+        if (strncmp(code, "not_found", 9) == 0)         return 3;
+        if (strncmp(code, "unknown_command", 15) == 0)  return 4;
+    }
+    return 1;
+}
 
 static void print_response(const char *response, bool raw_json) {
     if (!response) return;
@@ -1355,15 +1380,22 @@ int main(int argc, char **argv) {
         }
         /* Create a default workspace. */
         lmux_workspace_create(app, "default");
+        /* Restore the session BEFORE the socket starts accepting clients.
+         *
+         * Restoring rebuilds the entire model under the write lock, and a
+         * large snapshot (50 workspaces / 260 surfaces) takes long enough
+         * that clients connecting early simply block on the lock until their
+         * socket timeout expires and they report "empty response" (#9).
+         * Restoring first means the daemon is never advertised as ready while
+         * its model is half-rebuilt, so there is no window for a client to
+         * observe freed memory either. */
+        lmux_app_auto_restore_locked(app);
         /* Start socket server. */
         if (lmux_server_start_threaded(app) != 0) {
             fprintf(stderr, "lmux: failed to start socket server\n");
             lmux_app_free(app);
             return 1;
         }
-        /* Restore session AFTER socket is listening so clients
-           can connect while potentially large snapshots load. */
-        lmux_app_auto_restore(app);
         printf("lmux daemon ready. PID=%d\n", getpid());
         fflush(stdout);
         /* Main loop: check both app state and async exit flag. */
@@ -1454,9 +1486,10 @@ int main(int argc, char **argv) {
         }
 
         print_response(response, raw_json);
+        int rc = exit_code_for_response(response);
         free(response);
         free(json_request);
-        return 0;
+        return rc;
     }
 
     /* Socket commands: connect, send, receive, print. */
@@ -1483,7 +1516,8 @@ int main(int argc, char **argv) {
     }
 
     print_response(response, raw_json);
+    int rc = exit_code_for_response(response);
     free(response);
     free(json_request);
-    return 0;
+    return rc;
 }

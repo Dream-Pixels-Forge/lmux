@@ -309,6 +309,19 @@ static int pane_spawn_pty(lmux_pane *p) {
     }
 
     if (pid == 0) {
+        /* Child: close every descriptor inherited from the daemon before
+         * exec. Two bugs share this root cause:
+         *   #1 - the client socket was inherited, so the client's read loop
+         *        (which waits for EOF) never saw EOF and blocked forever.
+         *   #2 - all ~230 live /dev/ptmx masters were duplicated into every
+         *        new shell, growing the fd table without bound.
+         * Keep only stdin/stdout/stderr (the pty slave set up by forkpty);
+         * it is already fd 0/1/2 in the child. */
+        long maxfd = sysconf(_SC_OPEN_MAX);
+        if (maxfd < 0 || maxfd > 4096) maxfd = 4096;
+        for (int fd = 3; fd < (int)maxfd; fd++)
+            close(fd);
+
         /* Child: exec the command via shell */
         const char *shell = getenv("SHELL");
         if (!shell) shell = "/bin/sh";
@@ -329,17 +342,31 @@ static int pane_spawn_pty(lmux_pane *p) {
 static void pane_kill_pty(lmux_pane *p) {
     if (!p) return;
     if (p->child_pid > 0) {
+        /* The daemon installs a SIGCHLD handler that reaps *any* child with
+         * waitpid(-1, ...), so this child may already have been reaped by the
+         * time we get here (waitpid then fails with ECHILD). Treat that as
+         * "already gone" and fall through to closing the pty fd -- returning
+         * early here used to leave pty_fd open, so the same fd was closed a
+         * second time later and the daemon aborted with a double free. */
         kill(p->child_pid, SIGTERM);
-        /* Give it a moment, then SIGKILL */
+
         int status;
-        if (waitpid(p->child_pid, &status, WNOHANG) == 0) {
-            struct timespec ts = {0, 50000000L}; /* 50ms */
+        pid_t r = -1;
+        struct timespec ts = {0, 10000000L}; /* 10ms */
+        for (int i = 0; i < 5; i++) {          /* up to ~50ms grace period */
+            r = waitpid(p->child_pid, &status, WNOHANG);
+            if (r == p->child_pid) break;      /* reaped by us */
+            if (r < 0) break;                  /* ECHILD: handler reaped it */
             nanosleep(&ts, NULL);
+        }
+        if (r == 0) {
             kill(p->child_pid, SIGKILL);
             waitpid(p->child_pid, &status, 0);
         }
         p->child_pid = 0;
     }
+    /* Always close the master fd exactly once, even if the child was already
+     * reaped out from under us. */
     if (p->pty_fd >= 0) {
         close(p->pty_fd);
         p->pty_fd = -1;
@@ -858,7 +885,15 @@ lmux_workspace *lmux_workspace_create(lmux_app *a, const char *title) {
     vec_push(&ws->surfaces, s);
     /* Create one default pane: terminal with $SHELL or /bin/sh. */
     lmux_pane *p = pane_new(ws, s, "terminal");
-    if (!p) { free(s); free(ws); return NULL; }
+    if (!p) {
+        /* Undo the surface registration so the caller never sees a workspace
+         * holding a surface that is about to be freed (dangling pointer). */
+        vec_remove(&ws->surfaces, ws->surfaces.len - 1);
+        free(ws->surfaces.items);
+        free(s);
+        free(ws);
+        return NULL;
+    }
     const char *sh = getenv("SHELL");
     snprintf(p->command, sizeof p->command, "%s", sh ? sh : "/bin/sh");
     vec_push(&s->panes, p);
@@ -870,10 +905,29 @@ lmux_workspace *lmux_workspace_create(lmux_app *a, const char *title) {
     return ws;
 }
 
+/* True if the given pane belongs to one of this workspace's surfaces.
+ * Used to detect app-level pointers that would dangle after close. */
+static bool ws_owns_pane(const lmux_workspace *ws, const lmux_pane *p) {
+    for (size_t j = 0; j < ws->surfaces.len; j++) {
+        const lmux_surface *s = ws->surfaces.items[j];
+        for (size_t k = 0; k < s->panes.len; k++) {
+            if (s->panes.items[k] == p) return true;
+        }
+    }
+    return false;
+}
+
 void lmux_workspace_close(lmux_app *a, lmux_workspace *ws) {
     for (size_t i = 0; i < a->workspaces.len; i++) {
         if (a->workspaces.items[i] == ws) {
             vec_remove(&a->workspaces, i);
+            /* Drop app-level pane pointers *before* freeing the panes, while
+             * ws_owns_pane() can still inspect them safely. Doing this after
+             * the free walked already-released memory (heap-use-after-free). */
+            if (a->last_focused && ws_owns_pane(ws, a->last_focused))
+                a->last_focused = NULL;
+            if (a->search_pane && ws_owns_pane(ws, a->search_pane))
+                a->search_pane = NULL;
             for (size_t j = 0; j < ws->surfaces.len; j++) {
                 lmux_surface *s = ws->surfaces.items[j];
                 for (size_t k = 0; k < s->panes.len; k++) {
@@ -889,7 +943,15 @@ void lmux_workspace_close(lmux_app *a, lmux_workspace *ws) {
             free(ws->env_vars.items);
             free(ws->auth_tokens.items);
             free(ws->surfaces.items);
+            /* Don't leave app-level pointers dangling at freed memory.
+             * #3: ws_current/ws_last are dereferenced by workspace.current,
+             * workspace.select and last-window. */
+            if (a->ws_current == ws) a->ws_current = NULL;
+            if (a->ws_last == ws) a->ws_last = NULL;
             free(ws);
+            /* Keep a valid focus so later commands never read NULL. */
+            if (!a->ws_current && a->workspaces.len > 0)
+                a->ws_current = a->workspaces.items[a->workspaces.len - 1];
             return;
         }
     }
@@ -1007,6 +1069,7 @@ void lmux_workspace_set_cwd(lmux_workspace *ws, const char *cwd) {
 
 lmux_surface *lmux_surface_create(lmux_workspace *ws, const char *title) {
     lmux_surface *s = surface_new(ws);
+    if (!s) return NULL;   /* out of memory */
     snprintf(s->title, sizeof s->title, "%s", title ? title : "Tab");
     /* Mark all other surfaces in the workspace as not focused. */
     for (size_t i = 0; i < ws->surfaces.len; i++) {
@@ -2080,7 +2143,9 @@ static const char *json_find_key(const char *json, const char *key) {
         /* Must be preceded by '"' and followed by '":' */
         if ((p == json || *(p - 1) == '"') && p[klen] == '"' && p[klen + 1] == ':') {
             p += klen + 2; /* skip key": */
-            while (*p == ' ' || *p == '\t') p++;
+            /* Skip insignificant whitespace, including newlines, so that
+             * pretty-printed JSON parses the same as compact JSON (#7). */
+            while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
             return p;
         }
         p++;
@@ -3225,6 +3290,13 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
 
     /* --- last-pane --- */
     if (strcmp(cmd, "last-pane") == 0 || strcmp(cmd, "last_pane") == 0) {
+        /* Drop the pointer if its pane no longer exists in any live workspace
+         * (e.g. the owning workspace was closed). */
+        if (app->last_focused && !app->workspaces.len) app->last_focused = NULL;
+        for (size_t i = 0; app->last_focused && i < app->workspaces.len; i++) {
+            if (!ws_owns_pane(app->workspaces.items[i], app->last_focused))
+                app->last_focused = NULL;
+        }
         if (app->last_focused) {
             lmux_pane *p = app->last_focused;
             for (size_t i = 0; i < app->workspaces.len; i++) {
@@ -3770,6 +3842,14 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         else if (strcmp(key, "agent_codex") == 0) snprintf(app->config->agent_paths[2], 512, "%s", value);
         else if (strcmp(key, "agent_aider") == 0) snprintf(app->config->agent_paths[3], 512, "%s", value);
         else if (strcmp(key, "agent_goose") == 0) snprintf(app->config->agent_paths[4], 512, "%s", value);
+        else {
+            /* #6: unknown keys used to fall through and still report
+             * {"ok":true}, so typos silently discarded the value while
+             * telling the user the setting had been applied. */
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"unknown config key\"}}");
+            goto done;
+        }
         /* Save config to disk */
         char cpath[512];
         lmux_config_path(cpath, sizeof cpath);
@@ -7383,9 +7463,28 @@ void lmux_app_auto_restore(lmux_app *app) {
     if (!app || !app->auto_save_path[0]) return;
     struct stat st;
     if (stat(app->auto_save_path, &st) == 0) {
+        /* The daemon serves every client on its own thread (client_thread,
+         * server.c:348) while restoring tears down the whole model. Taking
+         * the write lock here is what keeps a concurrent workspace.list or
+         * pane.list from walking freed memory (#9).
+         *
+         * lmux_dispatch_json() already holds rw_lock when this is reached via
+         * the session.restore command, so we must not re-acquire it here. That
+         * is why this is a plain loader call and why the startup path in
+         * main.c takes the lock itself before calling in. */
         lmux_snapshot_load(app, app->auto_save_path);
         lmux_log(LMUX_LOG_INFO, "session: restored from %s", app->auto_save_path);
     }
+}
+
+/* Startup-only wrapper: acquires the model write lock, then restores.
+ * Safe to call from main() once the socket is live, because no other thread
+ * can be inside dispatch_command() while the write lock is held. */
+void lmux_app_auto_restore_locked(lmux_app *app) {
+    if (!app) return;
+    pthread_rwlock_wrlock(&app->rw_lock);
+    lmux_app_auto_restore(app);
+    pthread_rwlock_unlock(&app->rw_lock);
 }
 /* ------------------------------------------------------------------ */
 /* Snapshot persistence                                                */
@@ -7474,14 +7573,28 @@ bool lmux_snapshot_load(lmux_app *app, const char *path) {
      * then find surfaces/panes inside it by brace matching. */
     const char *p = buf;
 
-    /* Find workspaces array */
-    const char *ws_arr = strstr(p, "\"workspaces\":[");
+    /* Find workspaces array, tolerating insignificant whitespace (#7).
+     * json_find_key() skips whitespace after the colon, so both the
+     * compact form lmux writes ("workspaces":[) and standard pretty-printed
+     * JSON ("workspaces": [) are accepted. */
+    const char *ws_arr = json_find_key(p, "workspaces");
     if (!ws_arr) {
         /* No workspaces array — check if file was non-empty (corrupt) */
         if (n > 2) return false;
         return true; /* genuinely empty save */
     }
-    ws_arr += 14;
+    ws_arr = strchr(ws_arr, '[');
+    if (!ws_arr) return false;
+    ws_arr++;
+
+    /* #8: loading a snapshot replaces the current state instead of appending
+     * to it, so restoring the same snapshot twice cannot duplicate every
+     * workspace. Tear down existing workspaces up front; the fresh ones
+     * created below become the live state. */
+    while (app->workspaces.len > 0)
+        lmux_workspace_close(app, app->workspaces.items[app->workspaces.len - 1]);
+    app->ws_current = NULL;
+    app->ws_last = NULL;
 
     while (1) {
         /* Skip to next workspace object */
@@ -7514,10 +7627,34 @@ bool lmux_snapshot_load(lmux_app *app, const char *path) {
         if (!wtitle[0]) { ws_arr = ws_end; continue; }
 
         lmux_workspace *ws = lmux_workspace_create(app, wtitle);
+        if (!ws) { ws_arr = ws_end; continue; }
         if (wcwd[0]) lmux_workspace_set_cwd(ws, wcwd);
 
+        /* lmux_workspace_create() eagerly allocates a default "Shell" surface
+         * with a spawned pty. That placeholder is not part of the snapshot, so
+         * drop it before replaying the saved surfaces. App-level pane pointers
+         * must be cleared first: last_focused may still reference the pane we
+         * are about to free, and a later last-pane would touch freed memory. */
+        if (ws->surfaces.len > 0) {
+            for (size_t d = 0; d < ws->surfaces.len; d++) {
+                lmux_surface *ds = ws->surfaces.items[d];
+                for (size_t dp = 0; dp < ds->panes.len; dp++) {
+                    if (app->last_focused == ds->panes.items[dp]) app->last_focused = NULL;
+                    if (app->search_pane  == ds->panes.items[dp]) app->search_pane  = NULL;
+                    pane_kill_pty(ds->panes.items[dp]);
+                    free(ds->panes.items[dp]);
+                }
+                free(ds->panes.items);
+                free(ds);
+            }
+            free(ws->surfaces.items);
+            ws->surfaces.items = NULL;
+            ws->surfaces.len = 0;
+            ws->surfaces.cap = 0;
+        }
+
         /* Find surfaces array inside this workspace block */
-        const char *sf_arr = strstr(buf_copy, "\"surfaces\":[");
+        const char *sf_arr = json_find_key(buf_copy, "surfaces");
         if (sf_arr) {
             sf_arr = strchr(sf_arr, '[');
             if (sf_arr) sf_arr++;
@@ -7546,13 +7683,26 @@ bool lmux_snapshot_load(lmux_app *app, const char *path) {
                 lmux_surface *sf = NULL;
                 if (stitle[0]) {
                     sf = lmux_surface_create(ws, stitle);
-                    /* Remove the default pane surface_create added */
+                    /* lmux_surface_create() eagerly adds a default terminal
+                     * pane (with a spawned pty) that is not part of the
+                     * snapshot. Drop it before replaying the saved panes.
+                     * The surface stays registered in ws->surfaces -- only
+                     * its pane list is reset -- so freeing the surface here
+                     * would leave a dangling entry that lmux_workspace_close
+                     * later frees again (heap-use-after-free). */
                     if (sf && sf->panes.len > 0) {
                         for (size_t pi = 0; pi < sf->panes.len; pi++) {
+                            /* Clear app-level references before freeing, else
+                             * last-pane reads this pane after it is released. */
+                            if (app->last_focused == sf->panes.items[pi]) app->last_focused = NULL;
+                            if (app->search_pane  == sf->panes.items[pi]) app->search_pane  = NULL;
                             pane_kill_pty(sf->panes.items[pi]);
                             free(sf->panes.items[pi]);
                         }
+                        free(sf->panes.items);
+                        sf->panes.items = NULL;
                         sf->panes.len = 0;
+                        sf->panes.cap = 0;
                     }
                 }
 
