@@ -500,7 +500,12 @@ static int fuzz_malicious_patterns(void) {
         const char *out = NULL;
         bool waiting = false;
 
-        lmux_osc_parser_feed(p, "\033]9;hello\033", 12, &out, &waiting);
+        /* Derive the length from the array. A hand-counted 12 here sent the
+         * parser one byte past this 10-char literal (11 with the NUL), which
+         * ASan reported as a global-buffer-overflow and failed the sanitizers
+         * job (issue #16). sizeof - 1 excludes the NUL and cannot drift. */
+        static const char split_a[] = "\033]9;hello\033";
+        lmux_osc_parser_feed(p, split_a, sizeof split_a - 1, &out, &waiting);
         bool got = lmux_osc_parser_feed(p, "\\", 1, &out, &waiting);
         if (got && !out) { failures++; total_errors++; }
         lmux_osc_parser_free(p);
