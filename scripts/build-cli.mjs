@@ -6,7 +6,7 @@
  *
  * Output: build/lmux (statically linked CLI binary)
  *
- * Usage: node scripts/build-cli.mjs [--debug]
+ * Usage: node scripts/build-cli.mjs [--debug] [--sanitize]
  */
 
 import { execSync } from "node:child_process";
@@ -19,17 +19,25 @@ const ROOT = join(__dirname, "..");
 const BUILD = join(ROOT, "build");
 
 const debug = process.argv.includes("--debug");
+const sanitize = process.argv.includes("--sanitize");
 const CC = process.env.CC || "gcc";
+// -fsanitize has to be passed to BOTH the compile and the link. Forgetting it
+// at link time against an ASan-instrumented liblmux_core.a fails with
+// "undefined reference to __asan_init", so the sanitizer CI job could not
+// produce a usable binary at all (issue #14).
+const SAN = sanitize ? "-fsanitize=address,undefined -fno-omit-frame-pointer" : "";
 const LDFLAGS = [
     debug ? "-g" : "",
+    SAN,
     "-pthread",
-].join(" ").trim();
+].filter(Boolean).join(" ");
 const CFLAGS = [
     "-std=c17",
     "-Wall", "-Wextra",
     debug ? "-g -O0" : "-O2 -DNDEBUG",
+    SAN,
     `-I${join(ROOT, "include")}`,
-].join(" ");
+].filter(Boolean).join(" ");
 
 if (!existsSync(BUILD)) mkdirSync(BUILD, { recursive: true });
 

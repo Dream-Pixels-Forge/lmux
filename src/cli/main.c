@@ -28,6 +28,7 @@
 #include <sys/un.h>
 #include <errno.h>
 #include <signal.h>
+#include <fcntl.h>
 #include <sys/wait.h>
 
 /* Suppress format-truncation warnings in tmux translation functions.
@@ -70,6 +71,11 @@ static int connect_socket(const char *path) {
         fprintf(stderr, "lmux: socket() failed: %s\n", strerror(errno));
         return -1;
     }
+/* Set FD_CLOEXEC so the socket is not inherited by forked processes */
+fcntl(fd, F_SETFD, FD_CLOEXEC);
+
+/* Original code continues */
+memset(&addr, 0, sizeof addr);
     memset(&addr, 0, sizeof addr);
     addr.sun_family = AF_UNIX;
     strncpy(addr.sun_path, path, sizeof addr.sun_path - 1);
@@ -83,44 +89,56 @@ static int connect_socket(const char *path) {
 }
 
 static char *send_request(int fd, const char *json_request) {
-    /* Send request. */
+    /* Send request with trailing newline (server reads until \n). */
     size_t len = strlen(json_request);
-    if (write(fd, json_request, len) != (ssize_t)len) {
+    bool need_nl = (len == 0 || json_request[len - 1] != '\n');
+    size_t wlen = len + (need_nl ? 1 : 0);
+    char *wbuf = malloc(wlen + 1);
+    memcpy(wbuf, json_request, len);
+    if (need_nl) wbuf[len] = '\n';
+    wbuf[wlen] = '\0';
+    ssize_t wr = write(fd, wbuf, wlen);
+    free(wbuf);
+    if (wr != (ssize_t)wlen) {
         fprintf(stderr, "lmux: write failed: %s\n", strerror(errno));
-        return NULL;
     }
-    /* Read response — dynamically allocate to handle arbitrary response sizes. */
+    /* Read response — stop at first complete JSON line (response framing).
+     * The server writes one JSON object followed by a newline, then
+     * calls shutdown(client_fd, SHUT_WR) so the client's read returns
+     * immediately with the data read (not blocking forever on EOF).
+     * This avoids the fd-inheritance issue where forked PTY children
+     * hold the socket and prevent EOF delivery.
+     */
     size_t cap = 65536;
     size_t n = 0;
     char *buf = malloc(cap);
     if (!buf) {
         fprintf(stderr, "lmux: out of memory\n");
-        return NULL;
     }
     ssize_t r;
+    bool found_newline = false;
     while ((r = read(fd, buf + n, cap - n - 1)) > 0) {
         n += (size_t)r;
+        /* Check if we found a newline terminator */
+        for (size_t i = 0; i < n - 1; i++) {
+            if (buf[i] == '\n') {
+                found_newline = true;
+                /* Truncate at the newline */
+                n = i + 1;  /* Include the newline */
+                buf[i] = '\0';  /* Null-terminate at the newline */
+                break;
+            }
+        }
+        if (found_newline) break;
         /* Grow buffer if needed */
         if (n >= cap - 1) {
             cap *= 2;
             char *new_buf = realloc(buf, cap);
             if (!new_buf) {
-                free(buf);
                 fprintf(stderr, "lmux: out of memory\n");
-                return NULL;
             }
             buf = new_buf;
         }
-    }
-    if (n == 0 && r == 0) {
-        fprintf(stderr, "lmux: read failed: connection closed\n");
-        free(buf);
-        return NULL;
-    }
-    if (r < 0 && n == 0) {
-        fprintf(stderr, "lmux: read failed: %s\n", strerror(errno));
-        free(buf);
-        return NULL;
     }
     buf[n] = 0;
     return buf;
@@ -181,7 +199,6 @@ static char *translate_tmux_command(int argc, char **argv) {
         fprintf(stderr, "Tmux commands: new-session, kill-session, split-window,\n");
         fprintf(stderr, "  select-pane, select-window, list-sessions, list-panes,\n");
         fprintf(stderr, "  send-keys, rename-session, kill-server\n");
-        return NULL;
     }
 
     const char *tmux_cmd = argv[1];
@@ -189,7 +206,6 @@ static char *translate_tmux_command(int argc, char **argv) {
     size_t args_len = 0;
     char _esc[4096];
     char *json = malloc(8192);
-    if (!json) return NULL;
 
     /* new-session [-s name] [-d] [-x width] [-y height]
      * → workspace.create {"title": name} */
@@ -403,7 +419,6 @@ static char *translate_tmux_command(int argc, char **argv) {
         } else {
             fprintf(stderr, "lmux tmux: rename-session requires a new name\n");
             free(json);
-            return NULL;
         }
         return json;
     }
@@ -420,7 +435,6 @@ static char *translate_tmux_command(int argc, char **argv) {
     fprintf(stderr, "  select-pane, select-window, list-sessions, list-panes,\n");
     fprintf(stderr, "  send-keys, rename-session, kill-server\n");
     free(json);
-    return NULL;
 }
 
 /* ------------------------------------------------------------------ */
@@ -431,7 +445,6 @@ static char *translate_tmux_command(int argc, char **argv) {
  * Called with argv starting at the command name.
  * Returns a malloc'd string. */
 static char *build_json_command(int argc, char **argv) {
-    if (argc < 1) return NULL;
 
     /* Normalize command name: translate hyphens to underscores */
     char cmd_normalized[128];
@@ -610,8 +623,15 @@ static char *build_json_command(int argc, char **argv) {
     }
     /* workspace rename <id> <title> */
     else if (strcmp(cmd, "workspace.rename") == 0 && argc >= 3) {
+        /* Escape both arguments (#5). Interpolating argv raw produced
+         * malformed JSON for any title containing a quote, truncating the
+         * title and allowing injection of extra protocol arguments.
+         * json_escape_str is not reentrant, so two buffers are required. */
+        static char _esc_id[1024], _esc_title[1024];
         args_len = snprintf(args_buf, sizeof args_buf,
-                            "\"id\":\"%s\",\"title\":\"%s\"", argv[1], argv[2]);
+                            "\"id\":\"%s\",\"title\":\"%s\"",
+                            (json_escape(argv[1], _esc_id, sizeof _esc_id), _esc_id),
+                            (json_escape(argv[2], _esc_title, sizeof _esc_title), _esc_title));
     }
     /* surface.create [workspace_id] [title] */
     else if (strcmp(cmd, "surface.create") == 0) {
@@ -904,6 +924,19 @@ static char *build_json_command(int argc, char **argv) {
         }
     }
 
+    /* Shorthand mappings: bare command name → default subcommand */
+    if (strcmp(cmd, "workspace") == 0) { cmd = "workspace.list"; }
+    else if (strcmp(cmd, "surface") == 0) { cmd = "surface.list"; }
+    else if (strcmp(cmd, "pane") == 0) { cmd = "pane.list"; }
+    else if (strcmp(cmd, "notification") == 0) { cmd = "notification.list"; }
+    else if (strcmp(cmd, "window") == 0) { cmd = "window.list"; }
+    else if (strcmp(cmd, "ssh") == 0) { cmd = "ssh.list"; }
+    else if (strcmp(cmd, "agent") == 0) { cmd = "agent.list"; }
+    else if (strcmp(cmd, "feed") == 0) { cmd = "feed.panel.list"; }
+    else if (strcmp(cmd, "search") == 0) { cmd = "search.status"; }
+    else if (strcmp(cmd, "hooks") == 0) { cmd = "hooks.list"; }
+    else if (strcmp(cmd, "naming") == 0) { cmd = "naming.suggest"; }
+
     char *json = malloc(8192);
     if (args_len > 0) {
         snprintf(json, 8192, "{\"cmd\":\"%s\",\"args\":{%s}}", cmd, args_buf);
@@ -949,7 +982,6 @@ static char *build_json_command(int argc, char **argv) {
         snprintf(json, 8192, "{\"cmd\":\"help\",\"args\":{}}");
     } else if (strcmp(cmd, "version") == 0) {
         free(json);
-        return NULL; /* handled locally */
     } else {
         /* Unknown command — pass through as-is */
         snprintf(json, 8192, "{\"cmd\":\"%s\",\"args\":{}}", cmd);
@@ -961,6 +993,24 @@ static char *build_json_command(int argc, char **argv) {
 /* ------------------------------------------------------------------ */
 /* Pretty-print JSON response                                           */
 /* ------------------------------------------------------------------ */
+
+/* Map a daemon response to a process exit status (#4).
+ * Returns 0 on success and a distinct non-zero code per error class so that
+ * scripts, `set -e` and CI can detect failure. The printed output is
+ * unchanged; only the exit status differs. */
+static int exit_code_for_response(const char *response) {
+    if (!response) return 1;
+    if (!strstr(response, "\"ok\":false")) return 0;
+
+    const char *code = strstr(response, "\"code\":\"");
+    if (code) {
+        code += 8;
+        if (strncmp(code, "invalid_params", 14) == 0)   return 2;
+        if (strncmp(code, "not_found", 9) == 0)         return 3;
+        if (strncmp(code, "unknown_command", 15) == 0)  return 4;
+    }
+    return 1;
+}
 
 static void print_response(const char *response, bool raw_json) {
     if (!response) return;
@@ -1333,15 +1383,22 @@ int main(int argc, char **argv) {
         }
         /* Create a default workspace. */
         lmux_workspace_create(app, "default");
+        /* Restore the session BEFORE the socket starts accepting clients.
+         *
+         * Restoring rebuilds the entire model under the write lock, and a
+         * large snapshot (50 workspaces / 260 surfaces) takes long enough
+         * that clients connecting early simply block on the lock until their
+         * socket timeout expires and they report "empty response" (#9).
+         * Restoring first means the daemon is never advertised as ready while
+         * its model is half-rebuilt, so there is no window for a client to
+         * observe freed memory either. */
+        lmux_app_auto_restore_locked(app);
         /* Start socket server. */
         if (lmux_server_start_threaded(app) != 0) {
             fprintf(stderr, "lmux: failed to start socket server\n");
             lmux_app_free(app);
             return 1;
         }
-        /* Restore session AFTER socket is listening so clients
-           can connect while potentially large snapshots load. */
-        lmux_app_auto_restore(app);
         printf("lmux daemon ready. PID=%d\n", getpid());
         fflush(stdout);
         /* Main loop: check both app state and async exit flag. */
@@ -1432,9 +1489,10 @@ int main(int argc, char **argv) {
         }
 
         print_response(response, raw_json);
+        int rc = exit_code_for_response(response);
         free(response);
         free(json_request);
-        return 0;
+        return rc;
     }
 
     /* Socket commands: connect, send, receive, print. */
@@ -1461,7 +1519,8 @@ int main(int argc, char **argv) {
     }
 
     print_response(response, raw_json);
+    int rc = exit_code_for_response(response);
     free(response);
     free(json_request);
-    return 0;
+    return rc;
 }

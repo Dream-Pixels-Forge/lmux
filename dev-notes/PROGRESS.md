@@ -2,7 +2,7 @@
 
 **Project:** lmux
 **Started:** 2026-09-06
-**Current Phase:** Phase 3 - Engineer (Milestone 7: Final Gaps)
+**Current Phase:** Phase 3 - Engineer (Milestone 8: Memory Safety & CI Hardening)
 **Status:** In Progress
 
 ---
@@ -10,9 +10,39 @@
 ## Current State
 
 - **Project:** lmux - Terminal Multiplexer
-- **Started:** 2026-09-06
-- **Current Phase:** Phase 4 - Complete
-- **Status:** COMPLETE — All features implemented, 217 tests passing
+- **Current Phase:** Phase 3 - Engineer
+- **Status:** IN PROGRESS — remediation of issues #9-#14 (filed after live testing + comparison with `nami`)
+- **Branch:** `fix/issue-1-8-bugs` (issues #1-#8 fixes, uncommitted WIP)
+- **Baseline:** 217 tests; suite is currently RED (crash under `session.restore`)
+
+> Note: the previous entry claimed "COMPLETE — 217 tests passing". That is no
+> longer accurate. Live testing on 2026-10-02 found 14 defects; #9 (heap
+> use-after-free) crashes the daemon and must be fixed before the suite is green.
+
+---
+
+## Milestone 8: Memory Safety & CI Hardening (2026-10-02)
+
+All work is issue-driven (`git-driven-development`); status labels are the state machine.
+
+| Issue | Severity | Files | Label | Status |
+|-------|----------|-------|-------|--------|
+| #9 | critical | `src/core/model.c`, `src/cli/main.c` | `status:ready` | not started |
+| #10 | high | `src/core/model.c` | `status:ready` | not started |
+| #11 | tech-debt | `src/core/model.c` | `status:ready` | not started |
+| #12 | high | `src/core/model.c` | `status:ready` | not started |
+| #13 | medium | `.github/workflows/*`, `scripts/` | `status:ready` | not started |
+| #14 | high | `scripts/build-cli.mjs`, `.github/workflows/ci.yml`, `tests/` | `status:ready` | not started |
+
+### Serialization constraint
+Issues #9, #10, #11, #12 all touch `src/core/model.c` and **must be merged one at
+a time**, rebasing each onto `origin/master` before merge (git-driven-development §7).
+Issues #13 and #14 do not touch `model.c` and may proceed in parallel.
+
+### Known blocker
+`scripts/build-cli.mjs` does not forward `--sanitize` to the link step, so an
+instrumented CLI binary cannot be produced by the normal build. Issue #14 fixes
+this; until then, instrumented runs need a manual `gcc -fsanitize=...` link.
 
 ---
 

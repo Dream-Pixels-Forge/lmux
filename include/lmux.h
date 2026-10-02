@@ -543,6 +543,10 @@ char *lmux_dispatch_json(lmux_app *app, const char *json_request);
 
 void lmux_app_auto_save(lmux_app *app);
 void lmux_app_auto_restore(lmux_app *app);
+/* Same, but takes the model write lock first. Use from startup (main thread)
+ * where no lock is held yet; do NOT use from inside dispatch_command, which
+ * already holds rw_lock. */
+void lmux_app_auto_restore_locked(lmux_app *app);
 /* ------------------------------------------------------------------ */
 /* Focus history                                                      */
 /* ------------------------------------------------------------------ */
