@@ -50,6 +50,8 @@ jobs:
       - name: Run sanitizer tests
         run: |
           rm -f build/*.o build/*.a
+          node scripts/build-core.mjs --sanitize
+          node scripts/build-cli.mjs --sanitize
           node scripts/test.mjs --sanitize --unit
 
       - name: Build Debian package

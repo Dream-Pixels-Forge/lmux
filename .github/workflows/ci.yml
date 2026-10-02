@@ -65,6 +65,13 @@ jobs:
       - name: Build with ASan/UBSan
         run: node scripts/build-core.mjs --sanitize
 
+      # The CLI binary must be built as well: test.mjs --unit includes a
+      # "CLI help works" case that shells out to build/lmux, which only
+      # exists once build-cli.mjs has run. Without this step the job died
+      # with "CLI test FAILED (exit 127)" before it exercised any C code.
+      - name: Build CLI with ASan/UBSan
+        run: node scripts/build-cli.mjs --sanitize
+
       - name: Run tests with sanitizers
         run: node scripts/test.mjs --sanitize --unit
 
