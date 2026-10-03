@@ -310,6 +310,12 @@ struct lmux_pane {
     int           copy_sel_start_row;
     int           copy_sel_start_col;
     bool          copy_selecting;
+    /* Bounded scrollback of raw pty output. read-screen renders the tail of
+     * this instead of draining the pty, so repeated captures are repeatable
+     * and bytes after a NUL are not lost. */
+    char         *sb;
+    size_t        sb_len;
+    size_t        sb_cap;
 };
 /* pane_new defined after lmux_workspace struct — needs ws->app dereference */
 /* Spawn a child process with a pty for this pane.
@@ -555,6 +561,40 @@ static lmux_pane *pane_new(lmux_workspace *ws, lmux_surface *s,
     return p;
 }
 
+/* Scrollback limits. The buffer is bounded so a long-running pane cannot grow
+ * without limit; read-screen returns at most LMUX_CAPTURE_MAX of its tail. */
+#define LMUX_SCROLLBACK_MAX ((size_t)64 * 1024)
+#define LMUX_CAPTURE_MAX    ((size_t)8 * 1024)
+#define LMUX_PTY_DRAIN_MAX  ((size_t)256 * 1024)
+
+/* Append raw pty output to a pane's scrollback, discarding the oldest bytes
+ * once the cap is reached. Allocation is lazy so panes that are never read
+ * cost nothing. */
+static void pane_scrollback_append(lmux_pane *p, const char *data, size_t n) {
+    if (!p || !data || !n) return;
+    if (!p->sb) {
+        p->sb = malloc(LMUX_SCROLLBACK_MAX);
+        if (!p->sb) return;
+        p->sb_cap = LMUX_SCROLLBACK_MAX;
+    }
+    if (n > p->sb_cap) { data += n - p->sb_cap; n = p->sb_cap; }
+    if (p->sb_len + n > p->sb_cap) {
+        size_t drop = p->sb_len + n - p->sb_cap;
+        memmove(p->sb, p->sb + drop, p->sb_len - drop);
+        p->sb_len -= drop;
+    }
+    memcpy(p->sb + p->sb_len, data, n);
+    p->sb_len += n;
+}
+
+static void pane_scrollback_free(lmux_pane *p) {
+    if (!p) return;
+    free(p->sb);
+    p->sb = NULL;
+    p->sb_len = 0;
+    p->sb_cap = 0;
+}
+
 static lmux_surface *surface_new(lmux_workspace *ws) {
     lmux_surface *s = calloc(1, sizeof *s);
     if (!s) return NULL;
@@ -692,6 +732,7 @@ void lmux_app_free(lmux_app *a) {
             lmux_surface *s = ws->surfaces.items[j];
             for (size_t k = 0; k < s->panes.len; k++) {
                 pane_kill_pty(s->panes.items[k]);
+                pane_scrollback_free(s->panes.items[k]);
                 free(s->panes.items[k]);
             }
             free(s->panes.items);
@@ -969,6 +1010,7 @@ void lmux_workspace_close(lmux_app *a, lmux_workspace *ws) {
                 lmux_surface *s = ws->surfaces.items[j];
                 for (size_t k = 0; k < s->panes.len; k++) {
                     pane_kill_pty(s->panes.items[k]);
+                    pane_scrollback_free(s->panes.items[k]);
                     free(s->panes.items[k]);
                 }
                 free(s->panes.items);
@@ -1134,6 +1176,7 @@ void lmux_surface_close(lmux_workspace *ws, lmux_surface *s) {
         if (ws->surfaces.items[i] == s) {
             for (size_t k = 0; k < s->panes.len; k++) {
                 pane_kill_pty(s->panes.items[k]);
+                pane_scrollback_free(s->panes.items[k]);
                 free(s->panes.items[k]);
             }
             free(s->panes.items);
@@ -1195,6 +1238,7 @@ void lmux_pane_close(lmux_workspace *ws, lmux_pane *p) {
         for (size_t j = 0; j < s->panes.len; j++) {
             if (s->panes.items[j] == p) {
                 pane_kill_pty(p);
+                pane_scrollback_free(p);
                 vec_remove(&s->panes, j);
                 free(p);
                 return;
@@ -2676,7 +2720,11 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
     }
 
     /* --- read-screen --- */
-    if (strcmp(cmd, "read-screen") == 0 || strcmp(cmd, "read_screen") == 0 || strcmp(cmd, "capture-pane") == 0) {
+    /* `capture_pane` is accepted because build_json_command() in the CLI
+     * rewrites every hyphen to an underscore, so the documented `capture-pane`
+     * arrives here spelled `capture_pane`. Same reason `read_screen` exists. */
+    if (strcmp(cmd, "read-screen") == 0 || strcmp(cmd, "read_screen") == 0 ||
+        strcmp(cmd, "capture-pane") == 0 || strcmp(cmd, "capture_pane") == 0) {
         char ws_id[64] = {0}, s_id[64] = {0};
         json_extract_string(args_json, "workspace_id", ws_id, sizeof ws_id);
         json_extract_string(args_json, "surface_id", s_id, sizeof s_id);
@@ -2710,37 +2758,61 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             if (cp->focused) { p = cp; break; }
         }
         if (!p && s->panes.len > 0) p = s->panes.items[0];
-        if (!p || p->pty_fd < 0) {
+        if (!p) {
             written = snprintf(result, result_cap,
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no pty to read\"}}");
             goto done;
         }
-        /* Non-blocking read from pty master */
-        char screen[2048];
-        size_t slen = 0;
+        if (p->pty_fd < 0) {
+            /* Panes restored from a snapshot are created without a pty. Attach
+             * on first read, exactly as lmux_pane_send_keys() does on first
+             * write, so a restored pane is not unreadable until typed into. */
+            if (pane_spawn_pty(p) != 0) {
+                lmux_log(LMUX_LOG_DEBUG, "read-screen: no pty for pane %u", p->id);
+                written = snprintf(result, result_cap,
+                    "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no pty to read\"}}");
+                goto done;
+            }
+        }
+        /* Drain the pty into the pane's scrollback. read-screen used to return these
+         * bytes directly, which made it a destructive drain: a second call saw
+         * nothing, and anything past a NUL was discarded by the escaping loop. */
+        char chunk[4096];
         int flags = fcntl(p->pty_fd, F_GETFL, 0);
         fcntl(p->pty_fd, F_SETFL, flags | O_NONBLOCK);
+        size_t drained = 0;
         ssize_t r;
-        while (slen < sizeof screen - 1 && (r = read(p->pty_fd, screen + slen, sizeof screen - 1 - slen)) > 0) {
-            slen += (size_t)r;
+        while ((r = read(p->pty_fd, chunk, sizeof chunk)) > 0) {
+            pane_scrollback_append(p, chunk, (size_t)r);
+            drained += (size_t)r;
+            if (drained >= LMUX_PTY_DRAIN_MAX) break;
         }
         fcntl(p->pty_fd, F_SETFL, flags);
-        screen[slen] = 0;
-        /* Escape for JSON */
-        char escaped[4096];
-        size_t elen = 0;
-        for (size_t ii = 0; screen[ii] && elen < sizeof escaped - 6; ii++) {
-            char c = screen[ii];
-            if (c == '\\' || c == '"') { escaped[elen++] = '\\'; escaped[elen++] = c; }
-            else if (c == '\n') { escaped[elen++] = '\\'; escaped[elen++] = 'n'; }
-            else if (c == '\r') { escaped[elen++] = '\\'; escaped[elen++] = 'r'; }
-            else if (c == '\t') { escaped[elen++] = '\\'; escaped[elen++] = 't'; }
-            else if ((unsigned char)c < 32) { /* skip control chars */ }
-            else { escaped[elen++] = c; }
+        /* Render the tail of the scrollback, escaping by length rather than by
+         * NUL termination so embedded NULs cannot truncate the capture. */
+        size_t start = (p->sb_len > LMUX_CAPTURE_MAX) ? p->sb_len - LMUX_CAPTURE_MAX : 0;
+        size_t n = p->sb_len - start;
+        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{\"text\":\"");
+        if (written < 0) written = 0;
+        for (size_t ii = 0; ii < n; ii++) {
+            RESULT_GROW;
+            char c = p->sb[start + ii];
+            switch (c) {
+                case '\\': result[written++] = '\\'; result[written++] = '\\'; break;
+                case '"':  result[written++] = '\\'; result[written++] = '"';  break;
+                case '\n': result[written++] = '\\'; result[written++] = 'n';  break;
+                case '\r': result[written++] = '\\'; result[written++] = 'r';  break;
+                case '\t': result[written++] = '\\'; result[written++] = 't';  break;
+                default:
+                    /* Drop remaining control bytes, including NUL. */
+                    if ((unsigned char)c >= 32) result[written++] = c;
+                    break;
+            }
         }
-        escaped[elen] = 0;
-        written = snprintf(result, result_cap,
-            "{\"ok\":true,\"result\":{\"text\":\"%s\"}}", escaped);
+        RESULT_GROW;
+        int tail = snprintf(result + written, result_cap - (size_t)written, "\"}}");
+        if (tail > 0) written += tail;
+        result[written] = 0;
         goto done;
     }
 

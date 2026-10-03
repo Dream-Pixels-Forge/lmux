@@ -1,7 +1,8 @@
 # Handoff — lmux @ master
 
 **Date:** 2026-10-03
-**Branch state:** `master` @ `4219daa`, clean, in sync with origin
+**Branch state:** `master` @ `b25ccdb` (PR #20, PTY deferral during snapshot
+restore), clean, in sync with origin
 **Open issues:** 0
 **Version:** 1.1.1
 
