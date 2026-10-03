@@ -435,6 +435,11 @@ static char *translate_tmux_command(int argc, char **argv) {
     fprintf(stderr, "  select-pane, select-window, list-sessions, list-panes,\n");
     fprintf(stderr, "  send-keys, rename-session, kill-server\n");
     free(json);
+    /* Must return: falling off the end of this non-void function handed
+     * main() an indeterminate pointer, which it then free()d — ASan reported
+     * `bad-free` and glibc aborted with "double free or corruption".
+     * NULL is already the documented "nothing to send" result. */
+    return NULL;
 }
 
 /* ------------------------------------------------------------------ */

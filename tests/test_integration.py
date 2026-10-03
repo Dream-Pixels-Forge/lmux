@@ -15,6 +15,7 @@ Usage:
 
 import os
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -506,6 +507,41 @@ class TestConfig(unittest.TestCase):
         for key in ["font_family", "font_size", "theme", "scrollback_lines",
                      "show_sidebar", "auto_save_session", "default_shell"]:
             self.assertIn(key, cfg, f"missing config key: {key}")
+
+
+class TestTmuxCompatCli(unittest.TestCase):
+    """CLI-level checks that run the binary directly.
+
+    These exercise code paths that only run in the client process, so they
+    cannot be covered by the socket-based tests above.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        repo_root = Path(__file__).parent.parent
+        cls.bin = repo_root / "build" / "lmux"
+        if not cls.bin.exists():
+            raise unittest.SkipTest(
+                f"lmux binary not found at {cls.bin}; run the build first")
+
+    def test_unknown_tmux_subcommand_exits_cleanly(self):
+        """B7: translate_tmux_command() fell off the end on an unknown
+        subcommand after free(json), returning a dangling pointer. main()
+        then free()d that garbage — AddressSanitizer reported `bad-free` and
+        glibc aborted with "double free or corruption"."""
+        proc = subprocess.run(
+            [str(self.bin), "tmux", "definitely-not-a-command"],
+            capture_output=True, text=True, timeout=30,
+        )
+        # A negative return code means the process died on a signal, which is
+        # exactly the heap-corruption abort we are guarding against.
+        self.assertGreaterEqual(
+            proc.returncode, 0,
+            f"CLI crashed on a bad signal (rc={proc.returncode}); "
+            f"stderr tail: {proc.stderr[-300:]}",
+        )
+        self.assertNotIn("corruption", proc.stderr.lower())
+        self.assertNotIn("AddressSanitizer", proc.stderr)
 
 
 # ====================================================================
