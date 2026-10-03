@@ -544,6 +544,71 @@ class TestTmuxCompatCli(unittest.TestCase):
         self.assertNotIn("AddressSanitizer", proc.stderr)
 
 
+class TestBrowserScreenshotPathValidation(unittest.TestCase):
+    """#12: browser.screenshot accepted an arbitrary write path from any socket
+    client, letting a same-UID process or agent clobber any file the daemon
+    could write. Screenshot paths must be relative and confined to the
+    screenshot root."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.client, cls.daemon, cls.home = _isolated_client()
+
+    @classmethod
+    def tearDownClass(cls):
+        _shutdown_isolated(cls.daemon, cls.home)
+
+    def _shot(self, path):
+        return self.client.send("browser.screenshot", {"path": path})
+
+    def test_absolute_path_outside_root_is_rejected(self):
+        for bad in ["/tmp/pwned.png", "/etc/cron.d/pwn", "~/.bashrc"]:
+            resp = self._shot(bad)
+            self.assertFalse(resp.get("ok"), f"{bad!r} must be rejected: {resp}")
+            self.assertEqual(resp.get("error", {}).get("code"),
+                             "invalid_params", f"{bad!r}: {resp}")
+
+    def test_traversal_escape_is_rejected(self):
+        for bad in ["../escape.png", "sub/../../escape.png", "../../.bashrc"]:
+            resp = self._shot(bad)
+            self.assertFalse(resp.get("ok"), f"{bad!r} must be rejected: {resp}")
+
+    def test_rejected_write_leaves_no_file(self):
+        target = Path(self.home, "pwned-by-lmux.txt")
+        resp = self._shot(str(target))
+        self.assertFalse(resp.get("ok"))
+        self.assertFalse(target.exists(),
+                         "daemon must not create a file outside its root")
+
+    def test_relative_path_inside_root_is_accepted(self):
+        resp = self._shot("shot.png")
+        self.assertTrue(resp.get("ok"), f"relative path should be allowed: {resp}")
+        self.assertNotIn("..", resp.get("result", {}).get("path", ""))
+
+    def test_path_is_json_escaped_in_event_payload(self):
+        """A quote in the name must not break out of the JSON string that is
+        persisted to events.jsonl and echoed in the response.
+
+        The response is parsed with json.loads(), so reaching this assertion
+        already proves the wire format stayed valid: unescaped, the reply would
+        not have parsed at all. What must hold is that the escaped value
+        round-trips back to exactly what was asked for.
+        """
+        resp = self._shot('weird"name.png')
+        self.assertTrue(resp.get("ok"), resp)
+        path = resp.get("result", {}).get("path", "")
+        self.assertTrue(
+            path.endswith('weird"name.png'),
+            f"escaped path should round-trip to the original name: {path!r}",
+        )
+
+    def test_default_path_is_inside_root(self):
+        resp = self.client.send("browser.screenshot")
+        self.assertTrue(resp.get("ok"), resp)
+        self.assertTrue(resp.get("result", {}).get("path", "").startswith("/"),
+                        "default path should be absolute and rooted")
+
+
 # ====================================================================
 # Config persistence (round-trip through disk)
 # ====================================================================

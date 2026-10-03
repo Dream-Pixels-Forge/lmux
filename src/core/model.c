@@ -107,6 +107,23 @@ static bool is_safe_path(const char *path, const char *base_dir) {
     return true;
 }
 
+/* Root directory browser.screenshot is confined to (#12). Kept under the
+ * user's cache dir so a screenshot write can never reach a shell profile, an
+ * autostart entry, or a systemd unit. */
+static void browser_screenshot_root(char *buf, size_t cap) {
+    const char *xdg_cache = getenv("XDG_CACHE_HOME");
+    if (xdg_cache && xdg_cache[0]) {
+        snprintf(buf, cap, "%s/lmux/screenshots", xdg_cache);
+        return;
+    }
+    const char *home = getenv("HOME");
+    if (home && home[0]) {
+        snprintf(buf, cap, "%s/.cache/lmux/screenshots", home);
+        return;
+    }
+    snprintf(buf, cap, "/tmp/lmux-screenshots-%ld", (long)getuid());
+}
+
 /* ----- Vector helper ----- */
 
 #define VEC_GROW 8
@@ -4315,13 +4332,47 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         goto done;
     }
 
+    /* browser.screenshot (#12): the path used to be taken verbatim from the
+     * request, so any same-UID socket client could make the daemon write to an
+     * arbitrary location. Confine it to a cache root and reject anything that
+     * escapes it. */
     if (strcmp(cmd, "browser.screenshot") == 0) {
-        char path[1024] = {0};
-        json_extract_string(args_json, "path", path, sizeof path);
-        if (!path[0]) strncpy(path, "/tmp/lmux-screenshot.png", sizeof path - 1);
-        lmux_event_push(app, "browser.screenshot", "browser", "\"path\":\"%s\"", path);
+        char req[1024] = {0};
+        char root[1024];
+        char resolved[2048];
+        char esc[2048];
+
+        browser_screenshot_root(root, sizeof root);
+
+        json_extract_string(args_json, "path", req, sizeof req);
+        if (!req[0]) {
+            snprintf(resolved, sizeof resolved, "%s/screenshot.png", root);
+        } else {
+            /* A leading "~" is contained by the root, so it is not an escape,
+             * but it is always a mistake (it would silently become
+             * <root>/~/.bashrc). Reject it rather than quietly rewriting it. */
+            if (req[0] == '~') {
+                written = snprintf(result, result_cap,
+                    "{\"ok\":false,\"error\":{\"code\":\"invalid_params\","
+                    "\"message\":\"screenshot path must not start with '~'\"}}");
+                goto done;
+            }
+            /* is_safe_path() with a base_dir rejects absolute paths, ".."
+             * components, and anything not contained by base_dir. */
+            if (!is_safe_path(req, root)) {
+                written = snprintf(result, result_cap,
+                    "{\"ok\":false,\"error\":{\"code\":\"invalid_params\","
+                    "\"message\":\"screenshot path must be relative and inside %s\"}}",
+                    root);
+                goto done;
+            }
+            snprintf(resolved, sizeof resolved, "%s/%s", root, req);
+        }
+
+        json_escape_str(esc, sizeof esc, resolved);
+        lmux_event_push(app, "browser.screenshot", "browser", "\"path\":\"%s\"", esc);
         written = snprintf(result, result_cap,
-            "{\"ok\":true,\"result\":{\"path\":\"%s\"}}", path);
+            "{\"ok\":true,\"result\":{\"path\":\"%s\"}}", esc);
         goto done;
     }
 
