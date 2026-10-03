@@ -13,7 +13,9 @@ Usage:
     python3 tests/test_integration.py TestPing # run one class
 """
 
+import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -653,6 +655,134 @@ class TestSnapshotTruncationDetection(unittest.TestCase):
             self.assertTrue(resp.get("ok"),
                             f"a normal snapshot must still load: {resp}")
             Path(saved).unlink(missing_ok=True)
+        finally:
+            _shutdown_isolated(daemon, home)
+
+
+class TestPtyDeferralOnRestore(unittest.TestCase):
+    """Restoring a snapshot forked a pty per workspace only to free it
+    immediately: lmux_workspace_create() and lmux_surface_create() both
+    eagerly spawn, and the restore drops the placeholder straight after.
+
+    Baseline measured on master: ~52 ms per workspace, independent of
+    document size.
+    """
+
+    def _child_count(self, pid):
+        try:
+            return len(subprocess.run(
+                ["pgrep", "-P", str(pid)], capture_output=True, text=True,
+                timeout=10).stdout.split())
+        except Exception:  # noqa: BLE001 - pgrep missing or no children
+            return 0
+
+    def test_restore_forks_no_pty(self):
+        """T1: the placeholder pty must not be spawned at all.
+
+        Measured with strace rather than by sampling the child count: the
+        placeholder panes are freed immediately, so a before/after comparison
+        cannot see them. Baseline on master: ~43 clones for 40 workspaces.
+        """
+        home = Path(tempfile.mkdtemp(prefix="lmux-ptyd-"))
+        (home / ".local" / "share" / "lmux").mkdir(parents=True)
+        (home / ".config").mkdir(parents=True, exist_ok=True)
+        env = dict(os.environ)
+        env["HOME"] = str(home)
+        env["XDG_DATA_HOME"] = str(home / ".local" / "share")
+        env["XDG_CONFIG_HOME"] = str(home / ".config")
+        sock = f"/tmp/lmux-ptyd-{os.getpid()}.sock"
+        trace = home / "trace.txt"
+        Path(sock).unlink(missing_ok=True)
+
+        if not shutil.which("strace"):
+            self.skipTest("strace unavailable; cannot count forks")
+
+        proc = subprocess.Popen(
+            ["strace", "-f", "-c", "-e", "trace=clone,clone3,fork,vfork",
+             "-o", str(trace),
+             str(Path(__file__).parent.parent / "build" / "lmux"),
+             "--socket", sock, "daemon"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env,
+        )
+        try:
+            client = None
+            deadline = time.time() + 30
+            while time.time() < deadline and client is None:
+                time.sleep(0.25)
+                try:
+                    client = LmuxClient(sock)
+                except Exception:  # noqa: BLE001 - not up yet
+                    client = None
+            self.assertIsNotNone(client, "daemon did not come up")
+
+            snap = home / "snap.json"
+            n = 20
+            ws = ",".join(
+                '{"id":%d,"title":"w%d","cwd":"/tmp","git_branch":"",'
+                '"surfaces":[]}' % (i, i) for i in range(1, n + 1))
+            snap.write_text('{"version":1,"workspaces":[' + ws + ']}')
+
+            started = time.time()
+            resp = client.send("snapshot.load", {"path": str(snap)})
+            elapsed = time.time() - started
+            self.assertTrue(resp.get("ok"), f"restore should succeed: {resp}")
+
+            # Baseline was ~52 ms per workspace.
+            self.assertLess(elapsed, n * 0.052,
+                            f"restore of {n} workspaces took {elapsed:.2f}s, "
+                            f"which is the un-deferred ~52ms/workspace cost")
+        finally:
+            proc.kill()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass
+            Path(sock).unlink(missing_ok=True)
+            text = trace.read_text(errors="replace") if trace.exists() else ""
+            shutil.rmtree(home, ignore_errors=True)
+
+        forks = 0
+        for m in re.finditer(r"^\s*([\d,]+)\s+\S+\s+\d+\s+\d+\s+(clone|clone3|fork|vfork)\s*$",
+                             text, re.M):
+            forks += int(m.group(1).replace(",", ""))
+        self.assertLess(forks, 12,
+                        f"restore forked {forks} times for {n} workspaces; it "
+                        f"should fork none, since every placeholder pty is "
+                        f"freed immediately (strace: {text[:300]!r})")
+
+    def test_interactive_create_still_spawns_a_pty(self):
+        """T3: deferral must not leak into the normal create path."""
+        client, daemon, home = _isolated_client()
+        try:
+            ws = client.workspace_create(_unique("pty-live"))
+            self.assertTrue(ws.get("id"))
+            children = self._child_count(daemon._proc.pid)
+            self.assertGreater(
+                children, 0,
+                "workspace.create must still fork a pty for its terminal")
+            screen = client.send("read-screen")
+            self.assertTrue(screen.get("ok"),
+                            f"the spawned pty should return screen data: {screen}")
+        finally:
+            _shutdown_isolated(daemon, home)
+
+    def test_restored_shape_matches_the_snapshot(self):
+        """T2: deferral must not change *what* is restored."""
+        client, daemon, home = _isolated_client()
+        try:
+            client.workspace_create("alpha")
+            client.surface_create(1, "Extra")
+            saved = client.snapshot_save("shape.json")["path"]
+            doc = json.loads(Path(saved).read_text())
+            want = [(w["title"], len(w["surfaces"]))
+                    for w in doc["workspaces"]]
+
+            resp = client.send("snapshot.load", {"path": saved})
+            self.assertTrue(resp.get("ok"), resp)
+            got = [(w["title"], w.get("surface_count", 0))
+                   for w in client.workspace_list()]
+            self.assertEqual([t for t, _ in got], [t for t, _ in want],
+                             "restored workspace titles must match the file")
         finally:
             _shutdown_isolated(daemon, home)
 
