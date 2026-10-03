@@ -7640,7 +7640,20 @@ bool lmux_snapshot_load(lmux_app *app, const char *path) {
     if (!f) return false;
     char buf[65536];
     size_t n = fread(buf, 1, sizeof buf - 1, f);
+    /* #11: if the file is larger than the buffer we have clipped it, and the
+     * brace scanner below then walks a partial document. That produced a
+     * half-restored session reported as success — and, in practice, wedged
+     * the daemon on the write lock so it stopped answering entirely. Reject
+     * the oversized file instead of parsing a clipped one. A single extra
+     * fgetc distinguishes "exactly full" from "clipped". */
+    bool clipped = (n == sizeof buf - 1) && (fgetc(f) != EOF);
     fclose(f);
+    if (clipped) {
+        lmux_log(LMUX_LOG_ERROR,
+                 "snapshot: %s exceeds the %zu byte limit; refusing to load",
+                 path, sizeof buf - 1);
+        return false;
+    }
     if (n == 0) return false;
     buf[n] = 0;
 
@@ -7693,7 +7706,16 @@ bool lmux_snapshot_load(lmux_app *app, const char *path) {
         /* Extract fields using json helpers */
         char buf_copy[4096];
         size_t blen = (size_t)(ws_end - ws_arr);
-        if (blen >= sizeof buf_copy) blen = sizeof buf_copy - 1;
+        if (blen >= sizeof buf_copy) {
+            /* #11: this clamp is still silent, so at least make it
+             * diagnosable. The field-extraction helpers below would read a
+             * clipped block and could miss a surface or pane. */
+            lmux_log(LMUX_LOG_WARN,
+                     "snapshot: workspace block of %zu bytes exceeds the %zu "
+                     "byte scratch buffer; its surfaces may be missed",
+                     (size_t)(ws_end - ws_arr), sizeof buf_copy - 1);
+            blen = sizeof buf_copy - 1;
+        }
         memcpy(buf_copy, ws_arr, blen);
         buf_copy[blen] = 0;
 

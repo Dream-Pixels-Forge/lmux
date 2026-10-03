@@ -609,6 +609,57 @@ class TestBrowserScreenshotPathValidation(unittest.TestCase):
                         "default path should be absolute and rooted")
 
 
+class TestSnapshotTruncationDetection(unittest.TestCase):
+    """#11: lmux_snapshot_load() read into a fixed 64 KB buffer and silently
+    truncated anything larger, producing a partially-restored session that
+    still reported success. Truncation must be detected and reported."""
+
+    def test_oversized_snapshot_is_rejected_not_silently_truncated(self):
+        client, daemon, home = _isolated_client()
+        try:
+            snap = Path(tempfile.gettempdir(),
+                        f"lmux-test-big-{os.getpid()}.json")
+            # ~70 KB, comfortably past the 64 KB buffer.
+            workspaces = "".join(
+                '{"title":"ws%04d","cwd":"/tmp","surfaces":[]}' % i
+                for i in range(1800))
+            snap.write_text('{"workspaces":[' + workspaces + ']}')
+            self.assertGreater(snap.stat().st_size, 65536,
+                               "fixture must exceed the 64 KB buffer")
+
+            resp = client.send("snapshot.load", {"path": str(snap)})
+            self.assertFalse(resp.get("ok"),
+                             f"oversized snapshot must not report success: "
+                             f"{resp.get('ok')}")
+            self.assertEqual(resp.get("error", {}).get("code"), "load_failed")
+        finally:
+            _shutdown_isolated(daemon, home)
+            try:
+                snap.unlink()
+            except (OSError, UnboundLocalError):
+                pass
+
+    def test_normal_sized_snapshot_still_loads(self):
+        """The guard must not reject snapshots that legitimately fit."""
+        client, daemon, home = _isolated_client()
+        try:
+            ws = client.workspace_create(_unique("snap-fits"))
+            snap = Path(tempfile.gettempdir(),
+                        f"lmux-test-fits-{os.getpid()}.json")
+            client.snapshot_save(str(snap))
+            self.assertLess(snap.stat().st_size, 65536)
+
+            resp = client.send("snapshot.load", {"path": str(snap)})
+            self.assertTrue(resp.get("ok"),
+                            f"a normal snapshot must still load: {resp}")
+        finally:
+            _shutdown_isolated(daemon, home)
+            try:
+                snap.unlink()
+            except (OSError, UnboundLocalError):
+                pass
+
+
 # ====================================================================
 # Config persistence (round-trip through disk)
 # ====================================================================
