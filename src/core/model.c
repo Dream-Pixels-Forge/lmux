@@ -508,6 +508,12 @@ struct lmux_app {
     /* SSH sessions */
     vec_t       ssh_sessions;         /* of lmux_ssh_session* */
     lmux_id     next_ssh_session_id;  /* auto-increment session id */
+    /* Focus history, fed on every focus change; backs `focus.history` */
+    lmux_focus_history focus_history;
+    lmux_id            last_focus_recorded; /* dedupe consecutive same-pane focus */
+    /* Agent lifecycle hook scripts: hooks.add/list/remove */
+    vec_t       hooks;                /* of lmux_hook_script* */
+    lmux_id     next_hook_id;
     /* Feed panels */
     vec_t       feed_panels;          /* of lmux_feed_panel* */
     vec_t       feed_entries;         /* of lmux_feed_entry* */
@@ -595,6 +601,81 @@ static void pane_scrollback_free(lmux_pane *p) {
     p->sb_cap = 0;
 }
 
+/* Agent lifecycle events a hook script can bind to (ARCHITECTURE.md). */
+typedef enum {
+    LMUX_HOOK_SESSION_START = 0,
+    LMUX_HOOK_PROMPT_SUBMIT,
+    LMUX_HOOK_STOP,
+    LMUX_HOOK_ERROR,
+    LMUX_HOOK__COUNT
+} lmux_hook_event;
+
+#define LMUX_HOOKS_MAX 256
+
+typedef struct {
+    lmux_id        id;
+    lmux_hook_event event;
+    char           command[512];   /* shell command to run on the event */
+} lmux_hook_script;
+
+static const char *const HOOK_EVENT_NAMES[LMUX_HOOK__COUNT] = {
+    "session-start", "prompt-submit", "stop", "error"
+};
+
+/* Map a wire name to an event, or -1 if unknown. */
+static int hook_event_from_name(const char *name) {
+    if (!name) return -1;
+    for (int i = 0; i < LMUX_HOOK__COUNT; i++)
+        if (strcmp(name, HOOK_EVENT_NAMES[i]) == 0) return i;
+    return -1;
+}
+
+/* Bounded registry: reject writes past LMUX_HOOKS_MAX rather than growing. */
+static lmux_hook_script *hook_add(lmux_app *app, int ev, const char *command) {
+    if (!app || ev < 0 || !command) return NULL;
+    if (app->hooks.len >= LMUX_HOOKS_MAX) {
+        lmux_log(LMUX_LOG_ERROR, "hooks: registry full (%d), rejecting add",
+                 LMUX_HOOKS_MAX);
+        return NULL;
+    }
+    lmux_hook_script *h = calloc(1, sizeof *h);
+    if (!h) return NULL;
+    h->id = app->next_hook_id++;
+    h->event = (lmux_hook_event)ev;
+    snprintf(h->command, sizeof h->command, "%s", command);
+    vec_push(&app->hooks, h);
+    return h;
+}
+
+static bool hook_remove(lmux_app *app, int ev) {
+    if (!app || ev < 0) return false;
+    for (size_t i = 0; i < app->hooks.len; i++) {
+        lmux_hook_script *h = app->hooks.items[i];
+        if ((int)h->event == ev) {
+            vec_remove(&app->hooks, i);
+            free(h);
+            return true;
+        }
+    }
+    return false;
+}
+
+static void hooks_free_all(lmux_app *app) {
+    for (size_t i = 0; i < app->hooks.len; i++) free(app->hooks.items[i]);
+    free(app->hooks.items);
+    app->hooks.items = NULL;
+    app->hooks.len = 0;
+}
+
+/* Record a focus change. ids may be NULL when the target has no id yet. */
+static void app_focus_changed(lmux_app *app, lmux_pane *p) {
+    if (!app) return;
+    char pane_id[32] = "-", ws_id[32] = "-";
+    if (p) snprintf(pane_id, sizeof pane_id, "%u", p->id);
+    if (p && p->owner) snprintf(ws_id, sizeof ws_id, "%u", p->owner->id);
+    lmux_focus_history_push(&app->focus_history, pane_id, ws_id);
+}
+
 static lmux_surface *surface_new(lmux_workspace *ws) {
     lmux_surface *s = calloc(1, sizeof *s);
     if (!s) return NULL;
@@ -640,6 +721,9 @@ lmux_app *lmux_app_new(const char *socket_path) {
     a->next_window_id = 1;
     a->next_ssh_session_id = 1;
     a->next_feed_panel_id = 1;
+    a->hooks = (vec_t){0};
+    a->next_hook_id = 1;
+    lmux_focus_history_init(&a->focus_history);
     a->log_level = LMUX_LOG_INFO;
     a->start_time = time(NULL);
 
@@ -772,6 +856,7 @@ void lmux_app_free(lmux_app *a) {
     free(a->notifications.items);
     /* Free configuration */
     lmux_config_free(a->config);
+    hooks_free_all(a);
     pthread_rwlock_destroy(&a->rw_lock);
     pthread_mutex_destroy(&a->event_lock);
     free(a);
@@ -1279,6 +1364,13 @@ void lmux_pane_focus(lmux_workspace *ws, lmux_pane *p) {
         }
     }
     ws->app->last_focused = p;
+    /* Every focus change flows through here, so record it for
+     * `focus.history`. Skip no-op refocuses of the same pane. */
+    if (ws->app->focus_history.count == 0 ||
+        ws->app->last_focus_recorded != p->id) {
+        app_focus_changed(ws->app, p);
+        ws->app->last_focus_recorded = p->id;
+    }
 }
 
 void lmux_pane_focus_dir(lmux_workspace *ws, int dx, int dy) {
@@ -7347,6 +7439,240 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             written = snprintf(result, result_cap,
                 "{\"ok\":true,\"result\":{\"active\":false}}");
         }
+        goto done;
+    }
+
+    /* --- previously advertised but never dispatched -------------------------
+ * These names were listed in --help (and five in is_readonly_cmd) while
+ * having no handler, so every one returned unknown_command. The
+ * subsystems all existed; only the dispatch was missing. */
+
+    /* ssh.list — same payload as the already-working ssh.session.list */
+    if (strcmp(cmd, "ssh.list") == 0 || strcmp(cmd, "ssh_list") == 0) {
+        char buf[8192];
+        int n = snprintf(buf, sizeof buf, "{\"ok\":true,\"result\":{\"sessions\":[");
+        for (size_t i = 0; i < app->ssh_sessions.len; i++) {
+            lmux_ssh_session *s = app->ssh_sessions.items[i];
+            if (i > 0) n += snprintf(buf + n, sizeof buf - n, ",");
+            n += snprintf(buf + n, sizeof buf - n,
+                "{\"id\":%u,\"host\":\"%s\",\"user\":\"%s\",\"active\":%s}",
+                s->id, s->host, s->user, s->active ? "true" : "false");
+        }
+        n += snprintf(buf + n, sizeof buf - n, "]}}");
+        written = snprintf(result, result_cap, "%s", buf);
+        goto done;
+    }
+
+    /* ssh.connect <host> [user] [key] — create a session and attach it */
+    if (strcmp(cmd, "ssh.connect") == 0 || strcmp(cmd, "ssh_connect") == 0) {
+        char host[256] = {0}, user[128] = {0}, key[512] = {0}, pane_id[64] = {0};
+        json_extract_string(args_json, "host", host, sizeof host);
+        json_extract_string(args_json, "user", user, sizeof user);
+        json_extract_string(args_json, "key_path", key, sizeof key);
+        json_extract_string(args_json, "pane_id", pane_id, sizeof pane_id);
+        if (!host[0]) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"host required\"}}");
+            goto done;
+        }
+        lmux_ssh_session *s = lmux_ssh_session_create(app, host,
+                                                      user[0] ? user : NULL,
+                                                      key[0] ? key : NULL);
+        if (!s) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"internal\",\"message\":\"ssh session create failed\"}}");
+            goto done;
+        }
+        if (pane_id[0]) lmux_ssh_session_attach(s, (lmux_id)atol(pane_id));
+        written = snprintf(result, result_cap,
+            "{\"ok\":true,\"result\":{\"id\":%u,\"host\":\"%s\",\"user\":\"%s\"}}",
+            s->id, s->host, s->user);
+        goto done;
+    }
+
+    /* ssh.disconnect <session_id> */
+    if (strcmp(cmd, "ssh.disconnect") == 0 || strcmp(cmd, "ssh_disconnect") == 0) {
+        char sid[64] = {0};
+        json_extract_string(args_json, "session_id", sid, sizeof sid);
+        if (!sid[0]) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"session_id required\"}}");
+            goto done;
+        }
+        if (!lmux_ssh_session_detach(app, (lmux_id)atol(sid))) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"ssh session not found\"}}");
+            goto done;
+        }
+        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+        goto done;
+    }
+
+    /* hooks.add <event> <script> */
+    if (strcmp(cmd, "hooks.add") == 0 || strcmp(cmd, "hooks_add") == 0) {
+        char ev[64] = {0}, command[512] = {0};
+        json_extract_string(args_json, "event", ev, sizeof ev);
+        /* The CLI advertises this as `hooks.add <event> <script>` and sends
+         * the key "script"; accept "command" too for direct API callers. */
+        json_extract_string(args_json, "script", command, sizeof command);
+        if (!command[0])
+            json_extract_string(args_json, "command", command, sizeof command);
+        int e = hook_event_from_name(ev);
+        if (e < 0 || !command[0]) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"valid event and command required\"}}");
+            goto done;
+        }
+        lmux_hook_script *h = hook_add(app, e, command);
+        if (!h) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"internal\",\"message\":\"hooks registry full\"}}");
+            goto done;
+        }
+        written = snprintf(result, result_cap,
+            "{\"ok\":true,\"result\":{\"id\":%u,\"event\":\"%s\"}}",
+            h->id, HOOK_EVENT_NAMES[h->event]);
+        goto done;
+    }
+
+    /* hooks.list */
+    if (strcmp(cmd, "hooks.list") == 0 || strcmp(cmd, "hooks_list") == 0) {
+        RESULT_GROW;
+        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{\"hooks\":[");
+        if (written < 0) written = 0;
+        for (size_t i = 0; i < app->hooks.len; i++) {
+            lmux_hook_script *h = app->hooks.items[i];
+            RESULT_GROW;
+            written += snprintf(result + written, result_cap - (size_t)written,
+                "%s{\"id\":%u,\"event\":\"%s\",\"command\":\"%s\"}",
+                i ? "," : "", h->id, HOOK_EVENT_NAMES[h->event], h->command);
+        }
+        RESULT_GROW;
+        written += snprintf(result + written, result_cap - (size_t)written, "]}}");
+        result[written] = 0;
+        goto done;
+    }
+
+    /* hooks.remove <event> */
+    if (strcmp(cmd, "hooks.remove") == 0 || strcmp(cmd, "hooks_remove") == 0) {
+        char ev[64] = {0};
+        json_extract_string(args_json, "event", ev, sizeof ev);
+        int e = hook_event_from_name(ev);
+        if (e < 0) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"valid event required\"}}");
+            goto done;
+        }
+        if (!hook_remove(app, e)) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no hook for that event\"}}");
+            goto done;
+        }
+        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+        goto done;
+    }
+
+    /* focus.history [count] — most recent focus changes, newest first */
+    if (strcmp(cmd, "focus.history") == 0 || strcmp(cmd, "focus_history") == 0) {
+        char nbuf[32] = {0};
+        /* The CLI sends this argument as "count"; accept "n" too. */
+        json_extract_string(args_json, "count", nbuf, sizeof nbuf);
+        if (!nbuf[0])
+            json_extract_string(args_json, "n", nbuf, sizeof nbuf);
+        int want = nbuf[0] ? atoi(nbuf) : 20;
+        if (want <= 0 || want > 100) want = 20;
+        struct lmux_focus_entry entries[100];
+        int got = lmux_focus_history_recent(&app->focus_history, want, entries);
+        RESULT_GROW;
+        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{\"entries\":[");
+        if (written < 0) written = 0;
+        for (int i = 0; i < got; i++) {
+            RESULT_GROW;
+            written += snprintf(result + written, result_cap - (size_t)written,
+                "%s{\"pane_id\":\"%s\",\"workspace_id\":\"%s\",\"timestamp\":%lld,"
+                "\"duration_ms\":%lld}",
+                i ? "," : "", entries[i].pane_id, entries[i].workspace_id,
+                (long long)entries[i].timestamp, (long long)entries[i].duration_ms);
+        }
+        RESULT_GROW;
+        written += snprintf(result + written, result_cap - (size_t)written, "]}}");
+        result[written] = 0;
+        goto done;
+    }
+
+    /* naming.suggest [cwd] — candidate names derived from a working dir */
+    if (strcmp(cmd, "naming.suggest") == 0 || strcmp(cmd, "naming_suggest") == 0) {
+        char cwd[1024] = {0}, base[256] = {0};
+        json_extract_string(args_json, "cwd", cwd, sizeof cwd);
+        const char *slash = NULL;
+        for (const char *q = cwd; *q; q++) if (*q == '/') slash = q;
+        if (slash && slash[1]) snprintf(base, sizeof base, "%s", slash + 1);
+        else if (cwd[0] && !strchr(cwd, '/')) snprintf(base, sizeof base, "%s", cwd);
+        /* Suggest the basename with separators collapsed to dashes, plus a
+         * humanised form. Empty input yields an empty list, not a placeholder. */
+        char dashed[256] = {0}, spaced[256] = {0};
+        for (size_t i = 0; base[i] && i + 1 < sizeof dashed; i++) {
+            char ch = base[i];
+            if (ch == '.' || ch == '_') ch = '-';
+            dashed[i] = (char)((ch >= 'A' && ch <= 'Z') ? ch - 'A' + 'a' : ch);
+        }
+        size_t used = 0;
+        for (size_t i = 0; dashed[i] && used + 1 < sizeof spaced; i++)
+            if (dashed[i] != '-') spaced[used++] = dashed[i];
+        spaced[used] = 0;
+        RESULT_GROW;
+        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{\"suggestions\":[");
+        if (written < 0) written = 0;
+        int first = 1;
+        if (dashed[0]) {
+            RESULT_GROW;
+            written += snprintf(result + written, result_cap - (size_t)written,
+                "%s\"%s\"", first ? "" : ",", dashed);
+            first = 0;
+        }
+        if (used && strcmp(spaced, dashed) != 0) {
+            RESULT_GROW;
+            written += snprintf(result + written, result_cap - (size_t)written,
+                "%s\"%s\"", first ? "" : ",", spaced);
+        }
+        RESULT_GROW;
+        written += snprintf(result + written, result_cap - (size_t)written, "]}}");
+        result[written] = 0;
+        goto done;
+    }
+
+    /* notification.hook.list / notification.hook.remove — the singular
+     * spellings advertised in --help; the plural forms dispatch above. */
+    if (strcmp(cmd, "notification.hook.list") == 0 ||
+        strcmp(cmd, "notification_hook_list") == 0) {
+        char buf[8192];
+        int n = snprintf(buf, sizeof buf, "{\"ok\":true,\"result\":{\"hooks\":[");
+        for (size_t i = 0; i < app->notification_hooks.len; i++) {
+            lmux_notification_hook *h = app->notification_hooks.items[i];
+            if (i > 0) n += snprintf(buf + n, sizeof buf - n, ",");
+            /* lmux_notification_hook_remove() disables rather than deletes, so
+             * surface `enabled` rather than implying the entry vanished. */
+            n += snprintf(buf + n, sizeof buf - n,
+                "{\"event\":\"%s\",\"filter\":\"%s\",\"transform\":\"%s\","
+                "\"redirect\":\"%s\",\"enabled\":%s}",
+                h->event, h->filter, h->transform, h->redirect,
+                h->enabled ? "true" : "false");
+        }
+        n += snprintf(buf + n, sizeof buf - n, "]}}");
+        written = snprintf(result, result_cap, "%s", buf);
+        goto done;
+    }
+
+    if (strcmp(cmd, "notification.hook.remove") == 0 ||
+        strcmp(cmd, "notification_hook_remove") == 0) {
+        char ev[128] = {0};
+        json_extract_string(args_json, "event", ev, sizeof ev);
+        if (!ev[0] || !lmux_notification_hook_remove(app, ev)) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no notification hook for that event\"}}");
+            goto done;
+        }
+        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
         goto done;
     }
 
