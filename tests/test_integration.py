@@ -1304,8 +1304,6 @@ class TestNewCommandsWorkFromTheShell(unittest.TestCase):
     "command"; `focus.history` sends "count", the handler read "n").
     """
 
-    LIFECYCLE = ["session-start", "prompt-submit", "stop", "error"]
-
     def _cli(self, home, sock, *args):
         cli = Path(__file__).parent.parent / "build" / "lmux"
         env = dict(os.environ)
@@ -1350,6 +1348,155 @@ class TestNewCommandsWorkFromTheShell(unittest.TestCase):
             self.assertIn("stop", lst.stdout)
         finally:
             _shutdown_isolated(daemon, home)
+
+
+class TestHooksMultiTokenCommandForm(unittest.TestCase):
+    """`lmux hooks add <event> <script>` is the form gui/hooks_setup.py uses.
+
+    build_json_command() maps the bare word `hooks` to `hooks.list` via its
+    shorthand table, so the GUI's invocation used to return a list with exit 0.
+    hooks_setup.py checks returncode == 0 and therefore recorded the hook as
+    installed while nothing was registered.
+    """
+
+    def setUp(self):
+        self.client, self.daemon, self.home = _isolated_client()
+        self.sock = self.daemon.socket_path
+
+    def tearDown(self):
+        _shutdown_isolated(self.daemon, self.home)
+
+    def _cli(self, *args):
+        cli = Path(__file__).parent.parent / "build" / "lmux"
+        env = dict(os.environ)
+        env["HOME"] = str(self.home)
+        env["XDG_CONFIG_HOME"] = str(self.home / ".config")
+        return subprocess.run([str(cli), "--socket", self.sock, "--json",
+                               *args], capture_output=True, text=True,
+                              timeout=30, env=env)
+
+    def test_hooks_add_space_form_registers_the_hook(self):
+        add = self._cli("hooks", "add", "stop", "/bin/true")
+        self.assertIn('"ok":true', add.stdout,
+                      f"`lmux hooks add` failed: {add.stdout!r} {add.stderr!r}")
+        self.assertNotIn(
+            '"hooks":[', add.stdout,
+            "`lmux hooks add` returned a LIST; the bare-word shorthand "
+            "swallowed the subcommand")
+        lst = self._cli("hooks", "list")
+        self.assertIn("/bin/true", lst.stdout,
+                      f"hook not registered by the space form: {lst.stdout!r}")
+        self.assertIn("stop", lst.stdout)
+
+    def test_hooks_setup_exact_argv_shape_works(self):
+        """The precise call gui/hooks_setup.py:329 makes."""
+        cli = Path(__file__).parent.parent / "build" / "lmux"
+        result = subprocess.run(
+            [str(cli), "--socket", self.sock, "hooks", "add",
+             "session-start", "lmux agent.spawn -- claude --resume"],
+            capture_output=True, text=True, timeout=30,
+            env={**os.environ, "HOME": str(self.home),
+                 "XDG_CONFIG_HOME": str(self.home / ".config")})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lst = self._cli("hooks", "list")
+        self.assertIn("session-start", lst.stdout, lst.stdout)
+        self.assertIn("agent.spawn", lst.stdout, lst.stdout)
+
+    def test_hooks_remove_space_form(self):
+        self._cli("hooks", "add", "error", "/bin/false")
+        rm = self._cli("hooks", "remove", "error")
+        self.assertIn('"ok":true', rm.stdout, f"{rm.stdout!r} {rm.stderr!r}")
+        lst = self._cli("hooks", "list")
+        self.assertNotIn("/bin/false", lst.stdout, lst.stdout)
+
+    def test_both_spellings_address_the_same_registry(self):
+        self._cli("hooks", "add", "stop", "/bin/echo")
+        via_dot = self._cli("hooks.add", "prompt-submit", "/bin/echo")
+        self.assertIn('"ok":true', via_dot.stdout, via_dot.stdout)
+        lst = self._cli("hooks", "list")
+        self.assertIn("stop", lst.stdout, lst.stdout)
+        self.assertIn("prompt-submit", lst.stdout, lst.stdout)
+
+
+class TestNamingParityWithGui(unittest.TestCase):
+    """naming.suggest must match gui/auto_naming.py::suggest_names().
+
+    The daemon port only derived names from the directory basename, while the
+    GUI implements an ordered chain (git repo, repo:branch, package.json,
+    basename, basename (type)). This runs both over the same fixtures so drift
+    becomes a test failure rather than a slow divergence.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, str(Path(__file__).parent.parent / "gui"))
+        import auto_naming  # noqa: E402
+        # Store the plain function, not a bound method: assigning it to a
+        # class attribute would make it a descriptor and pass `self` in.
+        cls.suggest_names = staticmethod(auto_naming.suggest_names)
+
+    def setUp(self):
+        self.client, self.daemon, self.home = _isolated_client()
+
+    def tearDown(self):
+        _shutdown_isolated(self.daemon, self.home)
+
+    def _daemon_suggestions(self, cwd):
+        r = self.client.send("naming.suggest", {"cwd": cwd})
+        self.assertTrue(r.get("ok"), r)
+        return r["result"]["suggestions"]
+
+    def _assert_parity(self, cwd):
+        expected = self.suggest_names(cwd)
+        actual = self._daemon_suggestions(cwd)
+        self.assertEqual(
+            actual, expected,
+            f"daemon and GUI disagree for {cwd!r}:\n"
+            f"  gui   = {expected}\n  daemon= {actual}")
+
+    def _git_repo(self, d, branch):
+        subprocess.run(["git", "init", "-q", "-b", branch, d],
+                       capture_output=True, timeout=30)
+        subprocess.run(["git", "-C", d, "config", "user.email", "t@t"],
+                       capture_output=True, timeout=30)
+        subprocess.run(["git", "-C", d, "config", "user.name", "t"],
+                       capture_output=True, timeout=30)
+        Path(d, "f").write_text("x")
+        subprocess.run(["git", "-C", d, "add", "-A"], capture_output=True,
+                       timeout=30)
+        subprocess.run(["git", "-C", d, "commit", "-qm", "i"],
+                       capture_output=True, timeout=30)
+
+    def test_parity_on_a_git_repo(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._git_repo(d, "main")
+            Path(d, "Cargo.toml").write_text("[package]\nname=\"x\"\n")
+            self._assert_parity(d)
+
+    def test_parity_on_a_git_repo_with_a_feature_branch(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._git_repo(d, "main")
+            subprocess.run(["git", "-C", d, "checkout", "-qb", "feature/x"],
+                           capture_output=True, timeout=30)
+            suggestions = self._daemon_suggestions(d)
+            self.assertTrue(any(":" in s for s in suggestions),
+                            f"expected a repo:branch suggestion: {suggestions}")
+            self._assert_parity(d)
+
+    def test_parity_on_a_node_package(self):
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, "package.json").write_text(
+                json.dumps({"name": "@scope/thing"}))
+            self._assert_parity(d)
+
+    def test_parity_on_a_python_project(self):
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, "pyproject.toml").write_text("[project]\nname='x'\n")
+            self._assert_parity(d)
+
+    def test_parity_on_a_plain_directory(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._assert_parity(d)
 
 
 class TestSnapshotParserCorrectness(unittest.TestCase):

@@ -126,3 +126,15 @@ the pane but keeps the session — destroying it is `ssh.session.kill`.
   older than `model.c`, so shell tests failed against already-fixed code. Same
   class of error as the pre-fix verification in the earlier goal — rebuild and
   confirm timestamps before trusting a failure.
+
+## Superseded by a later goal
+
+The two non-blocking notes left at the end of PR #22 have both been addressed in
+`dev-notes/GOAL_HOOKS_NAMING.md`, which also **corrects a claim made in this
+document**: the ten commands were *not* unused. `gui/hooks_setup.py:329` calls
+`lmux hooks add`, which the bare-word shorthand silently mapped to `hooks.list`,
+so the installer reported success while registering nothing.
+
+Also fixed here: `ssh.connect` creates a session object regardless of whether the
+host is reachable. That remains true by design — nothing dials out — but callers
+should know a session is recorded even for an unreachable host.

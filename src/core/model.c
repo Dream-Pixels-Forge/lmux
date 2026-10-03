@@ -2415,6 +2415,119 @@ static void model_save_config(lmux_app *app) {
 }
 
 /* Dispatch a JSON command string and return a JSON response string (caller must free). */
+/* --- naming suggestions -----------------------------------------------
+ * Mirrors gui/auto_naming.py::suggest_names(), which is the reference
+ * implementation. The order below is deliberate and matches it exactly:
+ * git repo name, repo:branch, package.json name, directory basename,
+ * basename (project type). A parity test runs both over shared fixtures so
+ * the two cannot drift apart silently. */
+
+#define LMUX_NAMING_MAX_SUGGESTIONS 8
+
+/* Project-type markers, mirroring _PROJECT_MARKERS in gui/auto_naming.py. */
+static const char *const NAMING_MARKERS[][2] = {
+    {"package.json", "node"},   {"Cargo.toml", "rust"},
+    {"go.mod", "go"},           {"pyproject.toml", "python"},
+    {"setup.py", "python"},     {"Gemfile", "ruby"},
+    {"pom.xml", "java"},        {"build.gradle", "java"},
+    {"Makefile", "c"},          {"CMakeLists.txt", "cpp"},
+};
+
+/* Run a command in `cwd`, capturing up to cap-1 bytes of stdout. */
+static void naming_run(const char *cwd, const char *const argv[],
+                       char *out, size_t cap) {
+    if (!out || cap == 0) return;
+    out[0] = 0;
+    int fds[2];
+    if (pipe(fds) != 0) return;
+    pid_t pid = fork();
+    if (pid < 0) { close(fds[0]); close(fds[1]); return; }
+    if (pid == 0) {
+        close(fds[0]);
+        dup2(fds[1], STDOUT_FILENO);
+        close(fds[1]);
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) { dup2(devnull, STDERR_FILENO); close(devnull); }
+        if (cwd && cwd[0] && chdir(cwd) != 0) _exit(127);
+        execvp(argv[0], (char *const *)argv);
+        _exit(127);
+    }
+    close(fds[1]);
+    size_t n = 0;
+    ssize_t r;
+    while (n + 1 < cap && (r = read(fds[0], out + n, cap - 1 - n)) > 0) n += (size_t)r;
+    out[n] = 0;
+    close(fds[0]);
+    int st = 0;
+    waitpid(pid, &st, 0);
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) out[0] = 0;
+    /* Trim trailing newline. */
+    size_t len = strlen(out);
+    while (len > 0 && (out[len - 1] == '\n' || out[len - 1] == '\r'))
+        out[--len] = 0;
+}
+
+/* Directory basename, mirroring os.path.basename(cwd.rstrip(os.sep)). */
+static void naming_basename(const char *cwd, char *out, size_t cap) {
+    if (!out || cap == 0) return;
+    out[0] = 0;
+    size_t len = strlen(cwd);
+    while (len > 1 && cwd[len - 1] == '/') len--;
+    size_t start = 0;
+    for (size_t i = 0; i < len; i++) if (cwd[i] == '/') start = i + 1;
+    if (len > start) snprintf(out, cap, "%.*s", (int)(len - start), cwd + start);
+}
+
+static void naming_add(char names[][256], size_t *n, const char *name) {
+    if (!name || !name[0] || *n >= LMUX_NAMING_MAX_SUGGESTIONS) return;
+    if (strlen(name) >= 64) return;              /* GUI's `len(name) < 64` */
+    for (size_t i = 0; i < *n; i++)
+        if (strcmp(names[i], name) == 0) return; /* GUI's `seen` set */
+    snprintf(names[*n], 256, "%s", name);
+    (*n)++;
+}
+
+/* Extract "name" from a package.json without a full JSON parser: find the
+ * top-level "name" key and its string value. Good enough for the well-formed
+ * files this reads, and it degrades to "no suggestion" rather than failing. */
+static void naming_package_json_name(const char *cwd, char *out, size_t cap) {
+    if (!out || cap == 0) return;
+    out[0] = 0;
+    char path[1024];
+    snprintf(path, sizeof path, "%s/package.json", cwd);
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    char buf[4096];
+    size_t n = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    if (n == 0) return;
+    buf[n] = 0;
+    const char *key = strstr(buf, "\"name\"");
+    if (!key) return;
+    const char *q = strchr(key + 6, '"');
+    if (!q) return;
+    const char *end = strchr(q + 1, '"');
+    if (!end) return;
+    size_t len = (size_t)(end - q - 1);
+    if (len == 0 || len >= cap) return;
+    memcpy(out, q + 1, len);
+    out[len] = 0;
+    /* GUI strips a leading "@scope/". */
+    if (out[0] == '@') {
+        char *slash = strchr(out, '/');
+        if (slash) memmove(out, slash + 1, strlen(slash));
+    }
+}
+
+static const char *naming_project_type(const char *cwd) {
+    static char path[1024];
+    for (size_t i = 0; i < sizeof NAMING_MARKERS / sizeof NAMING_MARKERS[0]; i++) {
+        snprintf(path, sizeof path, "%s/%s", cwd, NAMING_MARKERS[i][0]);
+        if (access(path, F_OK) == 0) return NAMING_MARKERS[i][1];
+    }
+    return NULL;
+}
+
 static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_json) {
     size_t result_cap = 16384;
     char *result = malloc(result_cap);
@@ -7600,40 +7713,62 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         goto done;
     }
 
-    /* naming.suggest [cwd] — candidate names derived from a working dir */
+    /* naming.suggest [cwd] — see the naming helpers above. */
     if (strcmp(cmd, "naming.suggest") == 0 || strcmp(cmd, "naming_suggest") == 0) {
-        char cwd[1024] = {0}, base[256] = {0};
+        char cwd[1024] = {0};
         json_extract_string(args_json, "cwd", cwd, sizeof cwd);
-        const char *slash = NULL;
-        for (const char *q = cwd; *q; q++) if (*q == '/') slash = q;
-        if (slash && slash[1]) snprintf(base, sizeof base, "%s", slash + 1);
-        else if (cwd[0] && !strchr(cwd, '/')) snprintf(base, sizeof base, "%s", cwd);
-        /* Suggest the basename with separators collapsed to dashes, plus a
-         * humanised form. Empty input yields an empty list, not a placeholder. */
-        char dashed[256] = {0}, spaced[256] = {0};
-        for (size_t i = 0; base[i] && i + 1 < sizeof dashed; i++) {
-            char ch = base[i];
-            if (ch == '.' || ch == '_') ch = '-';
-            dashed[i] = (char)((ch >= 'A' && ch <= 'Z') ? ch - 'A' + 'a' : ch);
+        if (!cwd[0]) {
+            /* Default to the focused workspace's first pane directory, else $HOME. */
+            const char *home = getenv("HOME");
+            snprintf(cwd, sizeof cwd, "%s", home ? home : "");
         }
-        size_t used = 0;
-        for (size_t i = 0; dashed[i] && used + 1 < sizeof spaced; i++)
-            if (dashed[i] != '-') spaced[used++] = dashed[i];
-        spaced[used] = 0;
+        char names[LMUX_NAMING_MAX_SUGGESTIONS][256];
+        size_t n = 0;
+
+        /* 1. git repo name (+ repo:branch) */
+        static const char *const GIT_TOPLEVEL[] = {"git", "rev-parse", "--show-toplevel", NULL};
+        static const char *const GIT_BRANCH[] = {"git", "rev-parse", "--abbrev-ref", "HEAD", NULL};
+        char toplevel[1024] = {0}, branch[256] = {0};
+        naming_run(cwd, GIT_TOPLEVEL, toplevel, sizeof toplevel);
+        if (toplevel[0]) {
+            char repo[256] = {0};
+            naming_basename(toplevel, repo, sizeof repo);
+            naming_add(names, &n, repo);
+            naming_run(cwd, GIT_BRANCH, branch, sizeof branch);
+            if (branch[0] && strcmp(branch, "main") != 0 &&
+                strcmp(branch, "master") != 0) {
+                char combined[512];
+                snprintf(combined, sizeof combined, "%s:%s", repo, branch);
+                naming_add(names, &n, combined);
+            }
+        }
+
+        /* 2. package.json name */
+        char pkg[256] = {0};
+        naming_package_json_name(cwd, pkg, sizeof pkg);
+        naming_add(names, &n, pkg);
+
+        /* 3. directory basename */
+        char base[256] = {0};
+        naming_basename(cwd, base, sizeof base);
+        naming_add(names, &n, base);
+
+        /* 4. basename (project type) */
+        const char *ptype = naming_project_type(cwd);
+        if (ptype && base[0]) {
+            char combined[512];
+            snprintf(combined, sizeof combined, "%s (%s)", base, ptype);
+            naming_add(names, &n, combined);
+        }
+
         RESULT_GROW;
-        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{\"suggestions\":[");
+        written = snprintf(result, result_cap,
+            "{\"ok\":true,\"result\":{\"suggestions\":[");
         if (written < 0) written = 0;
-        int first = 1;
-        if (dashed[0]) {
+        for (size_t i = 0; i < n; i++) {
             RESULT_GROW;
             written += snprintf(result + written, result_cap - (size_t)written,
-                "%s\"%s\"", first ? "" : ",", dashed);
-            first = 0;
-        }
-        if (used && strcmp(spaced, dashed) != 0) {
-            RESULT_GROW;
-            written += snprintf(result + written, result_cap - (size_t)written,
-                "%s\"%s\"", first ? "" : ",", spaced);
+                "%s\"%s\"", i ? "," : "", names[i]);
         }
         RESULT_GROW;
         written += snprintf(result + written, result_cap - (size_t)written, "]}}");
