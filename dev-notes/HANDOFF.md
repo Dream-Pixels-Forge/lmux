@@ -66,17 +66,27 @@ did; external callers might.
 
 ## Known gaps, deliberately left open
 
-1. **Restore spawns a PTY per workspace, then destroys it.**
-   `lmux_workspace_create()` eagerly allocates a surface with a forked pty, and
-   the restore immediately frees it. Measured cost **~52 ms per workspace**,
-   independent of document size (40 ws / 138 KB = 2.14 s; 100 ws / 146 KB =
-   5.18 s). A 900-workspace restore takes ~45 s. Next task — see
-   `dev-notes/GOAL_PTY_DEFER.md`.
+1. **Restored panes get no pty at all.** `lmux_pane_split()` is called during
+   restore with `spawn_pty = false`, so panes read from a snapshot never get a
+   terminal. This predates the placeholder-fork fix and is **not** covered by
+   it — only the throwaway placeholder is deferred now. Investigate next; it
+   may be intentional (the host attaches panes later) or may mean a restored
+   terminal is dead.
 2. **`snap_read_string` clamps at `cap` silently.** Bounded and no worse than
-   master (destination fields are the same size or smaller), but an
-   over-long value is dropped without a warning.
+   master (destination fields are the same size or smaller), but an over-long
+   value is dropped without a warning.
 3. **Naming drift** between `GOAL_SNAP_PARSER.md` (says `snap_parse_*`) and the
    implementation (`snap_read_*`). Spec is stale, code is fine.
+
+## Resolved since this handoff was written
+
+- **Placeholder pty forks during restore — FIXED** on branch
+  `perf/defer-pty-on-restore`. `lmux_workspace_create()` and
+  `lmux_surface_create()` eagerly fork a pty that the restore immediately frees,
+  costing ~52 ms per workspace. Measured 100 workspaces: **5.18 s → 0.06 s**,
+  with the restore window contributing **0 forks**. The interactive path still
+  forks a live pty, and restore output is byte-identical to before. Spec:
+  `dev-notes/GOAL_PTY_DEFER.md`.
 
 ## Documentation that is stale
 
