@@ -125,14 +125,9 @@ A few hours. One alias, one lazy-spawn call, four tests.
   pane's screen the same way `read-screen` does and therefore show a blank pane
   until the user types. Worth checking once F1 lands.
 
-- **`read-screen` drains the pty; it is not a screen buffer.** The first read
-  after attach returns the shell's startup output, and every later read returns
-  only newly-arrived bytes — a second `read-screen` seconds later returns `""`.
-  This is pre-existing and applies equally to non-restored panes (verified
-  against a live pane), so it is not a regression from this change. But it means
-  `read-screen` is a "read new output" primitive, and a GUI cannot treat its
-  output as the current screen. Changing this is a design change well beyond
-  the two defects fixed here.
+- **`read-screen` drains the pty; it is not a screen buffer.** — *RESOLVED in the
+  follow-up, `dev-notes/GOAL_READSCREEN_CAPTURE.md`. This limitation was real
+  and has now been fixed.*
 - Consequently, a pty attached by a read may still return empty text on the
   very first read if the shell has not written its banner yet; content arrives
   on a subsequent read. `test_read_screen_works_on_a_restored_pane_...` polls

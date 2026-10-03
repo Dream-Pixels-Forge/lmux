@@ -921,6 +921,105 @@ class TestRestoredPaneReadableAndCapturePane(unittest.TestCase):
             shutil.rmtree(home, ignore_errors=True)
 
 
+class TestReadScreenIsARepeatableCapture(unittest.TestCase):
+    """`read-screen` must behave like tmux `capture-pane`, not a drain.
+
+    Three defects:
+      R1: it returned only the bytes that arrived since the previous call, so
+          a second call returned "".
+      R2: its JSON-escaping loop iterated `while (screen[ii] && ...)`, stopping
+          at the first NUL byte — and terminal output is full of them.
+      R3: with no buffer, there was nothing to bound; a capture must stay
+          within a fixed size regardless of how much output a pane produced.
+    """
+
+    def _pane(self):
+        client, daemon, home = _isolated_client()
+        client.workspace_create("cap")
+        # A fresh zsh shows the first-run wizard, which consumes the first
+        # keystrokes of anything typed into it. Choose "0" to write a .zshrc
+        # and exit the wizard, so later commands actually reach the shell.
+        client.surface_send_text("0\n")
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            time.sleep(0.3)
+            r = client.send("read-screen")
+            text = r.get("result", {}).get("text", "") if r.get("ok") else ""
+            if "Type one of the keys" not in text:
+                break
+        return client, daemon, home
+
+    def _read(self, client):
+        r = client.send("read-screen")
+        self.assertTrue(r.get("ok"), r)
+        return r.get("result", {}).get("text", "")
+
+    def test_repeated_read_screen_keeps_returning_content(self):
+        """R1: a second capture must not come back empty."""
+        client, daemon, home = self._pane()
+        try:
+            first = ""
+            deadline = time.time() + 15
+            while time.time() < deadline and not first.strip():
+                time.sleep(0.3)
+                first = self._read(client)
+            self.assertTrue(first.strip(), "pane produced no output to capture")
+            # Drain the pty, then capture again — content must still be there.
+            time.sleep(0.5)
+            second = self._read(client)
+            self.assertTrue(
+                second.strip(),
+                "second read-screen returned empty; it drained the pty "
+                "instead of capturing a buffer")
+            self.assertIn(
+                "zsh", second,
+                "capture should be repeatable and retain earlier output")
+        finally:
+            _shutdown_isolated(daemon, home)
+
+    def test_read_screen_is_not_truncated_by_nul_bytes(self):
+        """R2: output containing NULs must survive escaping.
+
+        The marker is assembled from shell variables at runtime so the typed
+        command line does not literally contain it — otherwise the shell's
+        echo of the command satisfies the assertion and the test passes
+        vacuously.
+        """
+        client, daemon, home = self._pane()
+        try:
+            client.surface_send_text(
+                r"printf 'AAA\000\000B\102\102_MARKER_END\n'; sleep 60" + "\n")
+            text = ""
+            deadline = time.time() + 25
+            while time.time() < deadline and "BBB_MARKER_END" not in text:
+                time.sleep(0.3)
+                text = self._read(client)
+            self.assertIn(
+                "BBB_MARKER_END", text,
+                "content after a NUL byte was lost; JSON escaping must skip "
+                f"NULs rather than terminate. Got: {text[-160:]!r}")
+        finally:
+            _shutdown_isolated(daemon, home)
+
+    def test_capture_size_is_bounded(self):
+        """R3: a huge burst of output must not produce an unbounded capture."""
+        client, daemon, home = self._pane()
+        try:
+            client.surface_send_text(
+                r"for i in $(seq 1 4000); do printf '%s\n' "
+                r"'0123456789012345678901234567890123456789'; done; sleep 60" + "\n")
+            text = ""
+            deadline = time.time() + 40
+            while time.time() < deadline and len(text) < 4096:
+                time.sleep(0.5)
+                text = self._read(client)
+            self.assertLessEqual(
+                len(text), 200_000,
+                f"capture is unbounded ({len(text)} bytes); it must be capped")
+        finally:
+            _shutdown_isolated(daemon, home)
+
+
 class TestSnapshotParserCorrectness(unittest.TestCase):
     """#11 structural fix: the hand-rolled brace-counting scanner silently
     corrupted any snapshot whose string values contained braces.
