@@ -1,3 +1,10 @@
+# Snapshot artifacts written into the repo root by tests run against the
+# daemon's cwd (see dev-notes/GOAL_GATES.md). Must never be committed: they
+# embed the local home path, shell, and workspace layout.
+*.json.bak
+/named.json
+/snap-*.json
+
 # Build output
 build/
 dist/

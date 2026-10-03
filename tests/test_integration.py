@@ -14,6 +14,7 @@ Usage:
 """
 
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -427,29 +428,30 @@ class TestSnapshot(unittest.TestCase):
 
     def test_save_returns_path(self):
         ws = self.c.workspace_create(_unique("snap-save"))
-        snap_path = os.path.join(tempfile.gettempdir(),
-                                 f"lmux-test-snap-{os.getpid()}.json")
+        # #12 step 4: snapshot.save no longer accepts an arbitrary absolute
+        # path — it is confined to the data root. Pass a relative name and use
+        # the path the daemon returns.
         try:
-            result = self.c.snapshot_save(snap_path)
-            self.assertTrue(os.path.exists(snap_path))
+            result = self.c.snapshot_save("snap-save-test.json")
+            saved = result.get("path")
+            self.assertTrue(saved, f"save should return a path: {result}")
+            self.assertTrue(os.path.isabs(saved),
+                            f"returned path should be absolute: {saved}")
+            self.assertTrue(os.path.exists(saved),
+                            f"snapshot should exist at {saved}")
         finally:
-            try:
-                os.unlink(snap_path)
-            except OSError:
-                pass
             self.c.workspace_close(ws["id"])
 
     def test_load_from_saved_file(self):
         # snapshot.load replaces the whole model, so run it on a private daemon
         # rather than the shared one that other classes are still using.
         client, daemon, home = _isolated_client()
-        snap_path = os.path.join(tempfile.gettempdir(),
-                                 f"lmux-test-snap-load-{os.getpid()}.json")
         try:
             ws = client.workspace_create(_unique("snap-load"))
-            client.snapshot_save(snap_path)
+            saved = client.snapshot_save("snap-load-test.json")["path"]
+            self.assertTrue(os.path.exists(saved))
             # Load the file we just saved
-            result = client.snapshot_load(snap_path)
+            result = client.snapshot_load(saved)
             self.assertIsInstance(result, dict)
             # Loading replaces the model (#8), so the workspace created above
             # no longer exists. A successful close would mean the loader is
@@ -459,10 +461,8 @@ class TestSnapshot(unittest.TestCase):
             self.assertIn("not_found", str(ctx.exception),
                           f"load should have replaced ws {ws['id']}")
         finally:
-            try:
-                os.unlink(snap_path)
-            except OSError:
-                pass
+            snap_path = Path(home, ".local", "share", "lmux", "snap-load-test.json")
+            snap_path.unlink(missing_ok=True)
             _shutdown_isolated(daemon, home)
 
     def test_save_default_path(self):
@@ -644,20 +644,216 @@ class TestSnapshotTruncationDetection(unittest.TestCase):
         client, daemon, home = _isolated_client()
         try:
             ws = client.workspace_create(_unique("snap-fits"))
-            snap = Path(tempfile.gettempdir(),
-                        f"lmux-test-fits-{os.getpid()}.json")
-            client.snapshot_save(str(snap))
-            self.assertLess(snap.stat().st_size, 65536)
+            # #12 step 4: save is confined to the data root, so ask for it by
+            # relative name and load the absolute path it returns.
+            saved = client.snapshot_save("snap-fits-test.json")["path"]
+            self.assertLess(os.path.getsize(saved), 65536)
 
-            resp = client.send("snapshot.load", {"path": str(snap)})
+            resp = client.send("snapshot.load", {"path": saved})
             self.assertTrue(resp.get("ok"),
                             f"a normal snapshot must still load: {resp}")
+            Path(saved).unlink(missing_ok=True)
         finally:
             _shutdown_isolated(daemon, home)
+
+
+class TestNestedTruncationIsAnnounced(unittest.TestCase):
+    """#11 remainder: sfcopy[2048] and pncopy[1024] clipped silently, so a
+    restore could drop panes with no signal. Both must log a warning.
+
+    The daemon logs to stdout, which the shared helpers discard, so this
+    starts its own daemon with stdout captured to a file and asserts on what
+    the process actually printed.
+    """
+
+    def _load_with_captured_output(self, snapshot_text):
+        home = Path(tempfile.mkdtemp(prefix="lmux-nested-"))
+        (home / ".local" / "share" / "lmux").mkdir(parents=True)
+        (home / ".config").mkdir(parents=True, exist_ok=True)
+        env = dict(os.environ)
+        env["HOME"] = str(home)
+        env["XDG_DATA_HOME"] = str(home / ".local" / "share")
+        env["XDG_CONFIG_HOME"] = str(home / ".config")
+        log = home / "daemon.log"
+        sock = f"/tmp/lmux-nested-{os.getpid()}-{len(snapshot_text)}.sock"
+        Path(sock).unlink(missing_ok=True)
+        proc = None
+        out_text = ""
+        try:
+            out = open(log, "wb")
+            proc = subprocess.Popen(
+                [str(Path(__file__).parent.parent / "build" / "lmux"),
+                 "--socket", sock, "daemon"],
+                stdout=out, stderr=subprocess.STDOUT, env=env,
+            )
+            deadline = time.time() + 30
+            client = None
+            while time.time() < deadline:
+                time.sleep(0.2)
+                if proc.poll() is not None:
+                    break
+                try:
+                    client = LmuxClient(sock)
+                    break
+                except Exception:  # noqa: BLE001 - not up yet
+                    client = None
+            if client is None:
+                self.fail("daemon did not come up")
+            snap = home / "snap.json"
+            snap.write_text(snapshot_text)
+            resp = client.send("snapshot.load", {"path": str(snap)})
+        finally:
+            if proc and proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            out.close()
+            out_text = log.read_text(errors="replace") if log.exists() else ""
+            Path(sock).unlink(missing_ok=True)
+            shutil.rmtree(home, ignore_errors=True)
+        return resp, out_text
+
+    def test_oversized_surface_block_logs_a_warning(self):
+        """A surface whose JSON block exceeds 2048 bytes must be announced."""
+        layout = "x" * 3000
+        surface = ('{"id":1,"title":"big",'
+                   '"panes":[{"id":1,"command":"zsh","cwd":"/tmp"}],'
+                   f'"layout":"{layout}"}}')
+        self.assertGreater(len(surface), 2048, "fixture must exceed sfcopy")
+        text = ('{"version":1,"workspaces":[{"id":1,"title":"ws","cwd":"/tmp",'
+                '"surfaces":[' + surface + ']}]}')
+
+        resp, output = self._load_with_captured_output(text)
+        self.assertIn(
+            "scratch buffer", output,
+            f"the sfcopy clamp must be announced; daemon said: {output[-500:]!r}")
+
+    def test_both_nested_clamps_emit_warnings(self):
+        """Structural guard: neither clamp may be a silent one-liner again."""
+        src = Path(__file__).parent.parent / "src" / "core" / "model.c"
+        text = src.read_text()
+        self.assertNotIn("if (sblen >= sizeof sfcopy) sblen = sizeof sfcopy - 1;",
+                         text,
+                         "sfcopy clamp is silent again — it must warn")
+        self.assertNotIn("if (pblen >= sizeof pncopy) pblen = sizeof pncopy - 1;",
+                         text,
+                         "pncopy clamp is silent again — it must warn")
+        for decl in ("char sfcopy[2048];", "char pncopy[1024];"):
+            idx = text.find(decl)
+            self.assertNotEqual(idx, -1, f"{decl} should still exist")
+            # The warn-then-clamp body follows the declaration.
+            window = text[idx:idx + 700]
+            self.assertIn("LMUX_LOG_WARN", window,
+                          f"{decl} must warn before clamping")
+
+
+class TestSnapshotSaveRoot(unittest.TestCase):
+    """#12 step 4: snapshot.save called is_safe_path(path, NULL), which rejects
+    ".." but places no containment, so any absolute path was accepted and the
+    daemon wrote there. Confine it to a data root, mirroring #17's
+    browser.screenshot fix."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.client, cls.daemon, cls.home = _isolated_client()
+
+    @classmethod
+    def tearDownClass(cls):
+        _shutdown_isolated(cls.daemon, cls.home)
+
+    def _save(self, path=None):
+        args = {"path": path} if path else {}
+        return self.client.send("snapshot.save", args)
+
+    def test_absolute_path_outside_root_is_rejected(self):
+        # Pre-create the parent: without it the save fails for an unrelated
+        # reason (missing directory), which is not a security control.
+        outside = Path(self.home, "outside")
+        outside.mkdir(parents=True, exist_ok=True)
+        target = outside / "pwn.json"
+        resp = self._save(str(target))
+        self.assertFalse(resp.get("ok"), f"must be rejected: {resp}")
+        self.assertEqual(resp.get("error", {}).get("code"), "invalid_params")
+        self.assertFalse(target.exists(), "no file may be created outside the root")
+
+    def test_traversal_is_rejected(self):
+        resp = self._save("../escape.json")
+        self.assertFalse(resp.get("ok"), f"must be rejected: {resp}")
+
+    def test_no_path_still_saves_to_default_location(self):
+        resp = self._save()
+        self.assertTrue(resp.get("ok"), f"default save must still work: {resp}")
+        path = Path(resp["result"]["path"])
+        self.assertTrue(path.exists(), "default snapshot file should exist")
+
+    def test_relative_filename_inside_root_is_accepted(self):
+        resp = self._save("named.json")
+        self.assertTrue(resp.get("ok"), f"relative name should be allowed: {resp}")
+        self.assertNotIn("..", resp["result"]["path"])
+
+
+    def test_default_path_works_without_a_preexisting_data_dir(self):
+        """Regression guard for the bug this change introduced.
+
+        Moving the default save location under the data root broke any machine
+        without ~/.local/share/lmux: lmux_snapshot_save() created no
+        directories, so the default save failed with save_failed. The
+        _isolated_client() helper pre-creates that directory, so the ordinary
+        default-path test cannot see it — this one starts from an empty HOME
+        and points XDG_DATA_HOME somewhere that does not exist.
+        """
+        bare = Path(tempfile.mkdtemp(prefix="lmux-bare-home-"))
+        data = bare / "no" / "such" / "data"
+        env = dict(os.environ)
+        env["HOME"] = str(bare)
+        env["XDG_DATA_HOME"] = str(data)
+        env.pop("XDG_CONFIG_HOME", None)
+        sock = f"/tmp/lmux-bare-{os.getpid()}.sock"
+        Path(sock).unlink(missing_ok=True)
+        daemon = LmuxDaemon(sock, env=env)
+        try:
+            client = daemon.start(timeout=60)
+            resp = client.send("snapshot.save")
+            self.assertTrue(resp.get("ok"),
+                            f"default save must work with no data dir: {resp}")
+            saved = Path(resp["result"]["path"])
+            self.assertTrue(saved.exists(),
+                            f"snapshot should exist at {saved}")
+            self.assertTrue(str(saved).startswith(str(data)),
+                            f"default should land under XDG_DATA_HOME: {saved}")
+        finally:
             try:
-                snap.unlink()
-            except (OSError, UnboundLocalError):
+                daemon.stop()
+            except Exception:  # noqa: BLE001 - teardown
                 pass
+            Path(sock).unlink(missing_ok=True)
+            shutil.rmtree(bare, ignore_errors=True)
+
+
+class TestDependencyGateTargetsMaster(unittest.TestCase):
+    """#13: trivy.yml was already fail-closed but triggered on `main` while the
+    repo's default branch is `master`, so the gate had never run."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.trivy = Path(__file__).parent.parent / ".github" / "workflows" / "trivy.yml"
+
+    def test_no_workflow_targets_a_nonexistent_main_branch(self):
+        workflows = list(self.trivy.parent.glob("*.yml"))
+        offenders = [w.name for w in workflows
+                     if "branches: [main]" in w.read_text()]
+        self.assertEqual(offenders, [],
+                         f"these workflows target 'main' but the default "
+                         f"branch is 'master': {offenders}")
+
+    def test_dependency_gate_is_fail_closed(self):
+        text = self.trivy.read_text()
+        self.assertIn("exit-code: 1", text,
+                      "the gate must stay fail-closed")
+        self.assertIn("branches: [master]", text,
+                      "the gate must trigger on master")
 
 
 # ====================================================================
