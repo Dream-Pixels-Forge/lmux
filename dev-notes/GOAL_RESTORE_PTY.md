@@ -153,3 +153,34 @@ A few hours. One alias, one lazy-spawn call, four tests.
   tests fail; with it restored, all 4 pass — the tests are load-bearing.
 - `read-screen` after restore, `capture-pane`, and `capture_pane` all return
   `ok:true` end-to-end from the built CLI.
+
+## Independent Audit — verdict: MET
+
+An independent pass re-ran every DoD item from scratch rather than trusting the
+implementation notes. (Automated subagent dispatch was unavailable in this
+environment, so the audit was executed directly and mechanically.)
+
+| Check | Result |
+|---|---|
+| D1 reproduced broken on `master`, fixed on branch | confirmed |
+| D2 reproduced broken on `master`, fixed on branch | confirmed |
+| D2 completeness — all 7 hyphenated commands swept | `capture-pane` was the only casualty |
+| Mutation check — 4 tests fail with fix reverted | confirmed |
+| `make test` 253 OK / fuzz / unit | all pass |
+| No test deleted, skipped, or weakened | 0 removed; skips 1 → 1 |
+| `include/lmux.h` untouched; diff within DoD scope | confirmed |
+| `read-screen` drains rather than buffers | confirmed (pre-existing) |
+
+Two process errors were caught and corrected during the audit rather than being
+allowed to produce a false pass:
+
+1. The first pre-fix verification reloaded only the binary while leaving the
+   **fixed daemon running**, so `capture-pane` appeared to already work. The
+   check was invalid and was redone with the daemon restarted on master's
+   `model.c`, which reproduced both defects correctly.
+2. A draft test skipped when `lmux` was missing, so it could pass vacuously in a
+   build that never produced the binary. Converted to a hard failure.
+
+**Status: branch pushed. PR not yet opened — `api.github.com` is unreachable
+from this environment, so the PR must be opened once network access is
+available.** Not merged: per the PRIDES workflow, merging waits on review and CI.
