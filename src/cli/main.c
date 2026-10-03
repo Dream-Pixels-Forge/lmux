@@ -457,6 +457,27 @@ static char *build_json_command(int argc, char **argv) {
     for (char *p = cmd_normalized; *p; p++) {
         if (*p == '-') *p = '_';
     }
+
+    /* Join a two-token `group sub` form into `group.sub`, shifting argv so the
+     * rest of this function sees the subcommand's arguments. gui/hooks_setup.py
+     * invokes `lmux hooks add <event> <script>`; without this the bare-word
+     * shorthand below would map `hooks` to `hooks.list` and silently ignore the
+     * subcommand while still exiting 0. */
+    if (argc >= 2 && (strcmp(cmd_normalized, "hooks") == 0 ||
+                      strcmp(cmd_normalized, "naming") == 0 ||
+                      strcmp(cmd_normalized, "ssh") == 0)) {
+        const char *sub = argv[1];
+        if (sub[0] != '-') {
+            char joined[160];
+            snprintf(joined, sizeof joined, "%s.%s", cmd_normalized, sub);
+            argv++;
+            argc--;
+            snprintf(cmd_normalized, sizeof cmd_normalized, "%s", joined);
+        }
+    }
+    for (char *p = cmd_normalized; *p; p++) {
+        if (*p == '-') *p = '_';
+    }
     const char *cmd = cmd_normalized;
     size_t args_len = 0;
     char args_buf[4096];
@@ -909,11 +930,13 @@ static char *build_json_command(int argc, char **argv) {
                 "\"event\":\"%s\",\"script\":\"%s\"", argv[1], (json_escape(argv[2], _esc, sizeof _esc), _esc));
         }
     }
-    /* hooks.remove <event> <script> */
+    /* hooks.remove <event> — the registry is keyed by event, so the script is not
+     * part of the identity. The old mapping required a spurious <script>
+     * argument, making `lmux hooks remove <event>` fail with invalid_params. */
     else if (strcmp(cmd, "hooks.remove") == 0 || strcmp(cmd, "hooks_remove") == 0) {
-        if (argc >= 3) {
+        if (argc >= 2) {
             args_len = snprintf(args_buf, sizeof args_buf,
-                "\"event\":\"%s\",\"script\":\"%s\"", argv[1], (json_escape(argv[2], _esc, sizeof _esc), _esc));
+                "\"event\":\"%s\"", (json_escape(argv[1], _esc, sizeof _esc), _esc));
         }
     }
     /* naming.suggest <dir> */
@@ -1254,7 +1277,7 @@ static void print_usage(void) {
     printf("  ssh.disconnect <session_id>        Disconnect an SSH session\n");
     printf("  hooks.list                         List registered hook scripts\n");
     printf("  hooks.add <event> <script>         Register a hook script for an event\n");
-    printf("  hooks.remove <event> <script>      Unregister a hook script\n");
+    printf("  hooks.remove <event>                Unregister a hook script\n");
     printf("  naming.suggest <dir>               Get workspace name suggestions for a directory\n");
     printf("  focus.history [count]              Show recent focus history\n");
     printf("  capabilities                       Print server capabilities\n");
