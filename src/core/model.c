@@ -2226,6 +2226,16 @@ static unsigned hash_string(const char *s) {
     return h;
 }
 
+/* Persist config to disk after a mutation. Workspace-group commands used to
+ * mutate cfg->workspace_groups in memory only and never called
+ * lmux_config_save, so every group was silently lost on daemon exit. */
+static void model_save_config(lmux_app *app) {
+    if (!app || !app->config) return;
+    char cpath[512];
+    lmux_config_path(cpath, sizeof cpath);
+    lmux_config_save(app->config, cpath);
+}
+
 /* Dispatch a JSON command string and return a JSON response string (caller must free). */
 static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_json) {
     size_t result_cap = 16384;
@@ -3830,7 +3840,19 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         }
         if (strcmp(key, "font_family") == 0) snprintf(app->config->font_family, sizeof app->config->font_family, "%s", value);
         else if (strcmp(key, "font_size") == 0) app->config->font_size = (int)atol(value);
-        else if (strcmp(key, "theme") == 0) snprintf(app->config->theme, sizeof app->config->theme, "%s", value);
+        else if (strcmp(key, "theme") == 0) {
+            /* The GUI only offers dark/light (gui/main.py, gui/settings_ui.py)
+             * and coerces anything else to light via
+             *   set_active(0 if theme == "dark" else 1)
+             * so an unvalidated value was accepted, persisted, then silently
+             * ignored. Reject it at the boundary instead. */
+            if (strcmp(value, "dark") != 0 && strcmp(value, "light") != 0) {
+                written = snprintf(result, result_cap,
+                    "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"theme must be 'dark' or 'light'\"}}");
+                goto done;
+            }
+            snprintf(app->config->theme, sizeof app->config->theme, "%s", value);
+        }
         else if (strcmp(key, "scrollback_lines") == 0) app->config->scrollback_lines = (int)atol(value);
         else if (strcmp(key, "show_sidebar") == 0) app->config->show_sidebar = (strcmp(value, "true") == 0);
         else if (strcmp(key, "show_notifications_panel") == 0) app->config->show_notifications_panel = (strcmp(value, "true") == 0);
@@ -3868,6 +3890,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             goto done;
         }
         lmux_workspace_group *g = lmux_workspace_group_create(app->config, name);
+        if (g) model_save_config(app);
         written = snprintf(result, result_cap,
             "{\"ok\":true,\"result\":{\"name\":\"%s\"}}", g ? g->name : name);
         goto done;
@@ -3901,6 +3924,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         }
         lmux_id wid = (lmux_id)atol(ws_id_str);
         bool ok = lmux_workspace_group_add(app->config, name, wid);
+        if (ok) model_save_config(app);
         written = snprintf(result, result_cap,
             "{\"ok\":%s,\"result\":{}}", ok ? "true" : "false");
         goto done;
@@ -3918,6 +3942,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         }
         lmux_id wid = (lmux_id)atol(ws_id_str);
         bool ok = lmux_workspace_group_remove(app->config, name, wid);
+        if (ok) model_save_config(app);
         written = snprintf(result, result_cap,
             "{\"ok\":%s,\"result\":{}}", ok ? "true" : "false");
         goto done;

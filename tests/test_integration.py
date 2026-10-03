@@ -63,24 +63,36 @@ def _ensure_daemon():
 _iso_seq = 0
 
 
-def _isolated_client():
+def _isolated_client(home=None):
     """Start a private daemon with its own HOME, and return (client, daemon, home).
 
     Use for operations that act on the whole model (session restore, snapshot
     load) or that must not see state left behind by other tests.
+
+    Pass `home` to reuse a previous HOME, which is how a config-persistence
+    test observes state across a daemon restart.
     """
     global _iso_seq
     _iso_seq += 1
-    home = tempfile.mkdtemp(prefix="lmux-iso-home-")
-    data = Path(home, ".local", "share")
+    own_home = home is None
+    if own_home:
+        home = tempfile.mkdtemp(prefix="lmux-iso-home-")
+    home = Path(home)
+    data = home / ".local" / "share"
     (data / "lmux").mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
-    env["HOME"] = home
+    env["HOME"] = str(home)
     env["XDG_DATA_HOME"] = str(data)
+    # lmux_config_path() prefers XDG_CONFIG_HOME over HOME/.config; pin both so
+    # an ambient XDG_CONFIG_HOME cannot leak the developer's real config in.
+    env["XDG_CONFIG_HOME"] = str(home / ".config")
+    # lmux_config_save() mkdir()s only one level deep, so the parent must exist
+    # exactly as it does in any real $HOME.
+    (home / ".config").mkdir(parents=True, exist_ok=True)
     sock = f"/tmp/lmux-iso-{os.getpid()}-{_iso_seq}.sock"
     Path(sock).unlink(missing_ok=True)
     daemon = LmuxDaemon(sock, env=env)
-    return daemon.start(timeout=60), daemon, Path(home)
+    return daemon.start(timeout=60), daemon, home
 
 
 def _shutdown_isolated(daemon, home):
@@ -494,6 +506,86 @@ class TestConfig(unittest.TestCase):
         for key in ["font_family", "font_size", "theme", "scrollback_lines",
                      "show_sidebar", "auto_save_session", "default_shell"]:
             self.assertIn(key, cfg, f"missing config key: {key}")
+
+
+# ====================================================================
+# Config persistence (round-trip through disk)
+# ====================================================================
+
+class TestConfigPersistence(unittest.TestCase):
+    """Config mutations must survive a restart and reject invalid values.
+
+    Runs against a private daemon with its own HOME so assertions can be made
+    against the real config.json on disk, and so the developer's own
+    ~/.config/lmux/config.json is never touched.
+    """
+
+    def _cfg_path(self, home):
+        return Path(home, ".config", "lmux", "config.json")
+
+    def test_group_create_is_persisted_to_disk(self):
+        """T4: workspace.group.create used to mutate memory only, never saving."""
+        client, daemon, home = _isolated_client()
+        try:
+            name = _unique("persist")
+            resp = client.send("workspace.group.create", {"name": name})
+            self.assertTrue(resp.get("ok"), resp)
+
+            cfg_file = self._cfg_path(home)
+            self.assertTrue(cfg_file.exists(),
+                            "config.json should be written after a group create")
+            self.assertIn(name, cfg_file.read_text(),
+                          "created group should be present in config.json")
+        finally:
+            _shutdown_isolated(daemon, home)
+
+    def test_group_survives_daemon_restart(self):
+        """T1 at CLI level: a saved group must be readable after a restart."""
+        client, daemon, home = _isolated_client()
+        try:
+            name = _unique("restart")
+            client.send("workspace.group.create", {"name": name})
+        finally:
+            _shutdown_isolated(daemon, home)
+
+        # Second daemon over the same HOME: the loader must understand the
+        # array-of-objects form lmux_config_save() writes.
+        client2, daemon2, home2 = _isolated_client(home=home)
+        try:
+            groups = client2.send("workspace.group.list").get("result", {})
+            self.assertIn(name, [g["name"] for g in groups.get("groups", [])],
+                          "group should survive a daemon restart")
+        finally:
+            _shutdown_isolated(daemon2, home2)
+
+    def test_invalid_theme_value_is_rejected(self):
+        """T3: config.set accepted any theme string; the GUI silently ignored
+        everything except 'dark'/'light'."""
+        client, daemon, home = _isolated_client()
+        try:
+            before = client.config_get("theme").get("value")
+            # send() rather than config_set(): the helper raises on ok:false,
+            # which is exactly the response under test.
+            resp = client.send("config.set", {"key": "theme", "value": "Bogus"})
+            self.assertFalse(resp.get("ok"),
+                             f"invalid theme value should be rejected: {resp}")
+            self.assertEqual(resp.get("error", {}).get("code"), "invalid_params")
+            self.assertEqual(client.config_get("theme").get("value"), before,
+                             "rejected value must not change the setting")
+        finally:
+            _shutdown_isolated(daemon, home)
+
+    def test_valid_theme_values_are_accepted(self):
+        client, daemon, home = _isolated_client()
+        try:
+            original = client.config_get("theme").get("value", "dark")
+            for value in ("dark", "light"):
+                resp = client.send("config.set", {"key": "theme", "value": value})
+                self.assertTrue(resp.get("ok"), f"{value} should be accepted: {resp}")
+                self.assertEqual(client.config_get("theme").get("value"), value)
+            client.send("config.set", {"key": "theme", "value": original})
+        finally:
+            _shutdown_isolated(daemon, home)
 
 
 # ====================================================================

@@ -203,6 +203,143 @@ static void test_group_create_and_find(void) {
 }
 
 /* ──────────────────────────────────────────────
+ * Round-trip tests (RED before F2/F3)
+ *
+ * The three tests above each feed the loader a hand-written
+ * shape that the loader happens to accept. None of them ever
+ * exercises what lmux_config_save() actually writes, which is
+ * how all three collections came to be write-only. These tests
+ * use the real save format and a real temp file.
+ * ────────────────────────────────────────────── */
+
+static void test_keybindings_save_format_loads(void) {
+    TEST("keybindings in save format (array) load correctly");
+    char path[128];
+    snprintf(path, sizeof path, "/tmp/lmux-test-kb-rt-%d.json", getpid());
+
+    /* Exactly what lmux_config_save() emits for keybindings. */
+    write_test_config(path, "{"
+        "\"keybindings\": ["
+          "{\"key\": \"split-v\", \"action\": \"C-b percent\"},"
+          "{\"key\": \"split-h\", \"action\": \"C-b quote\"}"
+        "]"
+    "}");
+
+    lmux_config *cfg = lmux_config_new();
+    bool ok = lmux_config_load(cfg, path);
+    ASSERT(ok, "config with save-format keybindings should load");
+    ASSERT(cfg->keybindings.len == 2, "should parse 2 keybindings from save format");
+
+    lmux_keybinding *kb = lmux_config_find_key(cfg, "split-v");
+    ASSERT(kb != NULL, "should find 'split-v' from save format");
+    ASSERT(strcmp(kb->action, "C-b percent") == 0, "action should match");
+
+    lmux_config_free(cfg);
+    unlink(path);
+    PASS();
+}
+
+static void test_load_themes(void) {
+    TEST("themes array from save format loads");
+    char path[128];
+    snprintf(path, sizeof path, "/tmp/lmux-test-themes-%d.json", getpid());
+
+    /* Exactly what lmux_config_save() emits for themes. */
+    write_test_config(path, "{"
+        "\"themes\": ["
+          "{\"name\": \"dracula\", \"fg\": \"#f8f8f2\", \"bg\": \"#282a36\", \"cursor\": \"#f8f8f2\"},"
+          "{\"name\": \"solarized\", \"fg\": \"#839496\", \"bg\": \"#002b36\", \"cursor\": \"#93a1a1\"}"
+        "]"
+    "}");
+
+    lmux_config *cfg = lmux_config_new();
+    bool ok = lmux_config_load(cfg, path);
+    ASSERT(ok, "config with themes should load");
+    ASSERT(cfg->themes.len == 2, "should parse 2 themes");
+
+    lmux_theme_entry *t = lmux_config_find_theme(cfg, "dracula");
+    ASSERT(t != NULL, "should find 'dracula' theme");
+    ASSERT(strcmp(t->bg, "#282a36") == 0, "dracula bg should match");
+
+    lmux_config_free(cfg);
+    unlink(path);
+    PASS();
+}
+
+static void test_groups_save_load_roundtrip(void) {
+    TEST("workspace groups survive a real save/load round-trip");
+    char path[128];
+    snprintf(path, sizeof path, "/tmp/lmux-test-groups-rt-%d.json", getpid());
+
+    lmux_config *cfg = lmux_config_new();
+    lmux_workspace_group *g = lmux_workspace_group_create(cfg, "roundtrip");
+    ASSERT(g != NULL, "group_create should succeed");
+    ASSERT(lmux_workspace_group_add(cfg, "roundtrip", 7), "add ws 7");
+    ASSERT(lmux_workspace_group_add(cfg, "roundtrip", 9), "add ws 9");
+    ASSERT(lmux_config_save(cfg, path), "config_save should succeed");
+
+    lmux_config *reloaded = lmux_config_new();
+    ASSERT(lmux_config_load(reloaded, path), "reload should succeed");
+
+    lmux_workspace_group *found = lmux_workspace_group_find(reloaded, "roundtrip");
+    ASSERT(found != NULL, "group should survive save/load round-trip");
+    ASSERT(found->workspace_ids.len == 2, "group should still hold 2 workspace ids");
+
+    lmux_config_free(cfg);
+    lmux_config_free(reloaded);
+    unlink(path);
+    PASS();
+}
+
+static void test_save_creates_deep_parent_dirs(void) {
+    TEST("save creates missing parent directories at any depth");
+    char base[128];
+    snprintf(base, sizeof base, "/tmp/lmux-test-deep-%d", getpid());
+    /* Three levels, none of which exist. mkdir() is not recursive, so a
+     * single-level mkdir() of the leaf fails with ENOENT and the save
+     * silently no-ops — the user sees success and gets no file. */
+    char path[256];
+    snprintf(path, sizeof path, "%s/a/b/c/config.json", base);
+
+    lmux_config *cfg = lmux_config_new();
+    ASSERT(lmux_config_save(cfg, path), "save should succeed with missing parents");
+
+    lmux_config *reloaded = lmux_config_new();
+    ASSERT(lmux_config_load(reloaded, path), "file should exist and load back");
+    ASSERT(strcmp(reloaded->font_family, cfg->font_family) == 0,
+           "reloaded values should match");
+
+    lmux_config_free(cfg);
+    lmux_config_free(reloaded);
+    /* rm -rf the tree; rmdir on the leaf chain would need four calls */
+    char rm[320];
+    snprintf(rm, sizeof rm, "rm -rf %s", base);
+    if (system(rm) != 0) { /* best effort cleanup */ }
+    PASS();
+}
+
+static void test_save_reuses_existing_parent_dir(void) {
+    TEST("save reuses an existing parent directory");
+    char path[256];
+    snprintf(path, sizeof path, "/tmp/lmux-test-existing-%d/config.json", getpid());
+
+    lmux_config *cfg = lmux_config_new();
+    /* First save creates the directory; second must succeed identically. */
+    ASSERT(lmux_config_save(cfg, path), "first save should create the directory");
+    ASSERT(lmux_config_save(cfg, path), "second save should reuse it");
+
+    lmux_config *reloaded = lmux_config_new();
+    ASSERT(lmux_config_load(reloaded, path), "file should load back");
+
+    lmux_config_free(cfg);
+    lmux_config_free(reloaded);
+    char rm[320];
+    snprintf(rm, sizeof rm, "rm -rf /tmp/lmux-test-existing-%d", getpid());
+    if (system(rm) != 0) { /* best effort cleanup */ }
+    PASS();
+}
+
+/* ──────────────────────────────────────────────
  * Main
  * ────────────────────────────────────────────── */
 
@@ -217,6 +354,11 @@ int main(void) {
     test_load_keybindings();
     test_load_groups();
     test_group_create_and_find();
+    test_keybindings_save_format_loads();
+    test_load_themes();
+    test_groups_save_load_roundtrip();
+    test_save_creates_deep_parent_dirs();
+    test_save_reuses_existing_parent_dir();
 
     printf("\n======================\n");
     printf("Tests: %d passed, %d failed, %d total\n\n",
