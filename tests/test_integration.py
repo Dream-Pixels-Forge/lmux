@@ -15,6 +15,7 @@ Usage:
 
 import os
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -63,24 +64,36 @@ def _ensure_daemon():
 _iso_seq = 0
 
 
-def _isolated_client():
+def _isolated_client(home=None):
     """Start a private daemon with its own HOME, and return (client, daemon, home).
 
     Use for operations that act on the whole model (session restore, snapshot
     load) or that must not see state left behind by other tests.
+
+    Pass `home` to reuse a previous HOME, which is how a config-persistence
+    test observes state across a daemon restart.
     """
     global _iso_seq
     _iso_seq += 1
-    home = tempfile.mkdtemp(prefix="lmux-iso-home-")
-    data = Path(home, ".local", "share")
+    own_home = home is None
+    if own_home:
+        home = tempfile.mkdtemp(prefix="lmux-iso-home-")
+    home = Path(home)
+    data = home / ".local" / "share"
     (data / "lmux").mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
-    env["HOME"] = home
+    env["HOME"] = str(home)
     env["XDG_DATA_HOME"] = str(data)
+    # lmux_config_path() prefers XDG_CONFIG_HOME over HOME/.config; pin both so
+    # an ambient XDG_CONFIG_HOME cannot leak the developer's real config in.
+    env["XDG_CONFIG_HOME"] = str(home / ".config")
+    # lmux_config_save() mkdir()s only one level deep, so the parent must exist
+    # exactly as it does in any real $HOME.
+    (home / ".config").mkdir(parents=True, exist_ok=True)
     sock = f"/tmp/lmux-iso-{os.getpid()}-{_iso_seq}.sock"
     Path(sock).unlink(missing_ok=True)
     daemon = LmuxDaemon(sock, env=env)
-    return daemon.start(timeout=60), daemon, Path(home)
+    return daemon.start(timeout=60), daemon, home
 
 
 def _shutdown_isolated(daemon, home):
@@ -494,6 +507,237 @@ class TestConfig(unittest.TestCase):
         for key in ["font_family", "font_size", "theme", "scrollback_lines",
                      "show_sidebar", "auto_save_session", "default_shell"]:
             self.assertIn(key, cfg, f"missing config key: {key}")
+
+
+class TestTmuxCompatCli(unittest.TestCase):
+    """CLI-level checks that run the binary directly.
+
+    These exercise code paths that only run in the client process, so they
+    cannot be covered by the socket-based tests above.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        repo_root = Path(__file__).parent.parent
+        cls.bin = repo_root / "build" / "lmux"
+        if not cls.bin.exists():
+            raise unittest.SkipTest(
+                f"lmux binary not found at {cls.bin}; run the build first")
+
+    def test_unknown_tmux_subcommand_exits_cleanly(self):
+        """B7: translate_tmux_command() fell off the end on an unknown
+        subcommand after free(json), returning a dangling pointer. main()
+        then free()d that garbage — AddressSanitizer reported `bad-free` and
+        glibc aborted with "double free or corruption"."""
+        proc = subprocess.run(
+            [str(self.bin), "tmux", "definitely-not-a-command"],
+            capture_output=True, text=True, timeout=30,
+        )
+        # A negative return code means the process died on a signal, which is
+        # exactly the heap-corruption abort we are guarding against.
+        self.assertGreaterEqual(
+            proc.returncode, 0,
+            f"CLI crashed on a bad signal (rc={proc.returncode}); "
+            f"stderr tail: {proc.stderr[-300:]}",
+        )
+        self.assertNotIn("corruption", proc.stderr.lower())
+        self.assertNotIn("AddressSanitizer", proc.stderr)
+
+
+class TestBrowserScreenshotPathValidation(unittest.TestCase):
+    """#12: browser.screenshot accepted an arbitrary write path from any socket
+    client, letting a same-UID process or agent clobber any file the daemon
+    could write. Screenshot paths must be relative and confined to the
+    screenshot root."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.client, cls.daemon, cls.home = _isolated_client()
+
+    @classmethod
+    def tearDownClass(cls):
+        _shutdown_isolated(cls.daemon, cls.home)
+
+    def _shot(self, path):
+        return self.client.send("browser.screenshot", {"path": path})
+
+    def test_absolute_path_outside_root_is_rejected(self):
+        for bad in ["/tmp/pwned.png", "/etc/cron.d/pwn", "~/.bashrc"]:
+            resp = self._shot(bad)
+            self.assertFalse(resp.get("ok"), f"{bad!r} must be rejected: {resp}")
+            self.assertEqual(resp.get("error", {}).get("code"),
+                             "invalid_params", f"{bad!r}: {resp}")
+
+    def test_traversal_escape_is_rejected(self):
+        for bad in ["../escape.png", "sub/../../escape.png", "../../.bashrc"]:
+            resp = self._shot(bad)
+            self.assertFalse(resp.get("ok"), f"{bad!r} must be rejected: {resp}")
+
+    def test_rejected_write_leaves_no_file(self):
+        target = Path(self.home, "pwned-by-lmux.txt")
+        resp = self._shot(str(target))
+        self.assertFalse(resp.get("ok"))
+        self.assertFalse(target.exists(),
+                         "daemon must not create a file outside its root")
+
+    def test_relative_path_inside_root_is_accepted(self):
+        resp = self._shot("shot.png")
+        self.assertTrue(resp.get("ok"), f"relative path should be allowed: {resp}")
+        self.assertNotIn("..", resp.get("result", {}).get("path", ""))
+
+    def test_path_is_json_escaped_in_event_payload(self):
+        """A quote in the name must not break out of the JSON string that is
+        persisted to events.jsonl and echoed in the response.
+
+        The response is parsed with json.loads(), so reaching this assertion
+        already proves the wire format stayed valid: unescaped, the reply would
+        not have parsed at all. What must hold is that the escaped value
+        round-trips back to exactly what was asked for.
+        """
+        resp = self._shot('weird"name.png')
+        self.assertTrue(resp.get("ok"), resp)
+        path = resp.get("result", {}).get("path", "")
+        self.assertTrue(
+            path.endswith('weird"name.png'),
+            f"escaped path should round-trip to the original name: {path!r}",
+        )
+
+    def test_default_path_is_inside_root(self):
+        resp = self.client.send("browser.screenshot")
+        self.assertTrue(resp.get("ok"), resp)
+        self.assertTrue(resp.get("result", {}).get("path", "").startswith("/"),
+                        "default path should be absolute and rooted")
+
+
+class TestSnapshotTruncationDetection(unittest.TestCase):
+    """#11: lmux_snapshot_load() read into a fixed 64 KB buffer and silently
+    truncated anything larger, producing a partially-restored session that
+    still reported success. Truncation must be detected and reported."""
+
+    def test_oversized_snapshot_is_rejected_not_silently_truncated(self):
+        client, daemon, home = _isolated_client()
+        try:
+            snap = Path(tempfile.gettempdir(),
+                        f"lmux-test-big-{os.getpid()}.json")
+            # ~70 KB, comfortably past the 64 KB buffer.
+            workspaces = "".join(
+                '{"title":"ws%04d","cwd":"/tmp","surfaces":[]}' % i
+                for i in range(1800))
+            snap.write_text('{"workspaces":[' + workspaces + ']}')
+            self.assertGreater(snap.stat().st_size, 65536,
+                               "fixture must exceed the 64 KB buffer")
+
+            resp = client.send("snapshot.load", {"path": str(snap)})
+            self.assertFalse(resp.get("ok"),
+                             f"oversized snapshot must not report success: "
+                             f"{resp.get('ok')}")
+            self.assertEqual(resp.get("error", {}).get("code"), "load_failed")
+        finally:
+            _shutdown_isolated(daemon, home)
+            try:
+                snap.unlink()
+            except (OSError, UnboundLocalError):
+                pass
+
+    def test_normal_sized_snapshot_still_loads(self):
+        """The guard must not reject snapshots that legitimately fit."""
+        client, daemon, home = _isolated_client()
+        try:
+            ws = client.workspace_create(_unique("snap-fits"))
+            snap = Path(tempfile.gettempdir(),
+                        f"lmux-test-fits-{os.getpid()}.json")
+            client.snapshot_save(str(snap))
+            self.assertLess(snap.stat().st_size, 65536)
+
+            resp = client.send("snapshot.load", {"path": str(snap)})
+            self.assertTrue(resp.get("ok"),
+                            f"a normal snapshot must still load: {resp}")
+        finally:
+            _shutdown_isolated(daemon, home)
+            try:
+                snap.unlink()
+            except (OSError, UnboundLocalError):
+                pass
+
+
+# ====================================================================
+# Config persistence (round-trip through disk)
+# ====================================================================
+
+class TestConfigPersistence(unittest.TestCase):
+    """Config mutations must survive a restart and reject invalid values.
+
+    Runs against a private daemon with its own HOME so assertions can be made
+    against the real config.json on disk, and so the developer's own
+    ~/.config/lmux/config.json is never touched.
+    """
+
+    def _cfg_path(self, home):
+        return Path(home, ".config", "lmux", "config.json")
+
+    def test_group_create_is_persisted_to_disk(self):
+        """T4: workspace.group.create used to mutate memory only, never saving."""
+        client, daemon, home = _isolated_client()
+        try:
+            name = _unique("persist")
+            resp = client.send("workspace.group.create", {"name": name})
+            self.assertTrue(resp.get("ok"), resp)
+
+            cfg_file = self._cfg_path(home)
+            self.assertTrue(cfg_file.exists(),
+                            "config.json should be written after a group create")
+            self.assertIn(name, cfg_file.read_text(),
+                          "created group should be present in config.json")
+        finally:
+            _shutdown_isolated(daemon, home)
+
+    def test_group_survives_daemon_restart(self):
+        """T1 at CLI level: a saved group must be readable after a restart."""
+        client, daemon, home = _isolated_client()
+        try:
+            name = _unique("restart")
+            client.send("workspace.group.create", {"name": name})
+        finally:
+            _shutdown_isolated(daemon, home)
+
+        # Second daemon over the same HOME: the loader must understand the
+        # array-of-objects form lmux_config_save() writes.
+        client2, daemon2, home2 = _isolated_client(home=home)
+        try:
+            groups = client2.send("workspace.group.list").get("result", {})
+            self.assertIn(name, [g["name"] for g in groups.get("groups", [])],
+                          "group should survive a daemon restart")
+        finally:
+            _shutdown_isolated(daemon2, home2)
+
+    def test_invalid_theme_value_is_rejected(self):
+        """T3: config.set accepted any theme string; the GUI silently ignored
+        everything except 'dark'/'light'."""
+        client, daemon, home = _isolated_client()
+        try:
+            before = client.config_get("theme").get("value")
+            # send() rather than config_set(): the helper raises on ok:false,
+            # which is exactly the response under test.
+            resp = client.send("config.set", {"key": "theme", "value": "Bogus"})
+            self.assertFalse(resp.get("ok"),
+                             f"invalid theme value should be rejected: {resp}")
+            self.assertEqual(resp.get("error", {}).get("code"), "invalid_params")
+            self.assertEqual(client.config_get("theme").get("value"), before,
+                             "rejected value must not change the setting")
+        finally:
+            _shutdown_isolated(daemon, home)
+
+    def test_valid_theme_values_are_accepted(self):
+        client, daemon, home = _isolated_client()
+        try:
+            original = client.config_get("theme").get("value", "dark")
+            for value in ("dark", "light"):
+                resp = client.send("config.set", {"key": "theme", "value": value})
+                self.assertTrue(resp.get("ok"), f"{value} should be accepted: {resp}")
+                self.assertEqual(client.config_get("theme").get("value"), value)
+            client.send("config.set", {"key": "theme", "value": original})
+        finally:
+            _shutdown_isolated(daemon, home)
 
 
 # ====================================================================

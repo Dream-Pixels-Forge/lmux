@@ -107,6 +107,23 @@ static bool is_safe_path(const char *path, const char *base_dir) {
     return true;
 }
 
+/* Root directory browser.screenshot is confined to (#12). Kept under the
+ * user's cache dir so a screenshot write can never reach a shell profile, an
+ * autostart entry, or a systemd unit. */
+static void browser_screenshot_root(char *buf, size_t cap) {
+    const char *xdg_cache = getenv("XDG_CACHE_HOME");
+    if (xdg_cache && xdg_cache[0]) {
+        snprintf(buf, cap, "%s/lmux/screenshots", xdg_cache);
+        return;
+    }
+    const char *home = getenv("HOME");
+    if (home && home[0]) {
+        snprintf(buf, cap, "%s/.cache/lmux/screenshots", home);
+        return;
+    }
+    snprintf(buf, cap, "/tmp/lmux-screenshots-%ld", (long)getuid());
+}
+
 /* ----- Vector helper ----- */
 
 #define VEC_GROW 8
@@ -2226,6 +2243,16 @@ static unsigned hash_string(const char *s) {
     return h;
 }
 
+/* Persist config to disk after a mutation. Workspace-group commands used to
+ * mutate cfg->workspace_groups in memory only and never called
+ * lmux_config_save, so every group was silently lost on daemon exit. */
+static void model_save_config(lmux_app *app) {
+    if (!app || !app->config) return;
+    char cpath[512];
+    lmux_config_path(cpath, sizeof cpath);
+    lmux_config_save(app->config, cpath);
+}
+
 /* Dispatch a JSON command string and return a JSON response string (caller must free). */
 static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_json) {
     size_t result_cap = 16384;
@@ -3830,7 +3857,19 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         }
         if (strcmp(key, "font_family") == 0) snprintf(app->config->font_family, sizeof app->config->font_family, "%s", value);
         else if (strcmp(key, "font_size") == 0) app->config->font_size = (int)atol(value);
-        else if (strcmp(key, "theme") == 0) snprintf(app->config->theme, sizeof app->config->theme, "%s", value);
+        else if (strcmp(key, "theme") == 0) {
+            /* The GUI only offers dark/light (gui/main.py, gui/settings_ui.py)
+             * and coerces anything else to light via
+             *   set_active(0 if theme == "dark" else 1)
+             * so an unvalidated value was accepted, persisted, then silently
+             * ignored. Reject it at the boundary instead. */
+            if (strcmp(value, "dark") != 0 && strcmp(value, "light") != 0) {
+                written = snprintf(result, result_cap,
+                    "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"theme must be 'dark' or 'light'\"}}");
+                goto done;
+            }
+            snprintf(app->config->theme, sizeof app->config->theme, "%s", value);
+        }
         else if (strcmp(key, "scrollback_lines") == 0) app->config->scrollback_lines = (int)atol(value);
         else if (strcmp(key, "show_sidebar") == 0) app->config->show_sidebar = (strcmp(value, "true") == 0);
         else if (strcmp(key, "show_notifications_panel") == 0) app->config->show_notifications_panel = (strcmp(value, "true") == 0);
@@ -3868,6 +3907,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             goto done;
         }
         lmux_workspace_group *g = lmux_workspace_group_create(app->config, name);
+        if (g) model_save_config(app);
         written = snprintf(result, result_cap,
             "{\"ok\":true,\"result\":{\"name\":\"%s\"}}", g ? g->name : name);
         goto done;
@@ -3901,6 +3941,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         }
         lmux_id wid = (lmux_id)atol(ws_id_str);
         bool ok = lmux_workspace_group_add(app->config, name, wid);
+        if (ok) model_save_config(app);
         written = snprintf(result, result_cap,
             "{\"ok\":%s,\"result\":{}}", ok ? "true" : "false");
         goto done;
@@ -3918,6 +3959,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         }
         lmux_id wid = (lmux_id)atol(ws_id_str);
         bool ok = lmux_workspace_group_remove(app->config, name, wid);
+        if (ok) model_save_config(app);
         written = snprintf(result, result_cap,
             "{\"ok\":%s,\"result\":{}}", ok ? "true" : "false");
         goto done;
@@ -4290,13 +4332,47 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         goto done;
     }
 
+    /* browser.screenshot (#12): the path used to be taken verbatim from the
+     * request, so any same-UID socket client could make the daemon write to an
+     * arbitrary location. Confine it to a cache root and reject anything that
+     * escapes it. */
     if (strcmp(cmd, "browser.screenshot") == 0) {
-        char path[1024] = {0};
-        json_extract_string(args_json, "path", path, sizeof path);
-        if (!path[0]) strncpy(path, "/tmp/lmux-screenshot.png", sizeof path - 1);
-        lmux_event_push(app, "browser.screenshot", "browser", "\"path\":\"%s\"", path);
+        char req[1024] = {0};
+        char root[1024];
+        char resolved[2048];
+        char esc[2048];
+
+        browser_screenshot_root(root, sizeof root);
+
+        json_extract_string(args_json, "path", req, sizeof req);
+        if (!req[0]) {
+            snprintf(resolved, sizeof resolved, "%s/screenshot.png", root);
+        } else {
+            /* A leading "~" is contained by the root, so it is not an escape,
+             * but it is always a mistake (it would silently become
+             * <root>/~/.bashrc). Reject it rather than quietly rewriting it. */
+            if (req[0] == '~') {
+                written = snprintf(result, result_cap,
+                    "{\"ok\":false,\"error\":{\"code\":\"invalid_params\","
+                    "\"message\":\"screenshot path must not start with '~'\"}}");
+                goto done;
+            }
+            /* is_safe_path() with a base_dir rejects absolute paths, ".."
+             * components, and anything not contained by base_dir. */
+            if (!is_safe_path(req, root)) {
+                written = snprintf(result, result_cap,
+                    "{\"ok\":false,\"error\":{\"code\":\"invalid_params\","
+                    "\"message\":\"screenshot path must be relative and inside %s\"}}",
+                    root);
+                goto done;
+            }
+            snprintf(resolved, sizeof resolved, "%s/%s", root, req);
+        }
+
+        json_escape_str(esc, sizeof esc, resolved);
+        lmux_event_push(app, "browser.screenshot", "browser", "\"path\":\"%s\"", esc);
         written = snprintf(result, result_cap,
-            "{\"ok\":true,\"result\":{\"path\":\"%s\"}}", path);
+            "{\"ok\":true,\"result\":{\"path\":\"%s\"}}", esc);
         goto done;
     }
 
@@ -7564,7 +7640,20 @@ bool lmux_snapshot_load(lmux_app *app, const char *path) {
     if (!f) return false;
     char buf[65536];
     size_t n = fread(buf, 1, sizeof buf - 1, f);
+    /* #11: if the file is larger than the buffer we have clipped it, and the
+     * brace scanner below then walks a partial document. That produced a
+     * half-restored session reported as success — and, in practice, wedged
+     * the daemon on the write lock so it stopped answering entirely. Reject
+     * the oversized file instead of parsing a clipped one. A single extra
+     * fgetc distinguishes "exactly full" from "clipped". */
+    bool clipped = (n == sizeof buf - 1) && (fgetc(f) != EOF);
     fclose(f);
+    if (clipped) {
+        lmux_log(LMUX_LOG_ERROR,
+                 "snapshot: %s exceeds the %zu byte limit; refusing to load",
+                 path, sizeof buf - 1);
+        return false;
+    }
     if (n == 0) return false;
     buf[n] = 0;
 
@@ -7617,7 +7706,16 @@ bool lmux_snapshot_load(lmux_app *app, const char *path) {
         /* Extract fields using json helpers */
         char buf_copy[4096];
         size_t blen = (size_t)(ws_end - ws_arr);
-        if (blen >= sizeof buf_copy) blen = sizeof buf_copy - 1;
+        if (blen >= sizeof buf_copy) {
+            /* #11: this clamp is still silent, so at least make it
+             * diagnosable. The field-extraction helpers below would read a
+             * clipped block and could miss a surface or pane. */
+            lmux_log(LMUX_LOG_WARN,
+                     "snapshot: workspace block of %zu bytes exceeds the %zu "
+                     "byte scratch buffer; its surfaces may be missed",
+                     (size_t)(ws_end - ws_arr), sizeof buf_copy - 1);
+            blen = sizeof buf_copy - 1;
+        }
         memcpy(buf_copy, ws_arr, blen);
         buf_copy[blen] = 0;
 

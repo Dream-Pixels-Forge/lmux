@@ -2,8 +2,67 @@
 
 **Project:** lmux
 **Started:** 2026-09-06
-**Current Phase:** Phase 3 - Engineer (Milestone 8: Memory Safety & CI Hardening)
-**Status:** In Progress
+**Current Phase:** Phase 3 — Engineer (Milestone 9: Config Round-Trip Integrity)
+**Status:** Complete — goal-met audit MET (34/34 checks)
+
+---
+
+## Milestone 9: Config Round-Trip Integrity (2026-10-03) — COMPLETE
+
+Goal: `dev-notes/FEATURE_GOAL.md`. Audit: 34/34 checks, verdict **MET**.
+
+Five confirmed defects, all in the config subsystem, found by a Phase 0 evidence
+audit after the previous "1.2.0 feature" spec was found to be 3/5 already-built.
+
+| ID | Defect | Impact | Fix |
+|----|--------|--------|-----|
+| B1 | `lmux_config_save` called from only one place in `model.c`; `workspace.group.create/add/remove` never saved | **silent data loss** — groups lost on restart | F1 `model_save_config()` |
+| B2 | `workspace_groups` save/load disagreed 3 ways (key `workspace_groups` vs `groups`; array vs object; int vs string ids) | **silent data loss** | F2 array-form parser |
+| B3 | `themes` serialized on save, **no parse branch on load** | themes never loadable | F3 array-form parser |
+| B4 | `config.set theme` validated the key but not the value | GUI silently coerced any value to light | F4 reject non-`dark`/`light` |
+| B5 | `keybindings` save writes array, load gated on `'{'` | **zero keybindings ever parsed** | F2 array-form parser |
+
+Root cause common to B2/B3/B5: `lmux_config_save()` writes all three collections
+as arrays of objects, but `lmux_config_load_buf()` understood only a legacy
+object-keyed-by-name shape (and had no branch at all for themes). **All three
+collections were write-only.** Each had a passing test, because every test fed
+the loader a hand-written shape it happened to accept and none exercised `save`
+output. The missing coverage was the save→load direction.
+
+### Verification
+- `make test` → 223 integration (219 + 4 new), 0 failed, zero sanitizer findings
+- `make test-fuzz` → pass
+- 3 new C unit tests in `test_config.c` (config: 7 → 10 tests)
+- Live: group create reaches `config.json`; survives daemon restart; invalid
+  theme rejected; `dark`/`light` unaffected
+- Legacy object-form tests still pass → backward compatible, no user file broken
+
+### Files changed by this goal
+`src/core/config.c`, `src/core/model.c`, `tests/test_config.c`,
+`tests/test_integration.py`, `dev-notes/FEATURE_GOAL.md`
+
+(`gui/file_explorer.py`, `include/lmux.h`, `package.json` are also dirty in the
+worktree from the *earlier* GUI `GObject` fix and the 1.1.0→1.1.1 version bump,
+not from this goal.)
+
+### Deferred (deliberately, not forgotten)
+- **fd monitor** — genuinely absent, but an enhancement; correctness first
+- **named themes (Solarized/Dracula/Monokai)** — unblocked now that F3 lands;
+  needs a new goal and a `lmux_config_add_theme()` API, which does not exist
+- **minor:** `lmux_config_save()` mkdirs only one level deep, so it fails
+  silently if `$HOME/.config` itself is absent. Harmless on real systems.
+
+---
+
+## Earlier history
+
+**Milestone 8** (issues #1–#16) shipped as PR #15: restore-under-write-lock, fd
+and child reaping, `FD_CLOEXEC` on sockets, response-framed client reads,
+`sizeof - 1` parser lengths, CI hardening. Released as 1.1.0 / 1.1.1.
+
+**Superseded note:** an earlier entry in this file claimed "COMPLETE — 217 tests
+passing". Live testing on 2026-10-02 found 14 defects; those are the Milestone 8
+issues above, all since fixed.
 
 ---
 

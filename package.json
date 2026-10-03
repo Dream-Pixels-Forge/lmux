@@ -1,5 +1,5 @@
 {
-  "version": "1.0.0",
+  "version": "1.1.1",
   "description": "A native Linux terminal for running AI coding agents in parallel",
   "private": true,
   "type": "module",
