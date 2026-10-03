@@ -7676,242 +7676,349 @@ bool lmux_snapshot_save(const lmux_app *app, const char *path) {
     return true;
 }
 
-bool lmux_snapshot_load(lmux_app *app, const char *path) {
-    if (!app || !path) return false;
-    FILE *f = fopen(path, "r");
-    if (!f) return false;
-    char buf[65536];
-    size_t n = fread(buf, 1, sizeof buf - 1, f);
-    /* #11: if the file is larger than the buffer we have clipped it, and the
-     * brace scanner below then walks a partial document. That produced a
-     * half-restored session reported as success — and, in practice, wedged
-     * the daemon on the write lock so it stopped answering entirely. Reject
-     * the oversized file instead of parsing a clipped one. A single extra
-     * fgetc distinguishes "exactly full" from "clipped". */
-    bool clipped = (n == sizeof buf - 1) && (fgetc(f) != EOF);
-    fclose(f);
-    if (clipped) {
-        lmux_log(LMUX_LOG_ERROR,
-                 "snapshot: %s exceeds the %zu byte limit; refusing to load",
-                 path, sizeof buf - 1);
+/* ------------------------------------------------------------------
+ * Snapshot reader (#11)
+ *
+ * Bounded, string-aware recursive descent over the schema
+ * lmux_snapshot_save() emits:
+ *
+ *   {"version":1,"workspaces":[
+ *     {"id":1,"title":"..","cwd":"..","git_branch":"..","surfaces":[
+ *       {"id":1,"title":"..","panes":[
+ *         {"id":1,"kind":"terminal","command":".."}]}]}]}
+ *
+ * The previous implementation hunted for '{' with strstr and counted braces,
+ * so a '}' inside any string value terminated the enclosing object early. A
+ * workspace titled "evil}" made surface objects appear in the workspace list
+ * while the load still reported success. Unknown keys are skipped, not
+ * modelled. No fixed scratch buffer holds a slice of the document: every
+ * string is decoded straight into a model-sized field.
+ * ------------------------------------------------------------------ */
+
+typedef struct { const char *p; const char *end; } snap_rd;
+
+static void snap_ws(snap_rd *r) {
+    while (r->p < r->end &&
+           (*r->p == ' ' || *r->p == '\t' || *r->p == '\n' || *r->p == '\r'))
+        r->p++;
+}
+
+static bool snap_peek(snap_rd *r, char c) {
+    snap_ws(r);
+    return r->p < r->end && *r->p == c;
+}
+
+static bool snap_eat(snap_rd *r, char c) {
+    if (!snap_peek(r, c)) return false;
+    r->p++;
+    return true;
+}
+
+/* Read a JSON string, resolving escapes. Fails on an unterminated value so a
+ * truncated document is rejected rather than half-applied. */
+static bool snap_read_string(snap_rd *r, char *out, size_t cap) {
+    snap_ws(r);
+    if (r->p >= r->end || *r->p != '"') return false;
+    r->p++;
+    size_t i = 0;
+    while (r->p < r->end && *r->p != '"') {
+        char c = *r->p++;
+        if (c == '\\' && r->p < r->end) {
+            char e = *r->p++;
+            switch (e) {
+            case 'n': c = '\n'; break;
+            case 't': c = '\t'; break;
+            case 'r': c = '\r'; break;
+            case 'b': c = '\b'; break;
+            case 'f': c = '\f'; break;
+            case '"': case '\\': case '/': c = e; break;
+            default: c = e; break;
+            }
+        }
+        if (i + 1 < cap) out[i++] = c;
+    }
+    if (r->p >= r->end) return false;   /* unterminated string */
+    r->p++;                              /* closing quote */
+    out[i] = '\0';
+    return true;
+}
+
+static bool snap_read_uint(snap_rd *r, unsigned *out) {
+    snap_ws(r);
+    if (r->p >= r->end || *r->p < '0' || *r->p > '9') return false;
+    unsigned long v = 0;
+    while (r->p < r->end && *r->p >= '0' && *r->p <= '9') {
+        v = v * 10 + (unsigned long)(*r->p - '0');
+        if (v > 0xFFFFFFFFul) return false;   /* implausible id: malformed */
+        r->p++;
+    }
+    *out = (unsigned)v;
+    return true;
+}
+
+/* Consume one value of any shape. Only used for keys the schema does not
+ * describe, so it is permissive about the value type while still refusing an
+ * unterminated container. */
+static bool snap_skip_value(snap_rd *r) {
+    snap_ws(r);
+    if (r->p >= r->end) return false;
+    if (*r->p == '"') { char t[512]; return snap_read_string(r, t, sizeof t); }
+    if (*r->p == '{' || *r->p == '[') {
+        int depth = 0;
+        while (r->p < r->end) {
+            char c = *r->p;
+            if (c == '"') {
+                char t[512];
+                if (!snap_read_string(r, t, sizeof t)) return false;
+                continue;
+            }
+            if (c == '{' || c == '[') depth++;
+            else if (c == '}' || c == ']') {
+                depth--;
+                if (depth == 0) { r->p++; return true; }
+            }
+            r->p++;
+        }
         return false;
     }
-    if (n == 0) return false;
-    buf[n] = 0;
+    while (r->p < r->end && *r->p != ',' && *r->p != '}' && *r->p != ']' &&
+           *r->p != ' ' && *r->p != '\t' && *r->p != '\n' && *r->p != '\r')
+        r->p++;
+    return true;
+}
 
-    /* Walk workspace objects in the workspaces array.
-     * Find each "title":"..." / "cwd":"..." pair, create the workspace,
-     * then find surfaces/panes inside it by brace matching. */
-    const char *p = buf;
 
-    /* Find workspaces array, tolerating insignificant whitespace (#7).
-     * json_find_key() skips whitespace after the colon, so both the
-     * compact form lmux writes ("workspaces":[) and standard pretty-printed
-     * JSON ("workspaces": [) are accepted. */
-    const char *ws_arr = json_find_key(p, "workspaces");
-    if (!ws_arr) {
-        /* No workspaces array — check if file was non-empty (corrupt) */
-        if (n > 2) return false;
-        return true; /* genuinely empty save */
+/* Drop the default terminal pane lmux_surface_create() spawns eagerly; the
+ * snapshot's own panes replace it. */
+static void snap_drop_eager_panes(lmux_app *app, lmux_surface *sf) {
+    if (!sf || sf->panes.len == 0) return;
+    for (size_t i = 0; i < sf->panes.len; i++) {
+        if (app->last_focused == sf->panes.items[i]) app->last_focused = NULL;
+        if (app->search_pane  == sf->panes.items[i]) app->search_pane  = NULL;
+        pane_kill_pty(sf->panes.items[i]);
+        free(sf->panes.items[i]);
     }
-    ws_arr = strchr(ws_arr, '[');
-    if (!ws_arr) return false;
-    ws_arr++;
+    free(sf->panes.items);
+    sf->panes.items = NULL;
+    sf->panes.len = 0;
+    sf->panes.cap = 0;
+}
 
-    /* #8: loading a snapshot replaces the current state instead of appending
-     * to it, so restoring the same snapshot twice cannot duplicate every
-     * workspace. Tear down existing workspaces up front; the fresh ones
-     * created below become the live state. */
-    while (app->workspaces.len > 0)
-        lmux_workspace_close(app, app->workspaces.items[app->workspaces.len - 1]);
-    app->ws_current = NULL;
-    app->ws_last = NULL;
-
-    while (1) {
-        /* Skip to next workspace object */
-        while (*ws_arr && *ws_arr != '{') ws_arr++;
-        if (*ws_arr != '{') break;
-
-        /* Find the matching closing brace for this workspace */
-        const char *ws_end = ws_arr + 1;
-        int depth = 1;
-        while (*ws_end && depth > 0) {
-            if (*ws_end == '{') depth++;
-            if (*ws_end == '}') depth--;
-            ws_end++;
-        }
-
-        /* Extract fields from this workspace block */
-        char wtitle[256] = {0};
-        char wcwd[1024] = {0};
-
-        /* Extract fields using json helpers */
-        char buf_copy[4096];
-        size_t blen = (size_t)(ws_end - ws_arr);
-        if (blen >= sizeof buf_copy) {
-            /* #11: this clamp is still silent, so at least make it
-             * diagnosable. The field-extraction helpers below would read a
-             * clipped block and could miss a surface or pane. */
-            lmux_log(LMUX_LOG_WARN,
-                     "snapshot: workspace block of %zu bytes exceeds the %zu "
-                     "byte scratch buffer; its surfaces may be missed",
-                     (size_t)(ws_end - ws_arr), sizeof buf_copy - 1);
-            blen = sizeof buf_copy - 1;
-        }
-        memcpy(buf_copy, ws_arr, blen);
-        buf_copy[blen] = 0;
-
-        json_extract_string(buf_copy, "title", wtitle, sizeof wtitle);
-        json_extract_string(buf_copy, "cwd", wcwd, sizeof wcwd);
-
-        if (!wtitle[0]) { ws_arr = ws_end; continue; }
-
-        lmux_workspace *ws = lmux_workspace_create(app, wtitle);
-        if (!ws) { ws_arr = ws_end; continue; }
-        if (wcwd[0]) lmux_workspace_set_cwd(ws, wcwd);
-
-        /* lmux_workspace_create() eagerly allocates a default "Shell" surface
-         * with a spawned pty. That placeholder is not part of the snapshot, so
-         * drop it before replaying the saved surfaces. App-level pane pointers
-         * must be cleared first: last_focused may still reference the pane we
-         * are about to free, and a later last-pane would touch freed memory. */
-        if (ws->surfaces.len > 0) {
-            for (size_t d = 0; d < ws->surfaces.len; d++) {
-                lmux_surface *ds = ws->surfaces.items[d];
-                for (size_t dp = 0; dp < ds->panes.len; dp++) {
-                    if (app->last_focused == ds->panes.items[dp]) app->last_focused = NULL;
-                    if (app->search_pane  == ds->panes.items[dp]) app->search_pane  = NULL;
-                    pane_kill_pty(ds->panes.items[dp]);
-                    free(ds->panes.items[dp]);
-                }
-                free(ds->panes.items);
-                free(ds);
+static bool snap_load_panes(lmux_app *app, lmux_workspace *ws,
+                            lmux_surface *sf, snap_rd *r) {
+    if (!snap_eat(r, '[')) return false;
+    if (snap_eat(r, ']')) return true;
+    for (;;) {
+        if (!snap_peek(r, '{')) return false;
+        r->p++;
+        char kind[64] = {0}, command[1024] = {0};
+        for (;;) {
+            char key[64] = {0};
+            if (!snap_read_string(r, key, sizeof key)) return false;
+            if (!snap_eat(r, ':')) return false;
+            if (strcmp(key, "kind") == 0) {
+                if (!snap_read_string(r, kind, sizeof kind)) return false;
+            } else if (strcmp(key, "command") == 0) {
+                if (!snap_read_string(r, command, sizeof command)) return false;
+            } else if (strcmp(key, "id") == 0) {
+                unsigned id;
+                if (!snap_read_uint(r, &id)) return false;
+            } else if (!snap_skip_value(r)) {
+                return false;
             }
-            free(ws->surfaces.items);
-            ws->surfaces.items = NULL;
-            ws->surfaces.len = 0;
-            ws->surfaces.cap = 0;
+            if (snap_eat(r, ',')) continue;
+            if (snap_eat(r, '}')) break;
+            return false;
         }
+        if (sf) {
+            /* Create the pane, deferring PTY spawn during restore. */
+            lmux_pane *np = lmux_pane_split(ws, sf, LMUX_SPLIT_HORIZONTAL,
+                                            command[0] ? command : NULL, false);
+            if (np && kind[0] && strcmp(kind, "terminal") != 0)
+                snprintf(np->kind, sizeof np->kind, "%s", kind);
+        }
+        if (snap_eat(r, ',')) continue;
+        if (snap_eat(r, ']')) return true;
+        return false;
+    }
+}
 
-        /* Find surfaces array inside this workspace block */
-        const char *sf_arr = json_find_key(buf_copy, "surfaces");
-        if (sf_arr) {
-            sf_arr = strchr(sf_arr, '[');
-            if (sf_arr) sf_arr++;
-
-            while (1) {
-                while (*sf_arr && *sf_arr != '{') sf_arr++;
-                if (*sf_arr != '{') break;
-
-                const char *sf_end = sf_arr + 1;
-                int sd = 1;
-                while (*sf_end && sd > 0) {
-                    if (*sf_end == '{') sd++;
-                    if (*sf_end == '}') sd--;
-                    sf_end++;
-                }
-
-                char stitle[128] = {0};
-                char sfcopy[2048];
-                size_t sblen = (size_t)(sf_end - sf_arr);
-                if (sblen >= sizeof sfcopy) {
-                    /* #11: silent clamp would drop this surface's panes with
-                     * no signal at all. Match buf_copy: warn, then clamp. */
-                    lmux_log(LMUX_LOG_WARN,
-                             "snapshot: surface block of %zu bytes exceeds the "
-                             "%zu byte scratch buffer; its panes may be missed",
-                             (size_t)(sf_end - sf_arr), sizeof sfcopy - 1);
-                    sblen = sizeof sfcopy - 1;
-                }
-                memcpy(sfcopy, sf_arr, sblen);
-                sfcopy[sblen] = 0;
-
-                json_extract_string(sfcopy, "title", stitle, sizeof stitle);
-
-                lmux_surface *sf = NULL;
-                if (stitle[0]) {
-                    sf = lmux_surface_create(ws, stitle);
-                    /* lmux_surface_create() eagerly adds a default terminal
-                     * pane (with a spawned pty) that is not part of the
-                     * snapshot. Drop it before replaying the saved panes.
-                     * The surface stays registered in ws->surfaces -- only
-                     * its pane list is reset -- so freeing the surface here
-                     * would leave a dangling entry that lmux_workspace_close
-                     * later frees again (heap-use-after-free). */
-                    if (sf && sf->panes.len > 0) {
-                        for (size_t pi = 0; pi < sf->panes.len; pi++) {
-                            /* Clear app-level references before freeing, else
-                             * last-pane reads this pane after it is released. */
-                            if (app->last_focused == sf->panes.items[pi]) app->last_focused = NULL;
-                            if (app->search_pane  == sf->panes.items[pi]) app->search_pane  = NULL;
-                            pane_kill_pty(sf->panes.items[pi]);
-                            free(sf->panes.items[pi]);
-                        }
-                        free(sf->panes.items);
-                        sf->panes.items = NULL;
-                        sf->panes.len = 0;
-                        sf->panes.cap = 0;
-                    }
-                }
-
-                /* Find panes array inside this surface */
-                const char *pn_arr = strstr(sfcopy, "\"panes\":[");
-                if (pn_arr && sf) {
-                    pn_arr = strchr(pn_arr, '[');
-                    if (pn_arr) pn_arr++;
-
-                    while (1) {
-                        while (*pn_arr && *pn_arr != '{') pn_arr++;
-                        if (*pn_arr != '{') break;
-
-                        const char *pn_end = pn_arr + 1;
-                        int pd = 1;
-                        while (*pn_end && pd > 0) {
-                            if (*pn_end == '{') pd++;
-                            if (*pn_end == '}') pd--;
-                            pn_end++;
-                        }
-
-                        char pk[16] = {0}, pcmd[512] = {0};
-                        char pncopy[1024];
-                        size_t pblen = (size_t)(pn_end - pn_arr);
-                        if (pblen >= sizeof pncopy) {
-                            /* #11: same silent-clamp problem as sfcopy. */
-                            lmux_log(LMUX_LOG_WARN,
-                                     "snapshot: pane block of %zu bytes exceeds "
-                                     "the %zu byte scratch buffer",
-                                     (size_t)(pn_end - pn_arr),
-                                     sizeof pncopy - 1);
-                            pblen = sizeof pncopy - 1;
-                        }
-                        memcpy(pncopy, pn_arr, pblen);
-                        pncopy[pblen] = 0;
-
-                        json_extract_string(pncopy, "kind", pk, sizeof pk);
-                        json_extract_string(pncopy, "command", pcmd, sizeof pcmd);
-
-                        /* Create pane on this surface (defer PTY spawn during restore) */
-                        lmux_pane *np = lmux_pane_split(ws, sf,
-                            LMUX_SPLIT_HORIZONTAL,
-                            pcmd[0] ? pcmd : NULL, false);
-                        if (np && pk[0] && strcmp(pk, "terminal") != 0) {
-                            snprintf(np->kind, sizeof np->kind, "%s", pk);
-                        }
-
-                        pn_arr = pn_end;
-                    }
-                }
-
-                sf_arr = sf_end;
+/* Parse the surfaces array. `panes` appears after `title` in the writer's
+ * output, but its panes cannot be created until the surface exists, so the
+ * reader records where the array starts and rewinds to it afterwards. */
+static bool snap_load_surfaces(lmux_app *app, lmux_workspace *ws, snap_rd *r) {
+    if (!snap_eat(r, '[')) return false;
+    if (snap_eat(r, ']')) return true;
+    for (;;) {
+        if (!snap_peek(r, '{')) return false;
+        r->p++;
+        char title[256] = {0};
+        const char *panes_at = NULL;
+        for (;;) {
+            char key[64] = {0};
+            if (!snap_read_string(r, key, sizeof key)) return false;
+            if (!snap_eat(r, ':')) return false;
+            if (strcmp(key, "title") == 0) {
+                if (!snap_read_string(r, title, sizeof title)) return false;
+            } else if (strcmp(key, "id") == 0) {
+                unsigned id;
+                if (!snap_read_uint(r, &id)) return false;
+            } else if (strcmp(key, "panes") == 0) {
+                snap_ws(r);
+                if (r->p >= r->end || *r->p != '[') return false;
+                panes_at = r->p;
+                if (!snap_skip_value(r)) return false;
+            } else if (!snap_skip_value(r)) {
+                return false;
             }
+            if (snap_eat(r, ',')) continue;
+            if (snap_eat(r, '}')) break;
+            return false;
         }
 
-        ws_arr = ws_end;
+        lmux_surface *sf = title[0] ? lmux_surface_create(ws, title) : NULL;
+        snap_drop_eager_panes(app, sf);
+        if (sf && panes_at) {
+            snap_rd sub = { panes_at, r->end };
+            if (!snap_load_panes(app, ws, sf, &sub)) return false;
+        }
+
+        if (snap_eat(r, ',')) continue;
+        if (snap_eat(r, ']')) return true;
+        return false;
+    }
+}
+
+/* Drop the default "Shell" surface lmux_workspace_create() allocates eagerly. */
+static void snap_drop_eager_surfaces(lmux_app *app, lmux_workspace *ws) {
+    if (!ws || ws->surfaces.len == 0) return;
+    for (size_t d = 0; d < ws->surfaces.len; d++) {
+        lmux_surface *ds = ws->surfaces.items[d];
+        for (size_t dp = 0; dp < ds->panes.len; dp++) {
+            if (app->last_focused == ds->panes.items[dp]) app->last_focused = NULL;
+            if (app->search_pane  == ds->panes.items[dp]) app->search_pane  = NULL;
+            pane_kill_pty(ds->panes.items[dp]);
+            free(ds->panes.items[dp]);
+        }
+        free(ds->panes.items);
+        free(ds);
+    }
+    free(ws->surfaces.items);
+    ws->surfaces.items = NULL;
+    ws->surfaces.len = 0;
+    ws->surfaces.cap = 0;
+}
+
+/* Parse one workspace object, creating it when its "surfaces" key is reached
+ * so the surfaces have a parent to attach to. */
+static bool snap_load_workspaces(lmux_app *app, snap_rd *r) {
+    if (!snap_eat(r, '[')) return false;
+    if (snap_eat(r, ']')) return true;
+    for (;;) {
+        if (!snap_peek(r, '{')) return false;
+        r->p++;
+        char title[256] = {0}, cwd[1024] = {0};
+        lmux_workspace *ws = NULL;
+        for (;;) {
+            char key[64] = {0};
+            if (!snap_read_string(r, key, sizeof key)) return false;
+            if (!snap_eat(r, ':')) return false;
+            if (strcmp(key, "title") == 0) {
+                if (!snap_read_string(r, title, sizeof title)) return false;
+            } else if (strcmp(key, "cwd") == 0) {
+                if (!snap_read_string(r, cwd, sizeof cwd)) return false;
+            } else if (strcmp(key, "id") == 0) {
+                unsigned id;
+                if (!snap_read_uint(r, &id)) return false;
+            } else if (strcmp(key, "surfaces") == 0) {
+                if (!title[0]) title[0] = '\0';
+                ws = lmux_workspace_create(app, title);
+                if (!ws) return false;
+                if (cwd[0]) lmux_workspace_set_cwd(ws, cwd);
+                snap_drop_eager_surfaces(app, ws);
+                if (!snap_load_surfaces(app, ws, r)) return false;
+            } else if (!snap_skip_value(r)) {
+                return false;
+            }
+            if (snap_eat(r, ',')) continue;
+            if (snap_eat(r, '}')) break;
+            return false;
+        }
+        /* A workspace with no "surfaces" key still has to exist. */
+        if (!ws && title[0]) {
+            ws = lmux_workspace_create(app, title);
+            if (!ws) return false;
+            if (cwd[0]) lmux_workspace_set_cwd(ws, cwd);
+            snap_drop_eager_surfaces(app, ws);
+        }
+        if (snap_eat(r, ',')) continue;
+        if (snap_eat(r, ']')) return true;
+        return false;
+    }
+}
+
+bool lmux_snapshot_load(lmux_app *app, const char *path) {
+    if (!app || !path) return false;
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+
+    /* Size the buffer from the file rather than capping it: a legitimately
+     * large session must load, while an unreadable one still fails below. */
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return false; }
+    long fsz = ftell(f);
+    if (fsz <= 0) { fclose(f); return false; }
+    if (fsz > 64L * 1024L * 1024L) {
+        lmux_log(LMUX_LOG_ERROR,
+                 "snapshot: %s is implausibly large (%ld bytes)", path, fsz);
+        fclose(f);
+        return false;
+    }
+    rewind(f);
+    char *buf = malloc((size_t)fsz + 1);
+    if (!buf) { fclose(f); return false; }
+    size_t n = fread(buf, 1, (size_t)fsz, f);
+    fclose(f);
+    buf[n] = '\0';
+
+    snap_rd r = { buf, buf + n };
+    bool ok = snap_peek(&r, '{');
+    if (ok) {
+        r.p++;
+        for (;;) {
+            char key[64] = {0};
+            if (!snap_read_string(&r, key, sizeof key)) { ok = false; break; }
+            if (!snap_eat(&r, ':')) { ok = false; break; }
+            if (strcmp(key, "workspaces") == 0) {
+                /* #8: a load replaces the current state rather than appending,
+                 * so restoring the same snapshot twice cannot duplicate every
+                 * workspace. Tear down first; the rebuilt ones become live. */
+                while (app->workspaces.len > 0)
+                    lmux_workspace_close(app,
+                        app->workspaces.items[app->workspaces.len - 1]);
+                app->ws_current = NULL;
+                app->ws_last = NULL;
+                if (!snap_load_workspaces(app, &r)) { ok = false; break; }
+            } else if (strcmp(key, "version") == 0) {
+                unsigned v;
+                if (!snap_read_uint(&r, &v)) { ok = false; break; }
+            } else if (!snap_skip_value(&r)) {
+                ok = false; break;
+            }
+            if (snap_eat(&r, ',')) continue;
+            if (snap_eat(&r, '}')) break;
+            ok = false; break;
+        }
+    }
+
+    free(buf);
+    if (!ok) {
+        lmux_log(LMUX_LOG_ERROR,
+                 "snapshot: %s is malformed; refusing to apply it", path);
+        return false;
     }
     return true;
 }
 
-/* Wrapper: try main path, fall back to .bak on corruption */
 bool lmux_snapshot_load_with_recovery(lmux_app *app, const char *path) {
     if (!app || !path) return false;
     /* Try main file first */

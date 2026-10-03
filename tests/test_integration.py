@@ -657,96 +657,139 @@ class TestSnapshotTruncationDetection(unittest.TestCase):
             _shutdown_isolated(daemon, home)
 
 
-class TestNestedTruncationIsAnnounced(unittest.TestCase):
-    """#11 remainder: sfcopy[2048] and pncopy[1024] clipped silently, so a
-    restore could drop panes with no signal. Both must log a warning.
+class TestSnapshotParserCorrectness(unittest.TestCase):
+    """#11 structural fix: the hand-rolled brace-counting scanner silently
+    corrupted any snapshot whose string values contained braces.
 
-    The daemon logs to stdout, which the shared helpers discard, so this
-    starts its own daemon with stdout captured to a file and asserts on what
-    the process actually printed.
+    Reproduced on master: a workspace titled 'evil}' made a *surface* object
+    appear in the workspace list, and the load still reported ok:true.
     """
 
-    def _load_with_captured_output(self, snapshot_text):
-        home = Path(tempfile.mkdtemp(prefix="lmux-nested-"))
-        (home / ".local" / "share" / "lmux").mkdir(parents=True)
-        (home / ".config").mkdir(parents=True, exist_ok=True)
-        env = dict(os.environ)
-        env["HOME"] = str(home)
-        env["XDG_DATA_HOME"] = str(home / ".local" / "share")
-        env["XDG_CONFIG_HOME"] = str(home / ".config")
-        log = home / "daemon.log"
-        sock = f"/tmp/lmux-nested-{os.getpid()}-{len(snapshot_text)}.sock"
-        Path(sock).unlink(missing_ok=True)
-        proc = None
-        out_text = ""
+    def _roundtrip(self, title):
+        """Create a workspace with `title`, save, load, return the titles seen."""
+        client, daemon, home = _isolated_client()
         try:
-            out = open(log, "wb")
-            proc = subprocess.Popen(
-                [str(Path(__file__).parent.parent / "build" / "lmux"),
-                 "--socket", sock, "daemon"],
-                stdout=out, stderr=subprocess.STDOUT, env=env,
-            )
-            deadline = time.time() + 30
-            client = None
-            while time.time() < deadline:
-                time.sleep(0.2)
-                if proc.poll() is not None:
-                    break
-                try:
-                    client = LmuxClient(sock)
-                    break
-                except Exception:  # noqa: BLE001 - not up yet
-                    client = None
-            if client is None:
-                self.fail("daemon did not come up")
-            snap = home / "snap.json"
-            snap.write_text(snapshot_text)
-            resp = client.send("snapshot.load", {"path": str(snap)})
+            ws = client.workspace_create(title)
+            client.surface_create(ws["id"])
+            saved = client.snapshot_save("rt.json")["path"]
+            resp = client.send("snapshot.load", {"path": saved})
+            self.assertTrue(resp.get("ok"), f"load should succeed: {resp}")
+            titles = [w["title"] for w in client.workspace_list()]
+            return titles
         finally:
-            if proc and proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-            out.close()
-            out_text = log.read_text(errors="replace") if log.exists() else ""
-            Path(sock).unlink(missing_ok=True)
-            shutil.rmtree(home, ignore_errors=True)
-        return resp, out_text
+            _shutdown_isolated(daemon, home)
 
-    def test_oversized_surface_block_logs_a_warning(self):
-        """A surface whose JSON block exceeds 2048 bytes must be announced."""
-        layout = "x" * 3000
-        surface = ('{"id":1,"title":"big",'
-                   '"panes":[{"id":1,"command":"zsh","cwd":"/tmp"}],'
-                   f'"layout":"{layout}"}}')
-        self.assertGreater(len(surface), 2048, "fixture must exceed sfcopy")
-        text = ('{"version":1,"workspaces":[{"id":1,"title":"ws","cwd":"/tmp",'
-                '"surfaces":[' + surface + ']}]}')
+    def test_closing_brace_in_title_does_not_leak_surfaces(self):
+        """T1: the exact corruption that motivated the parser."""
+        titles = self._roundtrip("evil}")
+        self.assertIn("evil}", titles,
+                      f"the title must round-trip intact: {titles}")
+        self.assertNotIn("Shell", titles,
+                         f"a surface title leaked in as a workspace: {titles}")
+        self.assertNotIn("Tab", titles,
+                         f"a surface title leaked in as a workspace: {titles}")
 
-        resp, output = self._load_with_captured_output(text)
-        self.assertIn(
-            "scratch buffer", output,
-            f"the sfcopy clamp must be announced; daemon said: {output[-500:]!r}")
+    def test_brace_and_quote_characters_round_trip(self):
+        for title in ["a}b", "a{b", 'q"q', "back\\slash", "{}"]:
+            with self.subTest(title=title):
+                titles = self._roundtrip(title)
+                self.assertIn(title, titles,
+                              f"{title!r} did not round-trip: {titles}")
 
-    def test_both_nested_clamps_emit_warnings(self):
-        """Structural guard: neither clamp may be a silent one-liner again."""
-        src = Path(__file__).parent.parent / "src" / "core" / "model.c"
-        text = src.read_text()
-        self.assertNotIn("if (sblen >= sizeof sfcopy) sblen = sizeof sfcopy - 1;",
-                         text,
-                         "sfcopy clamp is silent again — it must warn")
-        self.assertNotIn("if (pblen >= sizeof pncopy) pblen = sizeof pncopy - 1;",
-                         text,
-                         "pncopy clamp is silent again — it must warn")
-        for decl in ("char sfcopy[2048];", "char pncopy[1024];"):
-            idx = text.find(decl)
-            self.assertNotEqual(idx, -1, f"{decl} should still exist")
-            # The warn-then-clamp body follows the declaration.
-            window = text[idx:idx + 700]
-            self.assertIn("LMUX_LOG_WARN", window,
-                          f"{decl} must warn before clamping")
+    def test_truncated_snapshot_is_rejected_not_half_applied(self):
+        """T3: an unbalanced document must fail loudly."""
+        client, daemon, home = _isolated_client()
+        try:
+            snap = Path(tempfile.gettempdir(),
+                        f"lmux-test-trunc-{os.getpid()}.json")
+            snap.write_text('{"version":1,"workspaces":[{"id":1,"title":"a",'
+                            '"cwd":"/tmp","surfaces":[{"id":1,"title":"b"')
+            resp = client.send("snapshot.load", {"path": str(snap)})
+            self.assertFalse(resp.get("ok"),
+                             f"a truncated snapshot must be refused: {resp}")
+            self.assertEqual(resp.get("error", {}).get("code"), "load_failed")
+            snap.unlink(missing_ok=True)
+        finally:
+            _shutdown_isolated(daemon, home)
+
+    def test_large_snapshot_loads_beyond_the_old_64kb_ceiling(self):
+        """T4: the old fixed buffer rejected anything over 64 KB outright.
+
+        Sized by padding the cwd rather than by adding workspaces:
+        lmux_workspace_create() eagerly forks a pty per workspace, so cost is
+        driven by workspace count (~50ms each), not by document size. 40
+        workspaces with a long cwd still clear the old 64 KB ceiling while
+        keeping the test to a couple of seconds.
+        """
+        client, daemon, home = _isolated_client()
+        try:
+            snap = Path(tempfile.gettempdir(),
+                        f"lmux-test-large-{os.getpid()}.json")
+            n = 40
+            pad = "/x" * 1700
+            ws = ",".join(
+                '{"id":%d,"title":"ws%d","cwd":"%s","git_branch":"","surfaces":[]}'
+                % (i, i, pad) for i in range(1, n + 1))
+            snap.write_text('{"version":1,"workspaces":[' + ws + ']}')
+            self.assertGreater(snap.stat().st_size, 65536,
+                               "fixture must exceed the old ceiling")
+            resp = client.send("snapshot.load", {"path": str(snap)})
+            self.assertTrue(resp.get("ok"),
+                            f"a >64KB snapshot must now load: {resp}")
+            loaded = len(client.workspace_list())
+            self.assertEqual(loaded, n,
+                             f"expected all {n} workspaces, got {loaded}")
+            snap.unlink(missing_ok=True)
+        finally:
+            _shutdown_isolated(daemon, home)
+
+
+class TestNestedTruncationIsAnnounced(unittest.TestCase):
+    """Superseded by TestSnapshotParserCorrectness.
+
+    When the loader still used scratch buffers, this class asserted that
+    sfcopy[2048] and pncopy[1024] logged a warning instead of truncating
+    silently. #11's structural fix removed those buffers entirely, so the
+    warning they guarded is no longer reachable — the values are decoded
+    straight into model-sized fields and nothing is truncated.
+
+    Deleting these assertions outright would hide that change. They are
+    replaced by the strictly stronger invariant the goal asks for: none of the
+    buffers may come back, and the load path may not reintroduce brace
+    counting.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model_c = Path(__file__).parent.parent / "src" / "core" / "model.c"
+
+    def test_no_scratch_buffers_remain_in_the_snapshot_loader(self):
+        text = self.model_c.read_text()
+        for gone in ("buf_copy", "sfcopy", "pncopy"):
+            self.assertNotIn(gone, text,
+                             f"{gone} must not come back: the parser decodes "
+                             f"straight into model-sized fields")
+
+    def test_load_path_does_not_count_braces(self):
+        """The original bug: brace counting mis-parses any '}' in a string."""
+        text = self.model_c.read_text()
+        start = text.index("bool lmux_snapshot_load(lmux_app")
+        end = text.index("bool lmux_snapshot_load_with_recovery", start)
+        body = text[start:end]
+        for pattern in ("depth++", "depth--", '!= \'{\'', '== \'}\''):
+            self.assertNotIn(pattern, body,
+                             f"load path must not do brace matching: {pattern!r}")
+
+    def test_parser_escapes_are_string_aware(self):
+        """A string value containing a brace must not terminate its object."""
+        text = self.model_c.read_text()
+        self.assertIn("static bool snap_read_string", text,
+                      "the reader must decode strings with escape handling")
+        start = text.index("static bool snap_read_string")
+        window = text[start:start + 1400]
+        self.assertIn("'\\\\'", window,
+                      "snap_read_string must handle the escape character, "
+                      "otherwise a quoted brace ends the string early")
 
 
 class TestSnapshotSaveRoot(unittest.TestCase):
