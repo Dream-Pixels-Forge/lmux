@@ -2676,7 +2676,11 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
     }
 
     /* --- read-screen --- */
-    if (strcmp(cmd, "read-screen") == 0 || strcmp(cmd, "read_screen") == 0 || strcmp(cmd, "capture-pane") == 0) {
+    /* `capture_pane` is accepted because build_json_command() in the CLI
+     * rewrites every hyphen to an underscore, so the documented `capture-pane`
+     * arrives here spelled `capture_pane`. Same reason `read_screen` exists. */
+    if (strcmp(cmd, "read-screen") == 0 || strcmp(cmd, "read_screen") == 0 ||
+        strcmp(cmd, "capture-pane") == 0 || strcmp(cmd, "capture_pane") == 0) {
         char ws_id[64] = {0}, s_id[64] = {0};
         json_extract_string(args_json, "workspace_id", ws_id, sizeof ws_id);
         json_extract_string(args_json, "surface_id", s_id, sizeof s_id);
@@ -2710,10 +2714,21 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             if (cp->focused) { p = cp; break; }
         }
         if (!p && s->panes.len > 0) p = s->panes.items[0];
-        if (!p || p->pty_fd < 0) {
+        if (!p) {
             written = snprintf(result, result_cap,
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no pty to read\"}}");
             goto done;
+        }
+        if (p->pty_fd < 0) {
+            /* Panes restored from a snapshot are created without a pty. Attach
+             * on first read, exactly as lmux_pane_send_keys() does on first
+             * write, so a restored pane is not unreadable until typed into. */
+            if (pane_spawn_pty(p) != 0) {
+                lmux_log(LMUX_LOG_DEBUG, "read-screen: no pty for pane %u", p->id);
+                written = snprintf(result, result_cap,
+                    "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no pty to read\"}}");
+                goto done;
+            }
         }
         /* Non-blocking read from pty master */
         char screen[2048];

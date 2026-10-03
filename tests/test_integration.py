@@ -787,6 +787,140 @@ class TestPtyDeferralOnRestore(unittest.TestCase):
             _shutdown_isolated(daemon, home)
 
 
+class TestRestoredPaneReadableAndCapturePane(unittest.TestCase):
+    """Two defects found while investigating restored-pane pty attachment.
+
+    D1: only lmux_pane_send_keys() lazily spawns a pty, so read-screen fails on
+        a restored pane until the user types something first.
+    D2: build_json_command() rewrites every hyphen to an underscore, and the
+        daemon has no `capture_pane` alias, so the documented `capture-pane`
+        command is unreachable through the CLI.
+    """
+
+    def _restore_a_workspace(self, client):
+        client.workspace_create("restored")
+        client.surface_create(1)
+        saved = client.snapshot_save("d1.json")["path"]
+        resp = client.send("snapshot.load", {"path": saved})
+        self.assertTrue(resp.get("ok"), resp)
+        return saved
+
+    def test_read_screen_works_on_a_restored_pane_without_typing(self):
+        """T1/D1: read-screen must not require a prior send_text."""
+        client, daemon, home = _isolated_client()
+        try:
+            self._restore_a_workspace(client)
+            # Deliberately no send_text first — that is the whole point.
+            resp = client.send("read-screen")
+            self.assertTrue(resp.get("ok"),
+                            f"read-screen should lazily spawn the pty: {resp}")
+            self.assertNotIn("no pty to read", str(resp.get("error", "")))
+            self.assertIsInstance(resp.get("result", {}).get("text"), str)
+            # A fresh pty may not have produced output on the very first read,
+            # so poll: the point is that the restored pane really does yield
+            # screen content, not merely that the call returned ok.
+            deadline = time.time() + 15
+            text = ""
+            while time.time() < deadline and not text.strip():
+                time.sleep(0.3)
+                r = client.send("read-screen")
+                self.assertTrue(r.get("ok"), r)
+                text = r.get("result", {}).get("text", "")
+            self.assertTrue(
+                text.strip(),
+                "restored pane should produce screen content once attached")
+        finally:
+            _shutdown_isolated(daemon, home)
+
+    def test_restored_pane_uses_the_snapshot_command(self):
+        """T4: the lazily spawned pty must run the recorded command."""
+        client, daemon, home = _isolated_client()
+        try:
+            saved = self._restore_a_workspace(client)
+            recorded = json.loads(Path(saved).read_text())
+            want = recorded["workspaces"][-1]["surfaces"][0]["panes"][0]["command"]
+            self.assertTrue(want, "snapshot should record a command")
+            # The pty is attached on first read, so read before inspecting.
+            self.assertTrue(client.send("read-screen").get("ok"),
+                            "read-screen should attach the restored pty")
+            want_name = Path(want).name
+            deadline = time.time() + 15
+            children = ""
+            while time.time() < deadline:
+                children = subprocess.run(
+                    ["pgrep", "-P", str(daemon._proc.pid), "-a"],
+                    capture_output=True, text=True, timeout=10).stdout
+                if want_name in children:
+                    break
+                time.sleep(0.2)
+            self.assertIn(
+                want_name, children,
+                f"restored pty should run {want!r}, not a default shell; "
+                f"children: {children!r}")
+        finally:
+            _shutdown_isolated(daemon, home)
+
+    def test_capture_pane_hyphenated_form_works(self):
+        """T2/D2: the spelling printed in --help."""
+        client, daemon, home = _isolated_client()
+        try:
+            client.workspace_create("cap")
+            for cmd in ("capture-pane", "capture_pane"):
+                resp = client.send(cmd)
+                self.assertTrue(
+                    resp.get("ok"),
+                    f"{cmd} must work (build_json_command maps both to "
+                    f"'capture_pane'): {resp}")
+        finally:
+            _shutdown_isolated(daemon, home)
+
+    def test_capture_pane_is_reachable_from_the_shell(self):
+        """T3: exercise the real client, which is where the name is mangled."""
+        repo_root = Path(__file__).parent.parent
+        cli = repo_root / "build" / "lmux"
+        self.assertTrue(cli.exists(),
+                        f"lmux binary not built at {cli}; refusing to skip — "
+                        f"build it with `node scripts/build-cli.mjs` first")
+        # Run the client exactly as a user would, against a throwaway daemon.
+        home = Path(tempfile.mkdtemp(prefix="lmux-cap-"))
+        (home / ".config").mkdir(parents=True, exist_ok=True)
+        env = dict(os.environ)
+        env["HOME"] = str(home)
+        env["XDG_CONFIG_HOME"] = str(home / ".config")
+        sock_path = f"/tmp/lmux-cap-{os.getpid()}.sock"
+        Path(sock_path).unlink(missing_ok=True)
+        proc = subprocess.Popen(
+            [str(cli), "--socket", sock_path, "daemon"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+        try:
+            deadline = time.time() + 30
+            ready = False
+            while time.time() < deadline and not ready:
+                time.sleep(0.2)
+                r = subprocess.run([str(cli), "--socket", sock_path, "--json",
+                                    "ping"], capture_output=True, text=True,
+                                   timeout=15, env=env)
+                ready = r.returncode == 0 and '"ok":true' in r.stdout
+            self.assertTrue(ready, "daemon did not come up")
+            subprocess.run([str(cli), "--socket", sock_path, "--json",
+                            "workspace.create", "cap"], env=env,
+                           capture_output=True, timeout=15)
+            for cmd in ("capture-pane", "capture_pane"):
+                r = subprocess.run([str(cli), "--socket", sock_path, "--json", cmd],
+                                   capture_output=True, text=True,
+                                   timeout=30, env=env)
+                self.assertIn('"ok":true', r.stdout,
+                              f"`lmux {cmd}` must work from the shell; got {r.stdout!r}")
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            Path(sock_path).unlink(missing_ok=True)
+            shutil.rmtree(home, ignore_errors=True)
+
+
 class TestSnapshotParserCorrectness(unittest.TestCase):
     """#11 structural fix: the hand-rolled brace-counting scanner silently
     corrupted any snapshot whose string values contained braces.
