@@ -433,6 +433,17 @@ struct lmux_workspace {
 
 
 
+/* Root directory snapshot.save is confined to (#12 step 4). Mirrors the
+ * browser_screenshot_root() policy so there is exactly one shape for "a path a
+ * socket client may not choose". */
+static void lmux_data_root(char *buf, size_t cap) {
+    const char *xdg = getenv("XDG_DATA_HOME");
+    if (xdg && xdg[0]) { snprintf(buf, cap, "%s/lmux", xdg); return; }
+    const char *home = getenv("HOME");
+    if (home && home[0]) { snprintf(buf, cap, "%s/.local/share/lmux", home); return; }
+    snprintf(buf, cap, "/tmp/lmux");
+}
+
 /* ----- Data paths ----- */
 static void lmux_data_path(char *buf, size_t cap, const char *file) {
     const char *xdg = getenv("XDG_DATA_HOME");
@@ -3076,26 +3087,37 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
 
     /* --- snapshot.save [path] --- */
     if (strcmp(cmd, "snapshot.save") == 0) {
-        char path[1024] = {0};
-        json_extract_string(args_json, "path", path, sizeof path);
-        if (!path[0]) {
-            const char *home = getenv("HOME");
-            snprintf(path, sizeof path, "%s/.lmux_snapshot.json", home ? home : "/tmp");
-        }
-        /* Security: validate path to prevent traversal attacks */
-        if (!is_safe_path(path, NULL)) {
-            written = snprintf(result, result_cap,
-                "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"path contains traversal sequences\"}}");
-            goto done;
-        }
-        bool ok = lmux_snapshot_save(app, path);
-        if (ok) {
-            written = snprintf(result, result_cap,
-                "{\"ok\":true,\"result\":{\"path\":\"%s\"}}", path);
+        char req[1024] = {0};
+        char root[1024];
+        char resolved[2048];
+        char esc[2048];
+
+        /* #12 step 4: is_safe_path(path, NULL) rejected ".." but placed no
+         * containment, so any absolute path was accepted and written. Confine
+         * it to the data root, mirroring browser.screenshot. */
+        lmux_data_root(root, sizeof root);
+
+        json_extract_string(args_json, "path", req, sizeof req);
+        if (!req[0]) {
+            snprintf(resolved, sizeof resolved, "%s/snapshot.json", root);
         } else {
+            if (req[0] == '~' || !is_safe_path(req, root)) {
+                written = snprintf(result, result_cap,
+                    "{\"ok\":false,\"error\":{\"code\":\"invalid_params\","
+                    "\"message\":\"snapshot path must be relative and inside %s\"}}",
+                    root);
+                goto done;
+            }
+            snprintf(resolved, sizeof resolved, "%s/%s", root, req);
+        }
+        if (!lmux_snapshot_save(app, resolved)) {
             written = snprintf(result, result_cap,
                 "{\"ok\":false,\"error\":{\"code\":\"save_failed\",\"message\":\"failed to save snapshot\"}}");
+            goto done;
         }
+        json_escape_str(esc, sizeof esc, resolved);
+        written = snprintf(result, result_cap,
+            "{\"ok\":true,\"result\":{\"path\":\"%s\"}}", esc);
         goto done;
     }
 
@@ -7566,8 +7588,28 @@ void lmux_app_auto_restore_locked(lmux_app *app) {
 /* Snapshot persistence                                                */
 /* ------------------------------------------------------------------ */
 
+/* Create every missing directory in `path`. mkdir() is not recursive, and
+ * lmux_snapshot_save() previously created nothing at all, so moving the
+ * default save location under the data root would have made it fail silently
+ * on any machine without ~/.local/share/lmux. */
+static void lmux_mkpath(const char *path) {
+    char buf[2048];
+    snprintf(buf, sizeof buf, "%s", path);
+    char *leaf = strrchr(buf, '/');
+    if (!leaf) return;
+    *leaf = '\0';
+    for (char *p = buf + 1; *p; p++) {
+        if (*p != '/') continue;
+        *p = '\0';
+        mkdir(buf, 0755);   /* EEXIST is success for our purposes */
+        *p = '/';
+    }
+    mkdir(buf, 0755);
+}
+
 bool lmux_snapshot_save(const lmux_app *app, const char *path) {
     if (!app || !path) return false;
+    lmux_mkpath(path);
     /* Write to a temp file first for atomicity. */
     char tmp_path[1024];
     snprintf(tmp_path, sizeof tmp_path, "%s.tmp", path);
@@ -7772,7 +7814,15 @@ bool lmux_snapshot_load(lmux_app *app, const char *path) {
                 char stitle[128] = {0};
                 char sfcopy[2048];
                 size_t sblen = (size_t)(sf_end - sf_arr);
-                if (sblen >= sizeof sfcopy) sblen = sizeof sfcopy - 1;
+                if (sblen >= sizeof sfcopy) {
+                    /* #11: silent clamp would drop this surface's panes with
+                     * no signal at all. Match buf_copy: warn, then clamp. */
+                    lmux_log(LMUX_LOG_WARN,
+                             "snapshot: surface block of %zu bytes exceeds the "
+                             "%zu byte scratch buffer; its panes may be missed",
+                             (size_t)(sf_end - sf_arr), sizeof sfcopy - 1);
+                    sblen = sizeof sfcopy - 1;
+                }
                 memcpy(sfcopy, sf_arr, sblen);
                 sfcopy[sblen] = 0;
 
@@ -7825,7 +7875,15 @@ bool lmux_snapshot_load(lmux_app *app, const char *path) {
                         char pk[16] = {0}, pcmd[512] = {0};
                         char pncopy[1024];
                         size_t pblen = (size_t)(pn_end - pn_arr);
-                        if (pblen >= sizeof pncopy) pblen = sizeof pncopy - 1;
+                        if (pblen >= sizeof pncopy) {
+                            /* #11: same silent-clamp problem as sfcopy. */
+                            lmux_log(LMUX_LOG_WARN,
+                                     "snapshot: pane block of %zu bytes exceeds "
+                                     "the %zu byte scratch buffer",
+                                     (size_t)(pn_end - pn_arr),
+                                     sizeof pncopy - 1);
+                            pblen = sizeof pncopy - 1;
+                        }
                         memcpy(pncopy, pn_arr, pblen);
                         pncopy[pblen] = 0;
 
