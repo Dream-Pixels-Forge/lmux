@@ -1020,6 +1020,338 @@ class TestReadScreenIsARepeatableCapture(unittest.TestCase):
             _shutdown_isolated(daemon, home)
 
 
+GHOST_COMMANDS = [
+    "ssh.list", "ssh.connect", "ssh.disconnect",
+    "hooks.add", "hooks.list", "hooks.remove",
+    "naming.suggest", "focus.history",
+    "notification.hook.list", "notification.hook.remove",
+]
+
+
+class TestAdvertisedCommandsAreDispatchable(unittest.TestCase):
+    """`--help` must not promise commands the daemon cannot dispatch.
+
+    Ten commands were advertised (and five of them listed in is_readonly_cmd)
+    while having no dispatch handler, so every one returned unknown_command.
+    Nothing in the GUI ever sent them, so this was a false API promise rather
+    than a broken feature.
+    """
+
+    def test_every_advertised_command_is_dispatchable(self):
+        """F5: sweep --help against the live daemon."""
+        repo_root = Path(__file__).parent.parent
+        cli = repo_root / "build" / "lmux"
+        self.assertTrue(cli.exists(), f"lmux not built at {cli}")
+        out = subprocess.run([str(cli)], capture_output=True, text=True,
+                             timeout=30).stdout
+        advertised = sorted(set(re.findall(r"^\s{2}([a-z][a-z0-9_.-]+)", out,
+                                           re.M)))
+        advertised = [a for a in advertised if a != "lmux"]
+        self.assertGreater(len(advertised), 50, "help parsing looks broken")
+
+        client, daemon, home = _isolated_client()
+        try:
+            missing = []
+            for name in advertised:
+                # build_json_command() in the CLI rewrites every hyphen to an
+                # underscore before sending, so normalise the same way. Sending
+                # the raw advertised name would report false ghosts for
+                # commands that are perfectly reachable.
+                wire = name.replace("-", "_")
+                r = client.send(wire)
+                if not r.get("ok") and r.get("error", {}).get(
+                        "code") == "unknown_command":
+                    missing.append(name)
+            self.assertEqual(
+                missing, [],
+                f"{len(missing)} command(s) advertised in --help are not "
+                f"dispatched by the daemon: {missing}")
+        finally:
+            _shutdown_isolated(daemon, home)
+
+    def test_the_ten_ghosts_now_exist(self):
+        client, daemon, home = _isolated_client()
+        try:
+            for name in GHOST_COMMANDS:
+                r = client.send(name.replace("-", "_"))
+                self.assertNotEqual(
+                    "unknown_command", r.get("error", {}).get("code"),
+                    f"{name} is still a ghost: {r}")
+        finally:
+            _shutdown_isolated(daemon, home)
+
+
+class TestSshGhostCommands(unittest.TestCase):
+    def setUp(self):
+        self.client, self.daemon, self.home = _isolated_client()
+
+    def tearDown(self):
+        _shutdown_isolated(self.daemon, self.home)
+
+    def test_ssh_list_returns_a_sessions_array(self):
+        r = self.client.send("ssh.list")
+        self.assertTrue(r.get("ok"), r)
+        self.assertIsInstance(r["result"]["sessions"], list)
+
+    def test_ssh_disconnect_detaches_without_destroying(self):
+        """disconnect unbinds the pane but keeps the session listed.
+
+        lmux_ssh_session_detach() clears the pane binding; destroying the
+        session is `ssh.session.kill`. So the session must survive here.
+        """
+        r = self.client.send("ssh.connect", {"host": "example.invalid",
+                                             "user": "nobody"})
+        self.assertTrue(r.get("ok"), r)
+        sid = r["result"]["id"]
+        listing = self.client.send("ssh.list")
+        self.assertIn(sid, [s["id"] for s in listing["result"]["sessions"]])
+        d = self.client.send("ssh.disconnect", {"session_id": str(sid)})
+        self.assertTrue(d.get("ok"), d)
+        after = self.client.send("ssh.list")
+        self.assertIn(
+            sid, [s["id"] for s in after["result"]["sessions"]],
+            "disconnect must not destroy the session; kill does that")
+
+    def test_ssh_disconnect_unknown_session_errors(self):
+        r = self.client.send("ssh.disconnect", {"session_id": "99999"})
+        self.assertFalse(r.get("ok"), r)
+        self.assertEqual(r["error"]["code"], "not_found", r)
+
+    def test_ssh_disconnect_requires_session_id(self):
+        r = self.client.send("ssh.disconnect", {})
+        self.assertFalse(r.get("ok"), r)
+        self.assertEqual(r["error"]["code"], "invalid_params", r)
+
+
+class TestFocusHistoryGhostCommand(unittest.TestCase):
+    """focus.history must reflect real focus changes, not be permanently empty."""
+
+    def setUp(self):
+        self.client, self.daemon, self.home = _isolated_client()
+
+    def tearDown(self):
+        _shutdown_isolated(self.daemon, self.home)
+
+    def test_focus_history_records_focus_changes(self):
+        r = self.client.send("focus.history")
+        self.assertTrue(r.get("ok"), r)
+        self.assertIsInstance(r["result"]["entries"], list)
+        # Creating a workspace does not focus a pane, so drive real focus
+        # changes through pane.focus (the documented focus entry point).
+        panes = self.client.send("pane.list")["result"]["panes"]
+        self.assertTrue(panes)
+        for p in panes:
+            self.client.send("pane.focus", {"id": str(p["id"])})
+        time.sleep(0.3)
+        after = self.client.send("focus.history")
+        self.assertTrue(after.get("ok"), after)
+        self.assertGreater(
+            len(after["result"]["entries"]), 0,
+            "focus.history stayed empty after focus changes; a permanently "
+            "empty array would satisfy ok:true while being useless")
+        self.assertIn("pane_id", after["result"]["entries"][0])
+
+    def test_focus_history_records_an_explicit_pane_focus(self):
+        """pane.focus drives focus changes explicitly and must be recorded."""
+        self.client.send("workspace.create", {"title": "fh"})
+        time.sleep(0.2)
+        pane = self.client.send("pane.list")["result"]["panes"][0]
+        self.client.send("pane.focus", {"id": str(pane["id"])})
+        time.sleep(0.3)
+        entries = self.client.send("focus.history")["result"]["entries"]
+        self.assertTrue(
+            entries, "explicit pane.focus was not recorded in focus.history")
+        self.assertTrue(
+            any(e["pane_id"] == str(pane["id"]) for e in entries),
+            f"focused pane {pane['id']} missing from history: {entries}")
+
+    def test_focus_history_is_bounded(self):
+        p = self.client.send("pane.list")["result"]["panes"][0]
+        # Alternate the recorded pane id is not possible with one pane, so drive
+        # many distinct pushes through focus and assert the ring stays bounded.
+        for i in range(150):
+            self.client.send("workspace.create", {"title": f"b{i}"})
+            panes = self.client.send("pane.list")["result"]["panes"]
+            if len(panes) > 1:
+                self.client.send("pane.focus", {"id": str(panes[i % len(panes)]["id"])})
+        self.client.send("pane.focus", {"id": str(p["id"])})
+        r = self.client.send("focus.history", {"n": "100"})
+        self.assertLessEqual(
+            len(r["result"]["entries"]), 100,
+            "focus history must stay within its documented 100-entry bound")
+
+
+class TestHooksRegistryCommands(unittest.TestCase):
+    """hooks.* binds scripts to agent lifecycle events (ARCHITECTURE.md)."""
+
+    LIFECYCLE = ["session-start", "prompt-submit", "stop", "error"]
+
+    def setUp(self):
+        self.client, self.daemon, self.home = _isolated_client()
+
+    def tearDown(self):
+        _shutdown_isolated(self.daemon, self.home)
+
+    def test_hooks_round_trip(self):
+        r = self.client.send("hooks.add",
+                             {"event": "stop", "command": "/bin/true"})
+        self.assertTrue(r.get("ok"), r)
+        lst = self.client.send("hooks.list")
+        self.assertTrue(lst.get("ok"), lst)
+        self.assertEqual(len(lst["result"]["hooks"]), 1, lst)
+        hook = lst["result"]["hooks"][0]
+        self.assertEqual(hook["event"], "stop")
+        self.assertEqual(hook["command"], "/bin/true")
+        rm = self.client.send("hooks.remove", {"event": "stop"})
+        self.assertTrue(rm.get("ok"), rm)
+        self.assertEqual(
+            len(self.client.send("hooks.list")["result"]["hooks"]), 0)
+
+    def test_hooks_list_covers_every_lifecycle_event(self):
+        for ev in self.LIFECYCLE:
+            self.client.send("hooks.add", {"event": ev, "command": "/bin/true"})
+        lst = self.client.send("hooks.list")
+        got = {h["event"] for h in lst["result"]["hooks"]}
+        self.assertEqual(got, set(self.LIFECYCLE), lst)
+
+    def test_hooks_add_rejects_unknown_event(self):
+        r = self.client.send("hooks.add",
+                             {"event": "nope", "command": "/bin/true"})
+        self.assertFalse(r.get("ok"), r)
+        self.assertEqual(r["error"]["code"], "invalid_params", r)
+
+    def test_hooks_remove_unknown_event_errors(self):
+        r = self.client.send("hooks.remove", {"event": "stop"})
+        self.assertFalse(r.get("ok"), r)
+        self.assertEqual(r["error"]["code"], "not_found", r)
+
+    def test_hooks_registry_is_bounded(self):
+        for i in range(600):
+            self.client.send("hooks.add",
+                             {"event": self.LIFECYCLE[i % 4],
+                              "command": f"/bin/true {i}"})
+        lst = self.client.send("hooks.list")
+        self.assertLessEqual(len(lst["result"]["hooks"]), 256,
+                             "hooks registry must stay bounded")
+
+
+class TestNamingSuggestCommand(unittest.TestCase):
+    def setUp(self):
+        self.client, self.daemon, self.home = _isolated_client()
+
+    def tearDown(self):
+        _shutdown_isolated(self.daemon, self.home)
+
+    def test_naming_suggest_returns_a_candidate(self):
+        r = self.client.send("naming.suggest", {"cwd": "/tmp"})
+        self.assertTrue(r.get("ok"), r)
+        names = r["result"]["suggestions"]
+        self.assertIsInstance(names, list)
+        self.assertTrue(names, "expected at least one suggestion for /tmp")
+        self.assertTrue(all(isinstance(n, str) and n for n in names), names)
+
+    def test_naming_suggest_uses_the_basename(self):
+        r = self.client.send("naming.suggest", {"cwd": "/usr/share/doc"})
+        self.assertTrue(r.get("ok"), r)
+        self.assertIn("doc", r["result"]["suggestions"], r)
+
+    def test_naming_suggest_handles_empty_cwd(self):
+        r = self.client.send("naming.suggest", {"cwd": ""})
+        self.assertTrue(r.get("ok"), r)
+        self.assertIsInstance(r["result"]["suggestions"], list)
+
+
+class TestNotificationHookCommands(unittest.TestCase):
+    def setUp(self):
+        self.client, self.daemon, self.home = _isolated_client()
+
+    def tearDown(self):
+        _shutdown_isolated(self.daemon, self.home)
+
+    def test_notification_hook_list_round_trip(self):
+        # The advertised ghost is the singular `notification.hook.*`; the
+        # plural `notification.hooks.*` forms already dispatch. Add via the
+        # plural form, then read back through the advertised singular form.
+        add = self.client.send("notification.hooks.add",
+                               {"event": "bell", "filter": "*"})
+        self.assertTrue(add.get("ok"), add)
+        lst = self.client.send("notification.hook.list")
+        self.assertTrue(lst.get("ok"), lst)
+        self.assertEqual(len(lst["result"]["hooks"]), 1, lst)
+        self.assertTrue(lst["result"]["hooks"][0]["enabled"], lst)
+        rm = self.client.send("notification.hook.remove", {"event": "bell"})
+        self.assertTrue(rm.get("ok"), rm)
+        after = self.client.send("notification.hook.list")
+        # lmux_notification_hook_remove() disables rather than deletes, so the
+        # entry remains but must no longer report as enabled.
+        self.assertEqual(len(after["result"]["hooks"]), 1, after)
+        self.assertFalse(after["result"]["hooks"][0]["enabled"],
+                         f"hook should be disabled after remove: {after}")
+
+    def test_notification_hook_remove_unknown_errors(self):
+        r = self.client.send("notification.hook.remove", {"event": "nope"})
+        self.assertFalse(r.get("ok"), r)
+        self.assertEqual(r["error"]["code"], "not_found", r)
+
+
+class TestNewCommandsWorkFromTheShell(unittest.TestCase):
+    """The daemon handling a command is not the same as the CLI being able to
+    reach it.
+
+    Dispatch-only tests sent JSON directly to the daemon and passed while the
+    shell path stayed broken: the CLI builds its own arg keys, and two of them
+    disagreed with the handler (`hooks.add` sends "script", the handler read
+    "command"; `focus.history` sends "count", the handler read "n").
+    """
+
+    LIFECYCLE = ["session-start", "prompt-submit", "stop", "error"]
+
+    def _cli(self, home, sock, *args):
+        cli = Path(__file__).parent.parent / "build" / "lmux"
+        env = dict(os.environ)
+        env["HOME"] = str(home)
+        env["XDG_CONFIG_HOME"] = str(home / ".config")
+        return subprocess.run([str(cli), "--socket", sock, "--json", *args],
+                              capture_output=True, text=True, timeout=30,
+                              env=env)
+
+    def test_new_commands_are_reachable_through_the_cli(self):
+        client, daemon, home = _isolated_client()
+        try:
+            sock = daemon.socket_path
+            self.assertTrue(sock, "daemon has no socket_path")
+            checks = [
+                ("hooks.add", "stop", "/bin/true"),
+                ("hooks.list",),
+                ("naming.suggest", "/usr/share/doc"),
+                ("focus.history",),
+                ("ssh.list",),
+                ("notification.hook.list",),
+            ]
+            for argv in checks:
+                r = self._cli(home, sock, *argv)
+                self.assertIn('"ok":true', r.stdout,
+                              f"`lmux {' '.join(argv)}` failed from the shell: "
+                              f"{r.stdout!r} {r.stderr!r}")
+        finally:
+            _shutdown_isolated(daemon, home)
+
+    def test_hooks_add_from_the_shell_actually_registers(self):
+        """Covers the `script` vs `command` key mismatch."""
+        client, daemon, home = _isolated_client()
+        try:
+            sock = daemon.socket_path
+            add = self._cli(home, sock, "hooks.add", "stop", "/bin/true")
+            self.assertIn('"ok":true', add.stdout, add.stdout)
+            lst = self._cli(home, sock, "hooks.list")
+            self.assertIn('"ok":true', lst.stdout, lst.stdout)
+            self.assertIn("/bin/true", lst.stdout,
+                          f"hook registered via CLI but not listed: {lst.stdout}")
+            self.assertIn("stop", lst.stdout)
+        finally:
+            _shutdown_isolated(daemon, home)
+
+
 class TestSnapshotParserCorrectness(unittest.TestCase):
     """#11 structural fix: the hand-rolled brace-counting scanner silently
     corrupted any snapshot whose string values contained braces.
