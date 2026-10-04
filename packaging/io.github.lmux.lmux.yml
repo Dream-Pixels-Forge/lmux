@@ -25,15 +25,42 @@ finish-args:
 build-options:
   env:
     PIP_NO_BUILD_ISOLATION: '1'
-  build-args:
-    - --build-arg=VERSION=1.0.0
+
+# NOTE: a `build-args: [--build-arg=VERSION=1.0.0]` used to sit here. Every
+# module below uses `buildsystem: simple`, which rejects --build-arg, so an
+# end-to-end `flatpak-builder` run failed immediately with
+# "Unknown option --build-arg=VERSION=1.0.0". Nothing consumed it, and the
+# value was stale anyway (the app is 1.1.2). Found by actually building.
 
 modules:
   # Python packages not bundled in the GNOME runtime
   - name: python3-requirements
     buildsystem: simple
+    # The build sandbox has NO network (verified: a minimal probe manifest
+    # fails DNS even with `share: [network]`), so `pip3 install` from PyPI
+    # died with "Temporary failure in name resolution".
+    # These wheels are fetched here instead — flatpak-builder downloads
+    # sources in the builder context, which does have network — and installed
+    # offline. cffi/pycparser come along as pynacl's own dependencies so
+    # --no-index has everything it needs.
+    sources:
+      - type: file
+        url: https://files.pythonhosted.org/packages/7f/81/d60984052df5c97b1d24365bc1e30024379b42c4edcd79d2436b1b9806f2/pynacl-1.6.2-cp38-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
+        sha256: 22de65bb9010a725b0dac248f353bb072969c94fa8d6b1f34b87d7953cf7bbe4
+      - type: file
+        url: https://files.pythonhosted.org/packages/f7/a4/4399daaf8f7dfee9d7c3327fdb0426ee041cc63edc358b93911ceb2bfc7a/cffi-2.1.1-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
+        sha256: 34e261f78cb6ceaaa36f42f2613f4380d94d9c759a9c73c769ee6e0247364632
+      - type: file
+        url: https://files.pythonhosted.org/packages/0c/c3/44f3fbbfa403ea2a7c779186dc20772604442dde72947e7d01069cbe98e3/pycparser-3.0-py3-none-any.whl
+        sha256: b727414169a36b7d524c1c3e31839a521725078d7b2ff038656844266160a992
+      - type: file
+        url: https://files.pythonhosted.org/packages/dd/b8/d2d6d731733f51684bbf76bf34dab3b70a9148e8f2cef2bb544fccec681a/qrcode-8.2-py3-none-any.whl
+        sha256: 16e64e0716c14960108e85d853062c9e8bba5ca8252c0b4d0231b9df4060ff4f
+      - type: file
+        url: https://files.pythonhosted.org/packages/3b/2d/ede717bc1144f63886c21fd349bb95860b0d1a21149ff16f2bb362b612b6/pillow-12.3.0-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
+        sha256: 23d27a3e0307ec2244cc51e7287b919aa68d097504ebe19df4e76a98a3eea5bd
     build-commands:
-      - pip3 install --no-build-isolation --prefix=/app --no-deps pynacl qrcode[pil]
+      - pip3 install --no-index --find-links=. --no-build-isolation --prefix=/app pynacl qrcode[pil]
     cleanup:
       - /lib/python3*/site-packages/nacl/tests
       - /lib/python3*/site-packages/PIL/tests
