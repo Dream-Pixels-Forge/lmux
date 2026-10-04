@@ -4644,6 +4644,43 @@ class TestPackagingEntryPoints(unittest.TestCase):
             stale, "",
             "tracked files still point at the old repo org:\n" + stale)
 
+    def test_flatpak_metainfo_validates(self):
+        """The flatpak manifest ships its own AppStream metainfo — keep it valid.
+
+        Nothing else exercises this file: `flatpak-builder` is not part of the
+        test environment, so the component shipped with no <launchable>
+        element and `appstreamcli validate` rejected it with
+        `E: desktop-app-launchable-missing`. The AppImage copy (inlined in
+        packaging/build-appimage.sh) did have one; this copy did not.
+        """
+        if shutil.which("appstreamcli") is None:
+            self.skipTest("appstreamcli unavailable; cannot validate metainfo")
+        manifest = (Path(__file__).parent.parent
+                    / "packaging" / "io.github.lmux.lmux.yml")
+        lines = manifest.read_text().splitlines()
+        start = next((i for i, l in enumerate(lines)
+                      if "io.github.lmux.lmux.metainfo.xml" in l), None)
+        self.assertIsNotNone(start, "manifest should write a metainfo file")
+        body = []
+        for line in lines[start + 1:]:
+            if line.strip() == "EOF":
+                break
+            body.append(line.strip())
+        tmp = tempfile.mkdtemp(prefix="lmux-metainfo-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        # The filename must match the component id, otherwise appstreamcli
+        # reports a cid mismatch and skips the checks we care about.
+        xml = Path(tmp) / "io.github.lmux.lmux.metainfo.xml"
+        xml.write_text("\n".join(body) + "\n")
+        res = subprocess.run(
+            ["appstreamcli", "validate", "--no-net", str(xml)],
+            capture_output=True, text=True, timeout=60)
+        errors = [l for l in res.stdout.splitlines() if l.startswith("E:")]
+        self.assertEqual(
+            errors, [],
+            "flatpak AppStream metainfo fails validation:\n"
+            + "\n".join(errors))
+
 
 
 class TestGuiLocaleDirReadOnly(unittest.TestCase):
