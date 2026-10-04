@@ -4623,6 +4623,27 @@ class TestPackagingEntryPoints(unittest.TestCase):
             missing, [],
             f"package.json advertises non-existent script targets: {missing}")
 
+    def test_no_stale_github_repo_url(self):
+        """The repo lives under Dream-Pixels-Forge, not the old `lmux` org.
+
+        The old org URL sat in the AppImage metainfo (where appstreamcli
+        validation aborted `make appimage`) and in seven other tracked files —
+        including the `git clone` line in CONTRIBUTING.md and the private
+        vulnerability-reporting link in SECURITY.md, both of which are dead.
+        Fix the build; this pins it.
+        """
+        root = Path(__file__).parent.parent
+        # Assembled at runtime so this test file does not itself contain the
+        # literal — otherwise `git grep` matches its own source and the test
+        # can never pass.
+        needle = "github.com/" + "lmux" + "/lmux"
+        stale = subprocess.run(
+            ["git", "grep", "-n", needle],
+            cwd=root, capture_output=True, text=True).stdout.strip()
+        self.assertEqual(
+            stale, "",
+            "tracked files still point at the old repo org:\n" + stale)
+
 
 
 class TestGuiLocaleDirReadOnly(unittest.TestCase):

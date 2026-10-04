@@ -22,7 +22,7 @@ email listed in `package.json`).
 
 **Option 2 — GitHub Security Advisory**
 
-Use [GitHub's private vulnerability reporting](https://github.com/lmux/lmux/security/advisories/new)
+Use [GitHub's private vulnerability reporting](https://github.com/Dream-Pixels-Forge/lmux/security/advisories/new)
 to create an advisory directly.
 
 Include:

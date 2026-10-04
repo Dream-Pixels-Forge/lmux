@@ -348,7 +348,7 @@ Recommends: git,
 Suggests: gir1.2-gtk-4.0
 Installed-Size: $(du -sk "$BUILD_DIR/usr" | cut -f1)
 Maintainer: lmux developers <dev@lmux.dev>
-Homepage: https://github.com/lmux/lmux
+Homepage: https://github.com/Dream-Pixels-Forge/lmux
 Description: Terminal multiplexer with GUI for AI coding agents
  lmux is a native Linux terminal purpose-built for developers running
  multiple AI coding agents in parallel. It features a lightweight C
