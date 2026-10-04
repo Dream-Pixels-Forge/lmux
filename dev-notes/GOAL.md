@@ -251,7 +251,7 @@ syft dir:. -o spdx-json > sbom.json
 **Verification Gate:**
 ```bash
 # Test: Container image is signed
-cosign verify --key cosign.pub ghcr.io/lmux/lmux:latest
+cosign verify --key cosign.pub ghcr.io/dream-pixels-forge/lmux:latest
 ```
 
 **Implementation:**
@@ -296,7 +296,7 @@ trivy fs --severity HIGH,CRITICAL --exit-code 1 .
 | 4.2 | Property Tests | `afl-fuzz -i tests/fuzz/input -o tests/fuzz/output tests/fuzz_json` |
 | 4.3 | Benchmarks | `python3 tests/benchmarks.py::TestPerformance::test_request_latency` |
 | 5.1 | SBOM | `syft dir:. -o spdx-json > sbom.json` |
-| 5.2 | Container Signing | `cosign verify --key cosign.pub ghcr.io/lmux/lmux:latest` |
+| 5.2 | Container Signing | `cosign verify --key cosign.pub ghcr.io/dream-pixels-forge/lmux:latest` |
 | 5.3 | Dependency Scanning | `trivy fs --severity HIGH,CRITICAL --exit-code 1 .` |
 
 ---
