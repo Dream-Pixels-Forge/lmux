@@ -301,6 +301,32 @@ static void test_dispatch_unknown_cmd(void) {
     lmux_app_free(app); teardown(); PASS();
 }
 
+static void test_dispatch_naming_suggest_cache(void) {
+    TEST("dispatch naming.suggest memoises and stays consistent");
+    lmux_app *app = make_app();
+    char dir[128];
+    snprintf(dir, sizeof dir, "/tmp/lmux-naming-%d", (int)getpid());
+    rmdir(dir);                    /* ignore a stale dir from a previous run */
+    ASSERT(mkdir(dir, 0700) == 0, "mkdir should succeed");
+    char req[512];
+    snprintf(req, sizeof req,
+             "{\"cmd\":\"naming.suggest\",\"args\":{\"cwd\":\"%s\"}}", dir);
+    /* Two calls exercise the memo path (store then hit), so this runs the
+     * naming cache under the sanitizer build. */
+    char *first = lmux_dispatch_json(app, req);
+    ASSERT(first != NULL, "first response should not be NULL");
+    ASSERT(strstr(first, "\"ok\":true"), "naming.suggest should succeed");
+    ASSERT(strstr(first, "\"suggestions\":["), "should contain suggestions");
+    char *second = lmux_dispatch_json(app, req);
+    ASSERT(second != NULL, "second response should not be NULL");
+    ASSERT(strcmp(first, second) == 0, "cached response must match the first");
+    free(first);
+    free(second);
+    rmdir(dir);
+    lmux_app_free(app); teardown(); PASS();
+}
+
+
 static void test_snapshot_backup_recovery(void) {
     TEST("snapshot save creates .bak and load recovers from it");
     lmux_app *app = make_app();
@@ -364,6 +390,7 @@ int main(void) {
     test_dispatch_health_ready();
     test_dispatch_metrics();
     test_dispatch_unknown_cmd();
+    test_dispatch_naming_suggest_cache();
     test_snapshot_backup_recovery();
     printf("\n=====================\n");
     printf("Tests: %d passed, %d failed, %d total\n\n",
