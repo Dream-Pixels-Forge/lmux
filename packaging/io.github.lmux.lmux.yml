@@ -121,6 +121,10 @@ modules:
             <release version="1.1.2" date="2026-10-04"/>
           </releases>
           <content_rating type="oars-1.1"/>
+          <!-- The flatpak path installs io.github.lmux.lmux.desktop (see the
+               install block above), not lmux.desktop as the AppImage does, so
+               this id must not be copied from packaging/build-appimage.sh. -->
+          <launchable type="desktop-id">io.github.lmux.lmux.desktop</launchable>
         </component>
         EOF
 
