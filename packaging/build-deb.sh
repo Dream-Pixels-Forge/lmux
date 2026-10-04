@@ -122,25 +122,26 @@ fi
 # ─── 8. Create the wrapper scripts ────────────────────────────────
 echo "==> Creating wrapper scripts..."
 
-# /usr/bin/lmux — GUI launcher
-cat > "$BUILD_DIR/usr/bin/lmux" << 'WRAPPER'
+# ── Entry-point naming: `lmux` is the CLI, `lmux-gui` is the graphical
+# frontend. That matches README.md, CONTRIBUTING.md, gui/main.py's own
+# "lmux-gui" docstring, and the compiled binary's usage text
+# ("Usage: lmux <command> [args...]").
+# This script used to ship a GUI wrapper as `lmux` and hide the real binary
+# behind `lmux-cli`, which contradicted all four of those.
+#
+# `lmux` is a symlink rather than a wrapper script so the process keeps its
+# real argv[0] in ps/top, and so there is exactly one copy of the binary.
+ln -sf /usr/lib/lmux/build/lmux "$BUILD_DIR/usr/bin/lmux"
+
+# /usr/bin/lmux-gui — GUI launcher
+cat > "$BUILD_DIR/usr/bin/lmux-gui" << 'WRAPPER'
 #!/bin/bash
-# lmux — GUI launcher
+# lmux-gui — GUI launcher
 # Starts the Python-based GTK graphical interface.
 
 exec python3 /usr/lib/lmux/gui/main.py "$@"
 WRAPPER
-chmod 755 "$BUILD_DIR/usr/bin/lmux"
-
-# /usr/bin/lmux-cli — CLI-only launcher (runs the C binary directly)
-cat > "$BUILD_DIR/usr/bin/lmux-cli" << 'WRAPPER'
-#!/bin/bash
-# lmux-cli — CLI-only launcher
-# Runs the compiled C core binary for daemon, config, and socket operations.
-
-exec /usr/lib/lmux/build/lmux "$@"
-WRAPPER
-chmod 755 "$BUILD_DIR/usr/bin/lmux-cli"
+chmod 755 "$BUILD_DIR/usr/bin/lmux-gui"
 
 # ─── 9. Man page ───────────────────────────────────────────────────
 echo "==> Installing man page..."
@@ -156,7 +157,7 @@ lmux \- Linux terminal multiplexer for AI coding agents
 .I command
 .RI [ args... ]
 .br
-.B lmux-cli
+.B lmux-gui
 .RI [ args... ]
 .SH DESCRIPTION
 .B lmux
@@ -164,23 +165,22 @@ is a native Linux terminal purpose\-built for developers running multiple AI cod
 It features a lightweight C core daemon, a GTK3/GTK4 graphical frontend with VTE terminals,
 SSH workspace support, AI agent integration, and OSC terminal notification handling.
 .PP
-The GUI is launched by the
 .B lmux
-command.
-The C core binary is accessible directly via
-.BR lmux-cli .
+is the command\-line interface.
+The graphical frontend is launched with
+.BR lmux-gui .
 .SH COMMANDS
 .TP
-.BR lmux-cli\ daemon
+.BR lmux\ daemon
 Start the lmux daemon.
 .TP
-.BR lmux-cli\ config
+.BR lmux\ config
 Show or edit configuration.
 .TP
-.BR lmux-cli\ status
+.BR lmux\ status
 Show daemon status.
 .TP
-.BR lmux-cli\ help
+.BR lmux\ help
 Show all available commands.
 .SH OPTIONS
 .TP
@@ -357,8 +357,8 @@ Description: Terminal multiplexer with GUI for AI coding agents
  support, AI agent hooks, auto-naming, focus history, task management,
  and OSC terminal notification handling.
  .
- This package includes the GUI launcher (lmux), CLI-only launcher
- (lmux-cli), Python GUI modules, web dashboard, and C core binary.
+ This package includes the command-line interface (lmux), GUI launcher
+ (lmux-gui), Python GUI modules, web dashboard, and C core binary.
 CONTROL
 
 # ─── 14. DEBIAN/conffiles ──────────────────────────────────────────
@@ -391,8 +391,8 @@ fi
 echo ""
 echo "lmux has been installed successfully."
 echo ""
-echo "  GUI:    Run 'lmux' to start the graphical interface."
-echo "  CLI:    Run 'lmux-cli daemon' to start the daemon."
+echo "  CLI:    Run 'lmux daemon' to start the daemon."
+echo "  GUI:    Run 'lmux-gui' to start the graphical interface."
 echo "  Config: Edit ~/.config/lmux/config.json or /etc/lmux/config.json"
 echo ""
 POSTINST
@@ -441,8 +441,7 @@ find "$BUILD_DIR/usr/lib/${PACKAGE}" -type f -name '*.c' -o -name '*.h' | xargs 
 find "$BUILD_DIR/usr/lib/${PACKAGE}" -type f \( -name '*.html' -o -name '*.css' \) -exec chmod 644 {} \;
 find "$BUILD_DIR/usr/share" -type f -exec chmod 644 {} \;
 chmod 644 "$BUILD_DIR/etc/${PACKAGE}/config.json"
-chmod 755 "$BUILD_DIR/usr/bin/lmux"
-chmod 755 "$BUILD_DIR/usr/bin/lmux-cli"
+chmod 755 "$BUILD_DIR/usr/bin/lmux-gui"
 chmod 755 "$BUILD_DIR/usr/lib/${PACKAGE}/build/lmux"
 
 # ─── 18. Build the .deb ────────────────────────────────────────────
