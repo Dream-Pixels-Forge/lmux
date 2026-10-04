@@ -514,6 +514,8 @@ struct lmux_app {
     /* Agent lifecycle hook scripts: hooks.add/list/remove */
     vec_t       hooks;                /* of lmux_hook_script* */
     lmux_id     next_hook_id;
+    /* Memoised naming.suggest results, keyed by directory */
+    vec_t       naming_cache;         /* of naming_cache_entry* */
     /* Feed panels */
     vec_t       feed_panels;          /* of lmux_feed_panel* */
     vec_t       feed_entries;         /* of lmux_feed_entry* */
@@ -723,6 +725,7 @@ lmux_app *lmux_app_new(const char *socket_path) {
     a->next_feed_panel_id = 1;
     a->hooks = (vec_t){0};
     a->next_hook_id = 1;
+    a->naming_cache = (vec_t){0};
     lmux_focus_history_init(&a->focus_history);
     a->log_level = LMUX_LOG_INFO;
     a->start_time = time(NULL);
@@ -807,6 +810,105 @@ lmux_app *lmux_app_new(const char *socket_path) {
     return a;
 }
 
+/* --- naming suggestion cache ------------------------------------------
+ * naming.suggest shells out to `git` for repositories. A UI that re-suggests
+ * on every keystroke would fork repeatedly for an unchanged directory, so
+ * results are memoised per path. Bounded, and freed on shutdown.
+ *
+ * This is a pure optimisation: a miss recomputes, and an evicted entry is
+ * simply recomputed later. It must never change the result. */
+
+#define LMUX_NAMING_CACHE_MAX 16
+
+/* A stat-based fingerprint of the inputs naming.suggest depends on: the
+ * presence/mtime of package.json and, inside a work tree, of `.git/HEAD`
+ * (which changes on branch switch). Recomputed on every lookup; a mismatch is
+ * treated as a miss, so the cache can never serve a stale result. */
+typedef struct {
+    bool in_repo;
+    bool head_known;
+    bool pkg_present;
+    struct timespec head_mtime;
+    struct timespec pkg_mtime;
+} naming_fingerprint;
+
+static void naming_stat_ts(const char *path, bool *present,
+                           struct timespec *ts) {
+    struct stat st;
+    if (stat(path, &st) == 0) { *present = true; *ts = st.st_mtim; }
+    else { *present = false; ts->tv_sec = 0; ts->tv_nsec = 0; }
+}
+
+static bool naming_fingerprint_eq(const naming_fingerprint *a,
+                                  const naming_fingerprint *b) {
+    return a->in_repo == b->in_repo &&
+           a->head_known == b->head_known &&
+           a->pkg_present == b->pkg_present &&
+           a->head_mtime.tv_sec == b->head_mtime.tv_sec &&
+           a->head_mtime.tv_nsec == b->head_mtime.tv_nsec &&
+           a->pkg_mtime.tv_sec == b->pkg_mtime.tv_sec &&
+           a->pkg_mtime.tv_nsec == b->pkg_mtime.tv_nsec;
+}
+
+typedef struct {
+    char cwd[512];
+    time_t when;
+    char text[1024];      /* comma-joined suggestion list */
+    naming_fingerprint fp;/* state observed when `text` was computed */
+} naming_cache_entry;
+
+/* Replace the matching entry, or append/evict-oldest when full. */
+static void naming_cache_store(lmux_app *app, const char *cwd,
+                               const char *text, const naming_fingerprint *fp) {
+    if (!app || !cwd || !text || !fp) return;
+    for (size_t i = 0; i < app->naming_cache.len; i++) {
+        naming_cache_entry *e = app->naming_cache.items[i];
+        if (strcmp(e->cwd, cwd) == 0) {
+            snprintf(e->text, sizeof e->text, "%s", text);
+            e->fp = *fp;
+            e->when = time(NULL);
+            return;
+        }
+    }
+    if (app->naming_cache.len >= LMUX_NAMING_CACHE_MAX) {
+        size_t oldest = 0;
+        for (size_t i = 1; i < app->naming_cache.len; i++)
+            if (((naming_cache_entry *)app->naming_cache.items[i])->when <
+                ((naming_cache_entry *)app->naming_cache.items[oldest])->when)
+                oldest = i;
+        free(app->naming_cache.items[oldest]);
+        app->naming_cache.items[oldest] =
+            app->naming_cache.items[app->naming_cache.len - 1];
+        app->naming_cache.len--;
+    }
+    naming_cache_entry *e = calloc(1, sizeof *e);
+    if (!e) return;
+    snprintf(e->cwd, sizeof e->cwd, "%s", cwd);
+    snprintf(e->text, sizeof e->text, "%s", text);
+    e->fp = *fp;
+    e->when = time(NULL);
+    vec_push(&app->naming_cache, e);
+}
+
+static const char *naming_cache_get(lmux_app *app, const char *cwd,
+                                    const naming_fingerprint *fp) {
+    if (!app || !cwd || !fp) return NULL;
+    for (size_t i = 0; i < app->naming_cache.len; i++) {
+        naming_cache_entry *e = app->naming_cache.items[i];
+        if (strcmp(e->cwd, cwd) == 0 && naming_fingerprint_eq(&e->fp, fp))
+            return e->text;
+    }
+    return NULL;
+}
+
+static void naming_cache_free_all(lmux_app *app) {
+    for (size_t i = 0; i < app->naming_cache.len; i++)
+        free(app->naming_cache.items[i]);
+    free(app->naming_cache.items);
+    app->naming_cache.items = NULL;
+    app->naming_cache.len = 0;
+}
+
 void lmux_app_free(lmux_app *a) {
     if (!a) return;
     /* Free workspaces, surfaces, panes. */
@@ -857,6 +959,7 @@ void lmux_app_free(lmux_app *a) {
     /* Free configuration */
     lmux_config_free(a->config);
     hooks_free_all(a);
+    naming_cache_free_all(a);
     pthread_rwlock_destroy(&a->rw_lock);
     pthread_mutex_destroy(&a->event_lock);
     free(a);
@@ -2487,9 +2590,61 @@ static void naming_add(char names[][256], size_t *n, const char *name) {
     (*n)++;
 }
 
-/* Extract "name" from a package.json without a full JSON parser: find the
- * top-level "name" key and its string value. Good enough for the well-formed
- * files this reads, and it degrades to "no suggestion" rather than failing. */
+/* Find a key at the JSON object's TOP level only.
+ *
+ * The daemon's generic json_find_key() matches the first "key": anywhere in the
+ * document, so a nested `"name"` (inside "scripts", "dependencies", an array
+ * element, ...) wins over the real top-level one. For workspace naming that
+ * silently produced the wrong suggestion, so this walks the document tracking
+ * depth and only reports a match at depth 1.
+ *
+ * Returns a pointer to the first character of the value, or NULL. `*depth_out`,
+ * when non-NULL, receives the depth at which the match occurred.
+ */
+static const char *json_find_toplevel_key(const char *json, const char *key,
+                                          int *depth_out) {
+    if (!json || !key) return NULL;
+    const size_t klen = strlen(key);
+    int depth = 0;
+    bool in_string = false, escaped = false;
+    const char *str_start = NULL;   /* first char after the opening quote */
+    for (const char *p = json; *p; p++) {
+        if (in_string) {
+            if (escaped) { escaped = false; continue; }
+            if (*p == '\\') { escaped = true; continue; }
+            if (*p != '"') continue;
+            /* Closing quote: p[-1] is the last content char, str_start the
+             * first, so the content spans str_start .. p-1 inclusive. */
+            in_string = false;
+            size_t got = (size_t)(p - str_start);
+            if (depth == 1 && got == klen && memcmp(str_start, key, klen) == 0) {
+                /* A key string is followed by ':'. A *value* string with the
+                 * same content (e.g. {"description": "name"}) is not, so only
+                 * accept the match when the colon is present; otherwise keep
+                 * scanning. This is what makes the lookup a parse rather than a
+                 * content pattern-match. */
+                const char *v = p + 1;
+                while (*v == ' ' || *v == '\t' || *v == '\n' || *v == '\r') v++;
+                if (*v == ':') {
+                    v++;
+                    while (*v == ' ' || *v == '\t' || *v == '\n' || *v == '\r') v++;
+                    if (depth_out) *depth_out = depth;
+                    return v;
+                }
+            }
+            continue;
+        }
+        if (*p == '"') { in_string = true; escaped = false; str_start = p + 1; continue; }
+        if (*p == '{' || *p == '[') depth++;
+        else if (*p == '}' || *p == ']') depth--;
+    }
+    return NULL;
+}
+
+/* Extract "name" from a package.json. Only a top-level "name" counts; a nested
+ * one (in "scripts", "dependencies", ...) is ignored, matching the GUI's
+ * json.load() behaviour. Degrades to "no suggestion" on anything malformed
+ * rather than failing the command. */
 static void naming_package_json_name(const char *cwd, char *out, size_t cap) {
     if (!out || cap == 0) return;
     out[0] = 0;
@@ -2497,20 +2652,21 @@ static void naming_package_json_name(const char *cwd, char *out, size_t cap) {
     snprintf(path, sizeof path, "%s/package.json", cwd);
     FILE *f = fopen(path, "r");
     if (!f) return;
-    char buf[4096];
+    char buf[8192];
     size_t n = fread(buf, 1, sizeof buf - 1, f);
     fclose(f);
     if (n == 0) return;
     buf[n] = 0;
-    const char *key = strstr(buf, "\"name\"");
-    if (!key) return;
-    const char *q = strchr(key + 6, '"');
-    if (!q) return;
-    const char *end = strchr(q + 1, '"');
-    if (!end) return;
-    size_t len = (size_t)(end - q - 1);
-    if (len == 0 || len >= cap) return;
-    memcpy(out, q + 1, len);
+    const char *v = json_find_toplevel_key(buf, "name", NULL);
+    if (!v || *v != '"') return;
+    v++;
+    size_t len = 0;
+    while (v[len] && v[len] != '"' && len < cap - 1) {
+        if (v[len] == '\\' && v[len + 1]) len++;   /* skip escaped char */
+        len++;
+    }
+    if (len == 0) return;
+    memcpy(out, v, len);
     out[len] = 0;
     /* GUI strips a leading "@scope/". */
     if (out[0] == '@') {
@@ -2526,6 +2682,69 @@ static const char *naming_project_type(const char *cwd) {
         if (access(path, F_OK) == 0) return NAMING_MARKERS[i][1];
     }
     return NULL;
+}
+
+/* Walk up from `cwd` looking for a `.git` entry, the way git itself discovers
+ * a work tree. Lets naming.suggest skip forking `git` when the answer is
+ * certainly "no". GIT_DIR is honoured because git respects it and a plain
+ * parent walk would miss it. When `gitpath` is non-NULL the located `.git`
+ * path is copied into it. */
+static bool naming_find_dotgit(const char *cwd, char *gitpath, size_t cap) {
+    const char *gd = getenv("GIT_DIR");
+    if (gd) {
+        if (gitpath && cap) snprintf(gitpath, cap, "%s", gd);
+        return true;
+    }
+    if (!cwd || !cwd[0]) return false;
+    char dir[2048];
+    if (snprintf(dir, sizeof dir, "%s", cwd) >= (int)sizeof dir)
+        return true;                    /* pathologically long; let git decide */
+    for (;;) {
+        char probe[2200];
+        snprintf(probe, sizeof probe, "%s/.git", dir);
+        if (access(probe, F_OK) == 0) {
+            if (gitpath && cap) snprintf(gitpath, cap, "%s", probe);
+            return true;
+        }
+        size_t len = strlen(dir);
+        while (len > 1 && dir[len - 1] == '/') dir[--len] = 0;
+        if (len == 0 || strcmp(dir, "/") == 0) return false;
+        char *slash = strrchr(dir, '/');
+        if (!slash) return false;
+        if (slash == dir) dir[1] = 0;   /* direct child of root */
+        else *slash = 0;
+    }
+}
+
+static bool naming_in_git_repo(const char *cwd) {
+    return naming_find_dotgit(cwd, NULL, 0);
+}
+
+/* Fingerprint the state naming.suggest's output depends on. Cheap (stat only,
+ * no fork). A `.git` path that could not be resolved (pathologically long
+ * cwd) yields head_known == false on both sides, so caching still works. */
+static naming_fingerprint naming_fingerprint_of(const char *cwd) {
+    naming_fingerprint fp = {0};
+    if (!cwd) return fp;
+    char pkg[1200];
+    snprintf(pkg, sizeof pkg, "%s/package.json", cwd);
+    naming_stat_ts(pkg, &fp.pkg_present, &fp.pkg_mtime);
+    char git[2200];
+    if (naming_find_dotgit(cwd, git, sizeof git) && git[0]) {
+        fp.in_repo = true;
+        char head[2400];
+        snprintf(head, sizeof head, "%s/HEAD", git);
+        struct stat st;
+        if (stat(head, &st) == 0) {
+            fp.head_known = true;
+            fp.head_mtime = st.st_mtim;
+        } else if (stat(git, &st) == 0) {
+            /* .git may be a file (linked work tree) or HEAD unreadable. */
+            fp.head_known = true;
+            fp.head_mtime = st.st_mtim;
+        }
+    }
+    return fp;
 }
 
 static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_json) {
@@ -7722,24 +7941,36 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             const char *home = getenv("HOME");
             snprintf(cwd, sizeof cwd, "%s", home ? home : "");
         }
+        naming_fingerprint fp = naming_fingerprint_of(cwd);
+        const char *cached = naming_cache_get(app, cwd, &fp);
+        if (cached) {
+            RESULT_GROW;
+            written = snprintf(result, result_cap,
+                "{\"ok\":true,\"result\":{\"suggestions\":[%s]}}", cached);
+            result[written] = 0;
+            goto done;
+        }
         char names[LMUX_NAMING_MAX_SUGGESTIONS][256];
         size_t n = 0;
 
-        /* 1. git repo name (+ repo:branch) */
+        /* 1. git repo name (+ repo:branch) — skipped entirely when cwd is
+         * provably not in a repository, so a plain directory costs no fork. */
         static const char *const GIT_TOPLEVEL[] = {"git", "rev-parse", "--show-toplevel", NULL};
         static const char *const GIT_BRANCH[] = {"git", "rev-parse", "--abbrev-ref", "HEAD", NULL};
         char toplevel[1024] = {0}, branch[256] = {0};
-        naming_run(cwd, GIT_TOPLEVEL, toplevel, sizeof toplevel);
-        if (toplevel[0]) {
-            char repo[256] = {0};
-            naming_basename(toplevel, repo, sizeof repo);
-            naming_add(names, &n, repo);
-            naming_run(cwd, GIT_BRANCH, branch, sizeof branch);
-            if (branch[0] && strcmp(branch, "main") != 0 &&
-                strcmp(branch, "master") != 0) {
-                char combined[512];
-                snprintf(combined, sizeof combined, "%s:%s", repo, branch);
-                naming_add(names, &n, combined);
+        if (naming_in_git_repo(cwd)) {
+            naming_run(cwd, GIT_TOPLEVEL, toplevel, sizeof toplevel);
+            if (toplevel[0]) {
+                char repo[256] = {0};
+                naming_basename(toplevel, repo, sizeof repo);
+                naming_add(names, &n, repo);
+                naming_run(cwd, GIT_BRANCH, branch, sizeof branch);
+                if (branch[0] && strcmp(branch, "main") != 0 &&
+                    strcmp(branch, "master") != 0) {
+                    char combined[512];
+                    snprintf(combined, sizeof combined, "%s:%s", repo, branch);
+                    naming_add(names, &n, combined);
+                }
             }
         }
 
@@ -7762,14 +7993,22 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         }
 
         RESULT_GROW;
-        written = snprintf(result, result_cap,
-            "{\"ok\":true,\"result\":{\"suggestions\":[");
+        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{\"suggestions\":[");
         if (written < 0) written = 0;
+        /* Build the comma-joined body once: it is both the response payload
+         * and the value memoised for repeat calls. */
+        char joined[1024] = {0};
+        size_t jl = 0;
         for (size_t i = 0; i < n; i++) {
             RESULT_GROW;
-            written += snprintf(result + written, result_cap - (size_t)written,
+            int k = snprintf(result + written, result_cap - (size_t)written,
                 "%s\"%s\"", i ? "," : "", names[i]);
+            if (k > 0) written += k;
+            jl += (size_t)snprintf(joined + jl, sizeof joined - jl, "%s\"%s\"",
+                                   i ? "," : "", names[i]);
+            if (jl >= sizeof joined - 1) break;
         }
+        naming_cache_store(app, cwd, joined, &fp);
         RESULT_GROW;
         written += snprintf(result + written, result_cap - (size_t)written, "]}}");
         result[written] = 0;

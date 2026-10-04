@@ -1498,6 +1498,220 @@ class TestNamingParityWithGui(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             self._assert_parity(d)
 
+    # --- adversarial package.json shapes ---------------------------------
+    # PR #23's parity fixtures all put "name" first, so the flat strstr in
+    # naming_package_json_name() happened to be right and the test passed
+    # without exercising the bug. These fixtures put a nested "name" first.
+
+    def _pkg_parity(self, contents, label):
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, "package.json").write_text(contents)
+            expected = self.suggest_names(d)
+            actual = self._daemon_suggestions(d)
+            self.assertEqual(
+                actual, expected,
+                f"{label}: daemon and GUI disagree:\n"
+                f"  gui   = {expected}\n  daemon= {actual}")
+
+    def test_nested_name_does_not_beat_top_level_name(self):
+        self._pkg_parity(
+            '{"scripts": {"name": "WRONG"}, "name": "right-name"}',
+            "nested name inside scripts")
+
+    def test_nested_name_in_dependencies_does_not_win(self):
+        self._pkg_parity(
+            '{"dependencies": {"name": "WRONG-from-deps"}, "name": "real-pkg"}',
+            "nested name inside dependencies")
+
+    def test_nested_name_in_a_deeply_nested_object(self):
+        self._pkg_parity(
+            '{"a": {"b": {"c": {"name": "DEEP-WRONG"}}}, "name": "top"}',
+            "deeply nested name")
+
+    def test_name_inside_an_array_element(self):
+        self._pkg_parity(
+            '{"workspaces": [{"name": "IN-ARRAY"}], "name": "top-array"}',
+            "name inside an array element")
+
+    def test_escaped_quote_name_inside_a_string(self):
+        self._pkg_parity(
+            '{"description": "contains \\"name\\" text", "name": "after-esc"}',
+            "escaped quotes inside a string value")
+
+    def test_name_after_a_nested_object_with_no_top_level_name(self):
+        """No top-level name at all: both must agree on the fallback."""
+        self._pkg_parity(
+            '{"scripts": {"name": "only-nested"}}', "no top-level name")
+
+    def test_scoped_and_whitespace_variants(self):
+        self._pkg_parity('{ "name"  :\t"@scope/pkg" , "v":1 }',
+                         "whitespace and scope")
+        self._pkg_parity('{"name":"plain","version":"1.0.0"}', "compact")
+    def test_top_level_value_equal_to_name_before_the_key(self):
+        """A top-level *value* of "name" must not be mistaken for the key.
+
+        A candidate string only counts as a key when a ':' follows it. Here the
+        value is followed by a comma, so the real (later) "name" must still win.
+        """
+        self._pkg_parity(
+            '{"description": "name", "name": "real"}',
+            'a top-level value equal to "name" before the key')
+
+    def test_value_equal_to_name_under_another_key(self):
+        self._pkg_parity(
+            '{"a": "name", "name": "real"}',
+            'value "name" stored under another key')
+
+
+
+
+
+class TestNamingSuggestAvoidsSpuriousGitForks(unittest.TestCase):
+    """naming.suggest must not spawn `git` for directories that are not
+    repositories, and must not re-fork for the same path."""
+
+    def setUp(self):
+        self.client, self.daemon, self.home = _isolated_client()
+
+    def tearDown(self):
+        _shutdown_isolated(self.daemon, self.home)
+
+    def _git_children(self):
+        """Count the daemon's direct children that are `git` processes.
+
+        The daemon always has a pty child (the workspace shell), so an
+        absolute child count is meaningless; count only git.
+        """
+        pid = str(self.daemon._proc.pid)
+        kids = subprocess.run(["pgrep", "-P", pid], capture_output=True,
+                              text=True, timeout=10).stdout.split()
+        n = 0
+        for k in kids:
+            try:
+                cmd = Path(f"/proc/{k}/cmdline").read_bytes().decode(
+                    "utf-8", "replace")
+            except OSError:
+                continue
+            if "git" in cmd.split("\0")[0]:
+                n += 1
+        return n
+
+    def _wait_for_no_git(self, seconds=1.5):
+        """Poll briefly: a fork+exec may not have exited on the first read."""
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            if self._git_children() == 0:
+                return True
+            time.sleep(0.1)
+        return False
+
+    def test_no_git_process_for_a_non_repository(self):
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, "plain.txt").write_text("x")
+            r = self.client.send("naming.suggest", {"cwd": d})
+            self.assertTrue(r.get("ok"), r)
+            self.assertTrue(
+                self._wait_for_no_git(),
+                "daemon spawned git for a non-repository directory")
+
+    def test_repeated_calls_do_not_respawn_git(self):
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, "f").write_text("x")
+            first = self.client.send("naming.suggest", {"cwd": d})
+            self.assertTrue(first.get("ok"), first)
+            for _ in range(5):
+                again = self.client.send("naming.suggest", {"cwd": d})
+                self.assertEqual(
+                    again["result"]["suggestions"],
+                    first["result"]["suggestions"],
+                    "repeat calls must return the same suggestions")
+            self.assertTrue(
+                self._wait_for_no_git(),
+                "repeat calls must not respawn git")
+
+    def test_a_real_repository_still_forking_produces_repo_suggestions(self):
+        """S3 must not suppress the fork where it is actually needed."""
+        d = tempfile.mkdtemp(prefix="lmux-git-")
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        subprocess.run(["git", "init", "-q", "-b", "main", d],
+                       capture_output=True, timeout=30)
+        subprocess.run(["git", "-C", d, "config", "user.email", "t@t"],
+                       capture_output=True, timeout=30)
+        subprocess.run(["git", "-C", d, "config", "user.name", "t"],
+                       capture_output=True, timeout=30)
+        Path(d, "f").write_text("x")
+        subprocess.run(["git", "-C", d, "add", "-A"], capture_output=True,
+                       timeout=30)
+        subprocess.run(["git", "-C", d, "commit", "-qm", "i"],
+                       capture_output=True, timeout=30)
+        r = self.client.send("naming.suggest", {"cwd": d})
+        self.assertTrue(r.get("ok"), r)
+        self.assertIn(
+            Path(d).name, r["result"]["suggestions"],
+            f"repo name must still be suggested: {r['result']['suggestions']}")
+
+    def test_nested_directory_inside_a_repo_is_still_detected(self):
+        """A subdirectory has no .git of its own but is still in the tree."""
+        repo = tempfile.mkdtemp(prefix="lmux-git2-")
+        self.addCleanup(shutil.rmtree, repo, ignore_errors=True)
+        subprocess.run(["git", "init", "-q", "-b", "main", repo],
+                       capture_output=True, timeout=30)
+        subprocess.run(["git", "-C", repo, "config", "user.email", "t@t"],
+                       capture_output=True, timeout=30)
+        subprocess.run(["git", "-C", repo, "config", "user.name", "t"],
+                       capture_output=True, timeout=30)
+        Path(repo, "f").write_text("x")
+        subprocess.run(["git", "-C", repo, "add", "-A"], capture_output=True,
+                       timeout=30)
+        subprocess.run(["git", "-C", repo, "commit", "-qm", "i"],
+                       capture_output=True, timeout=30)
+        deep = Path(repo, "src", "nested")
+        deep.mkdir(parents=True)
+        r = self.client.send("naming.suggest", {"cwd": str(deep)})
+        self.assertTrue(r.get("ok"), r)
+        self.assertIn(
+            Path(repo).name, r["result"]["suggestions"],
+            f"repo root should be found from a nested dir: "
+            f"{r['result']['suggestions']}")
+    def test_switching_branch_invalidates_the_cache(self):
+        """A cached path must not serve a stale suggestion after a checkout.
+
+        The first call memoises the (main-branch) result; switching to a
+        feature branch changes `.git/HEAD`, so the next call must recompute and
+        surface the repo:branch form rather than the cached one.
+        """
+        repo = tempfile.mkdtemp(prefix="lmux-git3-")
+        self.addCleanup(shutil.rmtree, repo, ignore_errors=True)
+        subprocess.run(["git", "init", "-q", "-b", "main", repo],
+                       capture_output=True, timeout=30)
+        subprocess.run(["git", "-C", repo, "config", "user.email", "t@t"],
+                       capture_output=True, timeout=30)
+        subprocess.run(["git", "-C", repo, "config", "user.name", "t"],
+                       capture_output=True, timeout=30)
+        Path(repo, "f").write_text("x")
+        subprocess.run(["git", "-C", repo, "add", "-A"], capture_output=True,
+                       timeout=30)
+        subprocess.run(["git", "-C", repo, "commit", "-qm", "i"],
+                       capture_output=True, timeout=30)
+        repo_name = Path(repo).name
+
+        first = self.client.send("naming.suggest", {"cwd": repo})
+        self.assertTrue(first.get("ok"), first)
+        self.assertNotIn(f"{repo_name}:branchy", first["result"]["suggestions"])
+
+        subprocess.run(["git", "-C", repo, "checkout", "-qb", "branchy"],
+                       capture_output=True, timeout=30)
+
+        again = self.client.send("naming.suggest", {"cwd": repo})
+        self.assertTrue(again.get("ok"), again)
+        self.assertIn(
+            f"{repo_name}:branchy", again["result"]["suggestions"],
+            "cache served a stale result after checkout: "
+            f"{again['result']['suggestions']}")
+
+
+
+
 
 class TestSnapshotParserCorrectness(unittest.TestCase):
     """#11 structural fix: the hand-rolled brace-counting scanner silently
