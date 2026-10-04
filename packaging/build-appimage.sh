@@ -104,9 +104,11 @@ build_appdir() {
     mkdir -p "$APPDIR/usr/share/metainfo"
 
     # ── Install CLI binary (if it exists) ─────────────────────
+    # Installed as `lmux`, not `lmux-core`: the CLI is the primary entry point,
+    # matching README.md / CONTRIBUTING.md and the binary's own usage text.
     if [ -f "$ROOT/build/lmux" ]; then
-        cp "$ROOT/build/lmux" "$APPDIR/usr/bin/lmux-core"
-        chmod 755 "$APPDIR/usr/bin/lmux-core"
+        cp "$ROOT/build/lmux" "$APPDIR/usr/bin/lmux"
+        chmod 755 "$APPDIR/usr/bin/lmux"
         info "Installed C core binary"
     fi
 
@@ -117,25 +119,26 @@ build_appdir() {
         "$ROOT/gui/" "$APPDIR/usr/lib/$APP/gui/"
     chmod -R u=rwX,go=rX "$APPDIR/usr/lib/$APP/gui/"
 
-    # ── Wrapper script ────────────────────────────────────────
-    cat > "$APPDIR/usr/bin/$APP" << 'WRAPPER'
+    # ── GUI launcher ───────────────────────────────────────────
+    cat > "$APPDIR/usr/bin/lmux-gui" << 'WRAPPER'
 #!/bin/bash
-# lmux AppImage wrapper — sets up Python path and launches the GUI.
+# lmux-gui — AppImage GUI launcher. Sets up Python path and starts the GUI.
 # System python3 is required; not bundled in the AppImage.
 SELF_DIR="$(dirname "$(readlink -f "$0")")"
 export PYTHONPATH="$SELF_DIR/../lib/lmux:$PYTHONPATH"
 exec python3 "$SELF_DIR/../lib/lmux/gui/main.py" "$@"
 WRAPPER
-    chmod 755 "$APPDIR/usr/bin/$APP"
+    chmod 755 "$APPDIR/usr/bin/lmux-gui"
 
     # ── AppRun entry point ────────────────────────────────────
     cat > "$APPDIR/AppRun" << 'APPRUN'
 #!/bin/bash
-# AppRun — AppImage entry point. Resolves APPDIR and launches lmux.
+# AppRun — AppImage entry point. Resolves APPDIR and launches the GUI.
+# Double-clicking the AppImage opens lmux-gui; the CLI is usr/bin/lmux.
 SELF="$(readlink -f "$0")"
 APPDIR="$(dirname "$SELF")"
 export APPDIR
-exec "$APPDIR/usr/bin/lmux" "$@"
+exec "$APPDIR/usr/bin/lmux-gui" "$@"
 APPRUN
     chmod 755 "$APPDIR/AppRun"
 
@@ -145,7 +148,7 @@ APPRUN
 Name=lmux
 GenericName=Terminal Multiplexer
 Comment=Native Linux terminal for running AI coding agents in parallel
-Exec=lmux %F
+Exec=lmux-gui %F
 Icon=lmux
 Terminal=false
 Type=Application

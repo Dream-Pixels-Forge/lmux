@@ -4680,6 +4680,35 @@ class TestPackagingEntryPoints(unittest.TestCase):
             errors, [],
             "flatpak AppStream metainfo fails validation:\n"
             + "\n".join(errors))
+    def test_entry_point_naming_matches_documented_architecture(self):
+        """`lmux` is the CLI and `lmux-gui` is the GUI — in every packager.
+
+        README.md, CONTRIBUTING.md, gui/main.py's docstring and the compiled
+        binary's own usage text ("Usage: lmux <command> [args...]") all agree
+        on that split. The packagers did not: the deb shipped a GUI wrapper as
+        `lmux` and hid the real binary behind `lmux-cli`, while the AppImage
+        called the CLI `lmux-core`. So a fresh install answered `lmux` with the
+        GUI, and the binary was reachable only under a different name than the
+        one it prints in its own usage text.
+        """
+        root = Path(__file__).parent.parent
+        blob = "\n".join((root / "packaging" / n).read_text()
+                         for n in ("build-deb.sh", "build-appimage.sh"))
+        # deb
+        self.assertIn('"$BUILD_DIR/usr/bin/lmux"', blob,
+                      "deb should ship the CLI as /usr/bin/lmux")
+        self.assertIn('"$BUILD_DIR/usr/bin/lmux-gui"', blob,
+                      "deb should ship the GUI as /usr/bin/lmux-gui")
+        # AppImage
+        self.assertIn('"$APPDIR/usr/bin/lmux"', blob,
+                      "AppImage should ship the CLI as usr/bin/lmux")
+        self.assertIn('"$APPDIR/usr/bin/lmux-gui"', blob,
+                      "AppImage should ship the GUI as usr/bin/lmux-gui")
+        # The retired install paths must not creep back in. Checked as paths,
+        # not bare tokens, so a comment explaining the rename stays allowed.
+        for retired in ("usr/bin/lmux-cli", "usr/bin/lmux-core"):
+            self.assertNotIn(retired, blob,
+                             f"{retired} is a retired install path")
 
 
 
