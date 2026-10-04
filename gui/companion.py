@@ -27,7 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # ── Constants ────────────────────────────────────────────────
 
-LMUX_VERSION = "1.0.0"
+LMUX_VERSION = "1.1.2"
 DEFAULT_PORT = 8765
 TOKEN_MAX_AGE = 300  # 5 minutes
 RATE_LIMIT_PER_SEC = 10

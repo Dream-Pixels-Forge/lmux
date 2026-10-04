@@ -36,10 +36,11 @@ pnpm deps:apt         # install system libraries (GTK3, VTE, etc.)
 | `pnpm build` | Build core library, GUI, and CLI |
 | `pnpm build:core` | Compile `liblmux_core.a` (C static library) |
 | `pnpm build:cli` | Compile the `lmux` CLI binary (requires `build:core`) |
-| `pnpm build:app` | Build the Python GTK GUI |
 | `pnpm test` | Run unit tests and CLI smoke test |
 | `pnpm dev` | Run in development mode |
 | `pnpm clean` | Remove build artifacts |
+| `pnpm package:deb` | Build the Debian package (→ `packaging/build-deb.sh`) |
+| `pnpm package:appimage` | Build the AppImage (→ `packaging/build-appimage.sh`) |
 
 Individual build scripts also accept flags:
 

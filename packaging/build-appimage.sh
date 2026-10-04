@@ -160,7 +160,10 @@ DESKTOP
     ln -sf "usr/share/icons/hicolor/256x256/apps/$APP.svg" "$APPDIR/$APP.svg"
 
     # ── AppStream metainfo ────────────────────────────────────
-    cat > "$APPDIR/usr/share/metainfo/$APP.appdata.xml" << 'METAEOF'
+    # NOTE: the filename MUST match the component id above, and the URLs must
+    # resolve, or `appstreamcli validate` fails and appimagetool aborts the
+    # whole build (exit 3). Both were wrong here and broke `make appimage`.
+    cat > "$APPDIR/usr/share/metainfo/io.github.lmux.lmux.appdata.xml" << 'METAEOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
   <id>io.github.lmux.lmux</id>
@@ -173,8 +176,8 @@ DESKTOP
     multiple AI coding agents in parallel. Features workspace management, pane
     splitting, real-time monitoring, and SSH remote session support.</p>
   </description>
-  <url type="homepage">https://github.com/lmux/lmux</url>
-  <url type="bugtracker">https://github.com/lmux/lmux/issues</url>
+  <url type="homepage">https://github.com/Dream-Pixels-Forge/lmux</url>
+  <url type="bugtracker">https://github.com/Dream-Pixels-Forge/lmux/issues</url>
   <launchable type="desktop-id">lmux.desktop</launchable>
 </component>
 METAEOF

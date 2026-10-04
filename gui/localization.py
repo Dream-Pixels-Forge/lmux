@@ -375,9 +375,18 @@ def create_default_locales():
     
     for locale, strings in locales.items():
         locale_file = LOCALE_DIR / f"{locale}.json"
-        locale_file.parent.mkdir(parents=True, exist_ok=True)
-        with open(locale_file, "w", encoding="utf-8") as f:
-            json.dump(strings, f, indent=2, ensure_ascii=False)
+        try:
+            locale_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(locale_file, "w", encoding="utf-8") as f:
+                json.dump(strings, f, indent=2, ensure_ascii=False)
+        except OSError:
+            # Read-only install (AppImage mounts the gui tree as squashfs),
+            # or no permission to write there. The locale files ship with
+            # the package, so regenerating them is optional — keep going and
+            # fall back to whatever is on disk.
+            logger.debug("locale dir not writable, using shipped files: %s",
+                         locale_file.parent)
+            continue
 
 
 # Create default locales on import
