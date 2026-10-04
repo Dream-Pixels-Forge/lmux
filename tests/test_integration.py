@@ -4601,6 +4601,69 @@ class TestSessionRestoreConcurrency(unittest.TestCase):
 
 # ====================================================================
 
+class TestPackagingEntryPoints(unittest.TestCase):
+    """package.json must not advertise commands that don't exist.
+
+    Both `package:appimage` and `package:deb` pointed at non-existent
+    `scripts/*.mjs` files, while the real logic lives in `packaging/*.sh`
+    (reached through thin `scripts/*.sh` shims). Running them failed with
+    "Cannot find module" — silent drift between package.json and the repo.
+    """
+
+    def test_script_file_targets_exist(self):
+        root = Path(__file__).parent.parent
+        pkg = json.loads((root / "package.json").read_text())
+        missing = []
+        for name, cmd in pkg.get("scripts", {}).items():
+            for token in cmd.split():
+                if token.startswith(("scripts/", "packaging/")):
+                    if not (root / token).exists():
+                        missing.append(f"{name} -> {token}")
+        self.assertEqual(
+            missing, [],
+            f"package.json advertises non-existent script targets: {missing}")
+
+
+
+class TestGuiLocaleDirReadOnly(unittest.TestCase):
+    """gui/localization.py must survive a read-only install.
+
+    create_default_locales() runs at import time and rewrote its own
+    locale files unconditionally. Inside an AppImage the gui tree is
+    mounted read-only squashfs, so `open(..., "w")` raised OSError and the
+    GUI died before it ever started.
+    """
+
+    def test_create_default_locales_tolerates_readonly_locale_dir(self):
+        sys.path.insert(0, str(Path(__file__).parent.parent / "gui"))
+        import localization  # noqa: E402
+
+        ro_parent = tempfile.mkdtemp(prefix="lmux-ro-locale-")
+        self.addCleanup(shutil.rmtree, ro_parent, ignore_errors=True)
+        os.chmod(ro_parent, 0o500)
+        self.addCleanup(os.chmod, ro_parent, 0o700)
+
+        original = localization.LOCALE_DIR
+        localization.LOCALE_DIR = Path(ro_parent) / "locales"
+        self.addCleanup(setattr, localization, "LOCALE_DIR", original)
+
+        try:
+            localization.create_default_locales()
+        except OSError as e:
+            self.fail(
+                "create_default_locales must tolerate a read-only locale "
+                f"dir (AppImage); got {type(e).__name__}: {e}")
+
+    def test_readonly_import_still_provides_translations(self):
+        """Shipped locale files must still be usable when we cannot write."""
+        sys.path.insert(0, str(Path(__file__).parent.parent / "gui"))
+        import localization  # noqa: E402
+
+        loc = localization.get_localization()
+        self.assertTrue(loc.get("menu.file"))
+
+
+
 if __name__ == "__main__":
     # Clean up leftover test sockets
     for f in Path("/tmp").glob("lmux-integration-*.sock"):

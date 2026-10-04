@@ -76,8 +76,8 @@ lmux/
 - **Primary:** Node.js ESM scripts (`scripts/*.mjs`)
 - **Core Build:** `node scripts/build-core.mjs` → compiles C17 to `liblmux_core.a`
 - **CLI Build:** `node scripts/build-cli.mjs` → compiles CLI binary
-- **Package:** `node scripts/package-deb.mjs` → Debian package
-- **AppImage:** `node scripts/package-appimage.mjs` → AppImage
+- **Package:** `bash scripts/package-deb.sh` → Debian package (delegates to `packaging/build-deb.sh`)
+- **AppImage:** `bash scripts/package-appimage.sh` → AppImage (delegates to `packaging/build-appimage.sh`)
 
 ### Dependencies
 - **C Core:** POSIX sockets, pthreads, no external JSON library
