@@ -251,6 +251,9 @@ syft dir:. -o spdx-json > sbom.json
 **Verification Gate:**
 ```bash
 # Test: Container image is signed
+# NOTE: the OCI registry namespace is `lmux`, deliberately NOT the GitHub org
+# (`Dream-Pixels-Forge`). The two differ on purpose — do not "align" these
+# registry paths with the github.com/... URLs used elsewhere in the repo.
 cosign verify --key cosign.pub ghcr.io/lmux/lmux:latest
 ```
 
