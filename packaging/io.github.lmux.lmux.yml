@@ -115,10 +115,10 @@ modules:
               companion for QR-code pairing.
             </p>
           </description>
-          <url type="homepage">https://github.com/lmux/lmux</url>
-          <url type="bugtracker">https://github.com/lmux/lmux/issues</url>
+          <url type="homepage">https://github.com/Dream-Pixels-Forge/lmux</url>
+          <url type="bugtracker">https://github.com/Dream-Pixels-Forge/lmux/issues</url>
           <releases>
-            <release version="1.0.0" date="2026-01-01"/>
+            <release version="1.1.2" date="2026-10-04"/>
           </releases>
           <content_rating type="oars-1.1"/>
         </component>

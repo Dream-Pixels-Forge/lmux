@@ -35,5 +35,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - C17 unit tests for model, config, and OSC modules
 - Node.js build scripts for core library, CLI binary, watch mode, and test runner
 
-[unreleased]: https://github.com/lmux/lmux/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/lmux/lmux/releases/tag/v0.1.0
+[unreleased]: https://github.com/Dream-Pixels-Forge/lmux/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/Dream-Pixels-Forge/lmux/releases/tag/v0.1.0

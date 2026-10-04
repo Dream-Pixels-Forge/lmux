@@ -23,7 +23,7 @@ pnpm deps:apt
 ## Setup
 
 ```sh
-git clone https://github.com/lmux/lmux.git
+git clone https://github.com/Dream-Pixels-Forge/lmux.git
 cd lmux
 pnpm install          # install Node dev deps (build scripts)
 pnpm deps:apt         # install system libraries (GTK3, VTE, etc.)
