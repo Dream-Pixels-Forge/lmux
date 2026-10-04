@@ -1,6 +1,6 @@
 app-id: io.github.lmux.lmux
 runtime: org.gnome.Platform
-runtime-version: '46'
+runtime-version: '50'
 sdk: org.gnome.Sdk
 command: lmux
 
@@ -48,8 +48,8 @@ modules:
         url: https://files.pythonhosted.org/packages/7f/81/d60984052df5c97b1d24365bc1e30024379b42c4edcd79d2436b1b9806f2/pynacl-1.6.2-cp38-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
         sha256: 22de65bb9010a725b0dac248f353bb072969c94fa8d6b1f34b87d7953cf7bbe4
       - type: file
-        url: https://files.pythonhosted.org/packages/f7/a4/4399daaf8f7dfee9d7c3327fdb0426ee041cc63edc358b93911ceb2bfc7a/cffi-2.1.1-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
-        sha256: 34e261f78cb6ceaaa36f42f2613f4380d94d9c759a9c73c769ee6e0247364632
+        url: https://files.pythonhosted.org/packages/95/95/86342356ff5953b3fb06f7ef7c5bee212d45e770abc7218d451b9148313c/cffi-2.1.1-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
+        sha256: a931079504ecc49efed7744c476a5c343a92fabf66dec2db95edb1b2fdc770e2
       - type: file
         url: https://files.pythonhosted.org/packages/0c/c3/44f3fbbfa403ea2a7c779186dc20772604442dde72947e7d01069cbe98e3/pycparser-3.0-py3-none-any.whl
         sha256: b727414169a36b7d524c1c3e31839a521725078d7b2ff038656844266160a992
@@ -57,9 +57,15 @@ modules:
         url: https://files.pythonhosted.org/packages/dd/b8/d2d6d731733f51684bbf76bf34dab3b70a9148e8f2cef2bb544fccec681a/qrcode-8.2-py3-none-any.whl
         sha256: 16e64e0716c14960108e85d853062c9e8bba5ca8252c0b4d0231b9df4060ff4f
       - type: file
-        url: https://files.pythonhosted.org/packages/3b/2d/ede717bc1144f63886c21fd349bb95860b0d1a21149ff16f2bb362b612b6/pillow-12.3.0-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
-        sha256: 23d27a3e0307ec2244cc51e7287b919aa68d097504ebe19df4e76a98a3eea5bd
+        url: https://files.pythonhosted.org/packages/f7/62/de5bdd77d935331f4f802edc11e4d82950f642caad6cb2f949837b8560e2/pillow-12.3.0-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
+        sha256: 0847a763afefb695bc912d7c131e7e0632d4edc1d8698f58ddabec8e46b8b6d3
     build-commands:
+      - >-
+        python3 -c "import sys;
+        v = sys.version_info[:2];
+        assert v == (3, 13),
+        'wheels below are pinned for cp313 but this SDK has Python %s — '
+        're-probe the SDK and re-pin the wheel tags' % (v,)"
       - pip3 install --no-index --find-links=. --no-build-isolation --prefix=/app pynacl qrcode[pil]
     cleanup:
       - /lib/python3*/site-packages/nacl/tests
