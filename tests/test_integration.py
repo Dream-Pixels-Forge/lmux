@@ -4634,15 +4634,24 @@ class TestPackagingEntryPoints(unittest.TestCase):
         """
         root = Path(__file__).parent.parent
         # Assembled at runtime so this test file does not itself contain the
-        # literal — otherwise `git grep` matches its own source and the test
+        # literals -- otherwise `git grep` matches its own source and the test
         # can never pass.
-        needle = "github.com/" + "lmux" + "/lmux"
-        stale = subprocess.run(
-            ["git", "grep", "-n", needle],
-            cwd=root, capture_output=True, text=True).stdout.strip()
+        #
+        # Both namespaces: the GitHub org in web URLs and the OCI registry in
+        # container-image references. Both should be `Dream-Pixels-Forge`
+        # (GHCR lowercases it), never the legacy `lmux` namespace.
+        needles = ("github.com/" + "lmux" + "/lmux",
+                   "ghcr.io/" + "lmux" + "/lmux")
+        found = []
+        for needle in needles:
+            found.append(subprocess.run(
+                ["git", "grep", "-n", needle],
+                cwd=root, capture_output=True, text=True).stdout.strip())
+        stale = "\n".join(f for f in found if f)
         self.assertEqual(
             stale, "",
-            "tracked files still point at the old repo org:\n" + stale)
+            "tracked files still reference the old `lmux` namespace:\n"
+            + stale)
 
     def test_flatpak_metainfo_validates(self):
         """The flatpak manifest ships its own AppStream metainfo — keep it valid.
