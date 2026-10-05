@@ -44,6 +44,42 @@ jobs:
       - name: Run unit tests
         run: node scripts/test.mjs --unit
 
+  # The 313-test Python suite is the only full gate: --unit covers the C
+  # units, but every daemon behavior (pty, snapshot, harness) is exercised
+  # solely through tests/test_integration.py, which nothing in CI ran.
+  # `test_ci_runs_the_integration_suite` in tests/ pins this job.
+  # Serial by design: one runner, no matrix (shared-socket assumptions +
+  # the Proven #1 rule — two runners destroy each other's sockets).
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            gcc \
+            pkg-config \
+            python3 \
+            strace \
+            zsh
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build core library
+        run: node scripts/build-core.mjs
+
+      - name: Build CLI binary
+        run: node scripts/build-cli.mjs
+
+      - name: Run Python integration suite
+        run: python3 tests/test_integration.py
+
   sanitizers:
     runs-on: ubuntu-latest
     steps:

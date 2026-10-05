@@ -4597,6 +4597,29 @@ class TestSessionRestoreConcurrency(unittest.TestCase):
 
 # ====================================================================
 
+class TestIntegrationSuiteInCI(unittest.TestCase):
+    """The 313-test Python suite is the only full gate — it must run in CI.
+
+    ci.yml runs `node scripts/test.mjs --unit` only, so the suite never runs
+    on any PR. This pins the fix the same way
+    test_ci_builds_the_flatpak_manifest pins the flatpak job.
+    """
+
+    def test_ci_runs_the_integration_suite(self):
+        """An `integration` job must build core+CLI and run the suite."""
+        root = Path(__file__).parent.parent
+        ci = (root / ".github" / "workflows" / "ci.yml").read_text()
+        self.assertIn(
+            "tests/test_integration.py", ci,
+            "ci.yml never runs the Python integration suite — the only "
+            "full gate runs solely via `make test`, locally")
+        self.assertIn(
+            "integration:", ci,
+            "ci.yml should have a dedicated integration job by name")
+
+
+# ====================================================================
+
 class TestPackagingEntryPoints(unittest.TestCase):
     """package.json must not advertise commands that don't exist.
 
