@@ -93,9 +93,9 @@ appimage: build
 flatpak: build
 	@command -v flatpak-builder >/dev/null 2>&1 || { echo "Error: flatpak-builder not found"; exit 1; }
 	@echo "==> Building Flatpak for lmux v$(VERSION)"
-	@# Flatpak manifest would live in packaging/io.lmux.lmux.yml
-	@# For now, create the AppDir and hand off to flatpak-builder.
-	flatpak-builder --force-clean dist/flatpak/build packaging/io.lmux.lmux.yml
+	@# The manifest is packaging/io.github.lmux.lmux.yml (pinned by
+	@# test_flatpak_wrapper_runtime_matches_manifest et al. in tests/).
+	flatpak-builder --force-clean dist/flatpak/build packaging/io.github.lmux.lmux.yml
 
 rpm: build
 	@command -v rpmbuild >/dev/null 2>&1 || { echo "Error: rpmbuild not found (install rpm-build)"; exit 1; }

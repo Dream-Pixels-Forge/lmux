@@ -4689,6 +4689,72 @@ class TestPackagingEntryPoints(unittest.TestCase):
             errors, [],
             "flatpak AppStream metainfo fails validation:\n"
             + "\n".join(errors))
+    def test_make_flatpak_target_references_existing_manifest(self):
+        """`make flatpak` must point at a manifest that exists.
+
+        The target runs `flatpak-builder … packaging/io.lmux.lmux.yml`, but the
+        real file is `packaging/io.github.lmux.lmux.yml` — so the target has
+        never been able to build anything. Same class as the package.json
+        entry points above: a documented path that silently rotted because
+        nothing exercised it.
+        """
+        root = Path(__file__).parent.parent
+        makefile = (root / "Makefile").read_text()
+        # Isolate the flatpak target's recipe lines.
+        m = re.search(r"^flatpak:.*?\n((?:\t.*\n|\n)*)", makefile, re.MULTILINE)
+        self.assertIsNotNone(m, "Makefile should have a `flatpak` target")
+        refs = re.findall(r"packaging/[\w.\-]+\.yml", m.group(0))
+        self.assertTrue(refs, "flatpak target should name a manifest file")
+        missing = [r for r in refs if not (root / r).exists()]
+        self.assertEqual(
+            missing, [],
+            f"`make flatpak` references nonexistent manifest(s): {missing}")
+
+    def test_flatpak_wrapper_runtime_matches_manifest(self):
+        """The wrapper must install the runtime the manifest actually builds.
+
+        PR #32 moved `runtime-version` from 46 to 50 (GNOME 46 went EOL
+        2025-04-17), but flatpak-wrapper.sh still pre-installed `//46` — a
+        stale duplicate of the manifest's version string. Two pins: any
+        hardcoded `//NN` must match the manifest, and the wrapper must derive
+        the version from the manifest so the next runtime bump cannot leave
+        it behind.
+        """
+        root = Path(__file__).parent.parent
+        manifest = (root / "packaging" / "io.github.lmux.lmux.yml").read_text()
+        wrapper = (root / "packaging" / "flatpak-wrapper.sh").read_text()
+        mv = re.search(r"^runtime-version:\s*['\"]?(\d+)", manifest, re.MULTILINE)
+        self.assertIsNotNone(mv, "manifest should declare runtime-version")
+        hardcoded = re.search(r"//(\d+)", wrapper)
+        if hardcoded is not None:
+            self.assertEqual(
+                hardcoded.group(1), mv.group(1),
+                "flatpak-wrapper.sh hardcodes a different GNOME runtime than "
+                f"the manifest builds against (wrapper: //{hardcoded.group(1)}, "
+                f"manifest: {mv.group(1)})")
+        self.assertIn(
+            "runtime-version", wrapper,
+            "flatpak-wrapper.sh must derive the runtime version from the "
+            "manifest instead of hardcoding it")
+
+    def test_ci_builds_the_flatpak_manifest(self):
+        """CI must actually run flatpak-builder against the manifest.
+
+        All three defects fixed in #31 (dead --build-arg, pip without network,
+        wrong wheel tags) survived because nothing ever built this file — the
+        metainfo test above says as much. This pins the root-cause fix: a CI
+        job that builds it on every PR and push to master.
+        """
+        root = Path(__file__).parent.parent
+        ci = (root / ".github" / "workflows" / "ci.yml").read_text()
+        self.assertIn(
+            "flatpak-builder", ci,
+            "ci.yml never invokes flatpak-builder — the flatpak path is "
+            "untested by CI (root cause of #31)")
+        self.assertIn(
+            "packaging/io.github.lmux.lmux.yml", ci,
+            "ci.yml should build the real flatpak manifest by name")
+
     def test_entry_point_naming_matches_documented_architecture(self):
         """`lmux` is the CLI and `lmux-gui` is the GUI — in every packager.
 

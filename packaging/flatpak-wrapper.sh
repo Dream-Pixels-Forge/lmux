@@ -32,10 +32,18 @@ if ! flatpak remote-list --user 2>/dev/null | grep -q flathub; then
 fi
 
 # ── Install runtime and SDK if missing ───────────────────────
+# Version derived from the manifest — never hardcoded: PR #32 bumped the
+# runtime to 50 while this script still installed the old 46, and the only
+# reason it surfaced is that nothing exercised this path.
+RUNTIME_VERSION=$(sed -nE "s/^runtime-version:[[:space:]]*['\"]?([0-9]+).*/\1/p" "${MANIFEST}")
+if [ -z "${RUNTIME_VERSION}" ]; then
+  echo "ERROR: could not read runtime-version from ${MANIFEST}" >&2
+  exit 1
+fi
 for ref in org.gnome.Platform org.gnome.Sdk; do
   if ! flatpak list --user --runtime | grep -q "$ref"; then
-    echo "==> Installing ${ref}//46..."
-    flatpak install --user -y flathub "${ref}//46" || true
+    echo "==> Installing ${ref}//${RUNTIME_VERSION}..."
+    flatpak install --user -y flathub "${ref}//${RUNTIME_VERSION}" || true
   fi
 done
 
