@@ -1,8 +1,7 @@
 # Handoff — lmux @ master
 
-**Date:** 2026-10-05
-**Branch state:** `master` @ `a87ee34` (PR #33), clean, in sync with origin;
-this session's work on `fix/flatpak-ci-job`
+**Date:** 2026-10-05 (evening update — memorius session)
+**Branch state:** `master` @ `4a50768` (PR #39), clean, in sync with origin
 **Version:** 1.1.2
 **Tests:** 309 integration (306 + 3 new) + 23 model + 8 osc + 12 config unit,
 fuzz 0 errors — all re-run fresh for the goal-met audit (gate PASS, 10/10).
@@ -20,8 +19,10 @@ Merged since the previous handoff:
 | #33 | `a87ee34` | the previous handoff document |
 | #34 | `2717706` | rate limiter guarded with a mutex |
 | #35 | `22cf3ce` | updater rejects tar members escaping the extraction directory |
+| #36 | `f28331a` | **the flatpak-CI goal** — CI builds the manifest; `make flatpak` manifest path fixed; wrapper runtime derived from manifest; 3 new tests (goal-loop MET, 10/10) |
+| #39 | `4a50768` | handoff correction (orphan-daemon claim) + issues #37/#38 filed |
 
-This session executed the flatpak-CI open item (spec:
+Previous session executed the flatpak-CI open item (spec:
 `dev-notes/GOAL_FLATPAK_CI.md`, verdict MET via goal-loop):
 
 - **CI now builds the flatpak manifest.** New `flatpak` job in
@@ -29,7 +30,9 @@ This session executed the flatpak-CI open item (spec:
   caches `~/.local/share/flatpak` keyed on the manifest with a fallback
   restore key, runs `flatpak-builder --user … packaging/io.github.lmux.lmux.yml`,
   then installs the result and smoke-tests `flatpak run … --version`. The
-  root-cause fix for all three #31 defects.
+  root-cause fix for all three #31 defects. The new job caught a real bug on
+  its first live run (broken relative-path `flatpak install` usage) — fixed
+  and re-verified in CI.
 - **`make flatpak` pointed at a manifest that does not exist**
   (`packaging/io.lmux.lmux.yml`) — it never could have worked. Now points at
   the real file.
@@ -90,20 +93,54 @@ full strength.
    `sudo apt install flatpak-builder`, then `flatpak uninstall --user
    --unused`, `flatpak uninstall --user org.flatpak.Builder`,
    `flatpak remote-delete --user flathub`.
-2. **Memorius is still not exposed** in this session either — §5/§7 of the
-   workspace mandate remain manually unsatisfied; record the summary by hand.
-3. **The Python integration suite is not in CI.** The 309 tests exist, run
+2. **The Python integration suite is not in CI.** The 309 tests exist, run
    green locally, and are the only full gate. Adding them to CI is a natural
    next goal (needs the daemon + CLI built first).
-4. **Harness defects filed as issues #37 (ptyd daemon leak per run) and
-   #38 (second runner unlinks live sockets)** — both need their own RED tests.
+3. **Harness defects filed as issues #37 (ptyd daemon leak per run) and
+   #38 (second runner unlinks live sockets)** — both OPEN, both need their
+   own RED tests.
+4. **No stray processes left** — verified `no_stray_processes` before writing
+   this handoff (all 14 Oct 4–5 orphans killed earlier).
 
 ## Environment notes
 
 - Flatpak toolchain is installed **user-level** (`org.flatpak.Builder` +
   GNOME 46 and 50 SDKs, ~9 GB in `~/.local/share/flatpak`); `appimagetool` is
   in `~/.local/bin/`. The manifest build cache in CI is cold the first time.
-- **Seven `lmux-ptyd-*` daemons from Oct 4** are still running (pre-existing).
+- **Memorius is FIXED and working** (see § Memorius below). 19 vaults,
+  276 memories, embeddings up.
+- pipx memorius venv is 6.1 GB (torch/CUDA wheels) — do not delete it
+  thinking it is bloat.
+
+## Memorius — repaired this session ✅
+
+Why it was broken: (1) pipx held a stale 0.2.0 venv whose symlinks were
+squatted on by old `pip install --user` wrappers, so `pipx reinstall` errored
+and the shell silently used the pip copy; (2) Cline's MCP settings file had
+no memorius entry, so
+the server was never spawned.
+
+What was done (PyPI package only — the sibling `memorius` checkout on this
+machine is a dev
+tree and was deliberately NOT used):
+
+- Clean `pipx install memorius` → **0.8.2** (latest on PyPI), proper
+  symlinks, `memorius status` shows the vault intact.
+- `memorius serve` smoke-tested over stdio: handshake → `tools/list`
+  (28 tools) → `tools/call memorius_status` returns live data; CLI semantic
+  search verified (torch path works).
+- MCP registered in the Cline MCP settings file alongside brandly:
+  `"memorius": {"transport": {"type": "stdio", "command":
+  "~/.local/bin/memorius", "args": ["serve"]}}`.
+
+Torch question, answered: torch (~800 MB, hard dep via
+`memorius → sentence-transformers>=2.6.0 → torch>=2.2`) is the runtime for
+the local embedding model behind semantic search — not optional in the
+published package (unlike the dev repo's `local-embeddings` extra).
+
+⚠️ **After restarting the session/IDE: the Cline extension must reload to
+pick up the new MCP entry.** If `memorius_*` tools are still absent, restart
+the extension host. Verify with `memorius_status` as the first call.
 
 ## Known gaps, deliberately left open
 
