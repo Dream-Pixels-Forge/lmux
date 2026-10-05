@@ -195,5 +195,9 @@ jobs:
 
       - name: Install and smoke-test the built flatpak
         run: |
-          flatpak install --user build/flatpak/repo io.github.lmux.lmux -y
+          # Absolute path required: flatpak parses a *relative* LOCATION as a
+          # ref name and searches the default remote instead — the first run
+          # died with "'build' is not a valid name: Names must contain at
+          # least 2 periods" after a fully successful build.
+          flatpak install --user "$PWD/build/flatpak/repo" io.github.lmux.lmux -y
           flatpak run io.github.lmux.lmux --version
