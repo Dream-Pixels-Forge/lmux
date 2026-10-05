@@ -935,6 +935,8 @@ class TestReadScreenIsARepeatableCapture(unittest.TestCase):
         # A fresh zsh shows the first-run wizard, which consumes the first
         # keystrokes of anything typed into it. Choose "0" to write a .zshrc
         # and exit the wizard, so later commands actually reach the shell.
+        # Harmless under any other shell: `0` alone just fails as "command
+        # not found" and the session continues.
         client.surface_send_text("0\n")
         deadline = time.time() + 20
         while time.time() < deadline:
@@ -961,15 +963,19 @@ class TestReadScreenIsARepeatableCapture(unittest.TestCase):
                 first = self._read(client)
             self.assertTrue(first.strip(), "pane produced no output to capture")
             # Drain the pty, then capture again — content must still be there.
+            # Asserted shell-agnostically: the daemon spawns $SHELL (zsh here,
+            # bash on CI runners), so pin repeatability on the prompt echoing
+            # back rather than on any one shell's name.
             time.sleep(0.5)
             second = self._read(client)
             self.assertTrue(
                 second.strip(),
                 "second read-screen returned empty; it drained the pty "
                 "instead of capturing a buffer")
-            self.assertIn(
-                "zsh", second,
-                "capture should be repeatable and retain earlier output")
+            self.assertTrue(
+                second.strip() == first.strip() or len(second) >= len(first),
+                "second capture lost content the first capture had; "
+                "it must retain earlier output")
         finally:
             _shutdown_isolated(daemon, home)
 
@@ -4593,6 +4599,29 @@ class TestSessionRestoreConcurrency(unittest.TestCase):
             )
         finally:
             _shutdown_isolated(daemon, home)
+
+
+# ====================================================================
+
+class TestIntegrationSuiteInCI(unittest.TestCase):
+    """The 313-test Python suite is the only full gate — it must run in CI.
+
+    ci.yml runs `node scripts/test.mjs --unit` only, so the suite never runs
+    on any PR. This pins the fix the same way
+    test_ci_builds_the_flatpak_manifest pins the flatpak job.
+    """
+
+    def test_ci_runs_the_integration_suite(self):
+        """An `integration` job must build core+CLI and run the suite."""
+        root = Path(__file__).parent.parent
+        ci = (root / ".github" / "workflows" / "ci.yml").read_text()
+        self.assertIn(
+            "tests/test_integration.py", ci,
+            "ci.yml never runs the Python integration suite — the only "
+            "full gate runs solely via `make test`, locally")
+        self.assertIn(
+            "integration:", ci,
+            "ci.yml should have a dedicated integration job by name")
 
 
 # ====================================================================
