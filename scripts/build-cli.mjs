@@ -21,6 +21,18 @@ const BUILD = join(ROOT, "build");
 const debug = process.argv.includes("--debug");
 const sanitize = process.argv.includes("--sanitize");
 const CC = process.env.CC || "gcc";
+
+/* Detect libsystemd availability (same logic as build-core.mjs) */
+let haveSystemd = false;
+let systemdLibs = "";
+try {
+    const pkgLibs = execSync("pkg-config --libs libsystemd 2>/dev/null", { encoding: "utf8" }).trim();
+    if (pkgLibs) {
+        haveSystemd = true;
+        systemdLibs = pkgLibs;
+    }
+} catch { /* libsystemd not available */ }
+
 // -fsanitize has to be passed to BOTH the compile and the link. Forgetting it
 // at link time against an ASan-instrumented liblmux_core.a fails with
 // "undefined reference to __asan_init", so the sanitizer CI job could not
@@ -30,6 +42,7 @@ const LDFLAGS = [
     debug ? "-g" : "",
     SAN,
     "-pthread",
+    haveSystemd ? systemdLibs : "",
 ].filter(Boolean).join(" ");
 const CFLAGS = [
     "-std=c17",

@@ -24,6 +24,21 @@ const BUILD = join(ROOT, "build");
 const debug = process.argv.includes("--debug");
 const sanitize = process.argv.includes("--sanitize");
 const CC = process.env.CC || "gcc";
+
+/* Detect libsystemd availability */
+let haveSystemd = false;
+let systemdCflags = "";
+let systemdLibs = "";
+try {
+    const pkgCflags = execSync("pkg-config --cflags libsystemd 2>/dev/null", { encoding: "utf8" }).trim();
+    const pkgLibs = execSync("pkg-config --libs libsystemd 2>/dev/null", { encoding: "utf8" }).trim();
+    if (pkgCflags && pkgLibs) {
+        haveSystemd = true;
+        systemdCflags = pkgCflags;
+        systemdLibs = pkgLibs;
+    }
+} catch { /* libsystemd not available */ }
+
 const CFLAGS = [
     "-std=c17",
     "-Wall", "-Wextra", "-Wpedantic",
@@ -31,6 +46,8 @@ const CFLAGS = [
     debug ? "-g -O0" : "-O2 -DNDEBUG",
     sanitize ? "-fsanitize=address,undefined -fno-omit-frame-pointer" : "",
     `-I${join(ROOT, "include")}`,
+    haveSystemd ? "-DHAVE_SYSTEMD" : "",
+    haveSystemd ? systemdCflags : "",
     // WebKit2GTK flags (optional — browser module)
     ...(function() {
         try {
@@ -39,6 +56,8 @@ const CFLAGS = [
         } catch { return []; }
     })(),
 ].filter(Boolean).join(" ");
+
+const LDFLAGS_CORE = haveSystemd ? systemdLibs : "";
 
 const sources = [
     join(ROOT, "src", "core", "model.c"),

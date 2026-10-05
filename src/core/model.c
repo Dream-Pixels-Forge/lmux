@@ -42,6 +42,11 @@
 #include <termios.h>
 #include <time.h>
 
+/* Systemd journal support (optional, detected at compile time) */
+#ifdef HAVE_SYSTEMD
+#include <systemd/sd-journal.h>
+#endif
+
 /* Suppress format-truncation and stringop-truncation warnings.
  * Buffer sizes are appropriate; GCC can't prove it at compile time. */
 #pragma GCC diagnostic push
@@ -997,6 +1002,29 @@ static int log_json_enabled(void) {
     return g_log_json || g_log_json_config;
 }
 
+/* Check if systemd journal logging should be used.
+ * Returns true if running under systemd (NOTIFY_SOCKET is set) and
+ * libsystemd is available at compile time. */
+static bool log_journal_enabled(void) {
+#ifdef HAVE_SYSTEMD
+    const char *notify_socket = getenv("NOTIFY_SOCKET");
+    return notify_socket && notify_socket[0] != '\0';
+#else
+    return false;
+#endif
+}
+
+/* Map lmux_log_level to syslog priority (for journal PRIORITY field) */
+static int log_level_to_priority(lmux_log_level level) {
+    switch (level) {
+        case LMUX_LOG_DEBUG: return 7;  /* LOG_DEBUG */
+        case LMUX_LOG_INFO:  return 6;  /* LOG_INFO */
+        case LMUX_LOG_WARN:  return 4;  /* LOG_WARNING */
+        case LMUX_LOG_ERROR: return 3;  /* LOG_ERR */
+        default:             return 6;  /* LOG_INFO */
+    }
+}
+
 /* Extract log level from a log line (JSON or legacy format).
  * Returns: 0=debug, 1=info, 2=warn, 3=error, -1=unknown */
 static int log_line_get_level(const char *line) {
@@ -1129,8 +1157,28 @@ void lmux_log(lmux_log_level level, const char *fmt, ...) {
     vsnprintf(msg_buf, sizeof msg_buf, fmt, ap);
     va_end(ap);
 
+    /* Check if systemd journal logging is enabled */
+    bool journal_mode = log_journal_enabled();
+
     /* Check if JSON logging is enabled */
     bool json_mode = log_json_enabled();
+
+    /* Native systemd journal integration with structured fields */
+    if (journal_mode) {
+#ifdef HAVE_SYSTEMD
+        int priority = log_level_to_priority(level);
+        /* Send structured log entry to systemd journal */
+        sd_journal_send(
+            "PRIORITY=%d", priority,
+            "SYSLOG_IDENTIFIER=lmux",
+            "CODE_FILE=%s", __FILE__,
+            "CODE_LINE=%d", __LINE__,
+            "CODE_FUNC=%s", __func__,
+            "MESSAGE=%s", msg_buf,
+            NULL
+        );
+#endif
+    }
 
     /* Build JSON log entry */
     if (json_mode) {
@@ -1151,7 +1199,7 @@ void lmux_log(lmux_log_level level, const char *fmt, ...) {
             timestamp, json_levels[level], escaped);
         json_line = json_buf;
 
-        /* Write to stderr (systemd journal) */
+        /* Write to stderr (systemd journal captures this) */
         fprintf(stderr, "%s\n", json_line);
 
         /* Write to log file if configured */
@@ -1190,6 +1238,24 @@ void lmux_log(lmux_log_level level, const char *fmt, ...) {
 void lmux_log_request(const char *request_id, const char *cmd, bool ok, const char *detail) {
     if (g_log_level > LMUX_LOG_INFO && g_log_level_config > LMUX_LOG_INFO) return;
 
+    /* Native systemd journal integration with structured fields */
+    if (log_journal_enabled()) {
+#ifdef HAVE_SYSTEMD
+        sd_journal_send(
+            "PRIORITY=%d", 6,  /* LOG_INFO */
+            "SYSLOG_IDENTIFIER=lmux",
+            "CODE_FILE=%s", __FILE__,
+            "CODE_LINE=%d", __LINE__,
+            "CODE_FUNC=%s", __func__,
+            "MESSAGE=%s", detail ? detail : (ok ? "OK" : "FAIL"),
+            "LMUX_REQUEST_ID=%s", request_id ? request_id : "null",
+            "LMUX_CMD=%s", cmd ? cmd : "null",
+            "LMUX_OK=%s", ok ? "true" : "false",
+            NULL
+        );
+#endif
+    }
+
     if (log_json_enabled()) {
         time_t now = time(NULL);
         struct tm tm_buf;
@@ -1214,7 +1280,7 @@ void lmux_log_request(const char *request_id, const char *cmd, bool ok, const ch
         }
         strncat(json_line, "}", sizeof json_line - strlen(json_line) - 1);
 
-        /* Write to stderr (systemd journal) */
+        /* Write to stderr (systemd journal captures this) */
         fprintf(stderr, "%s\n", json_line);
 
         /* Write to log file if configured */

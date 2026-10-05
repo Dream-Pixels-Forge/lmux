@@ -19,6 +19,17 @@ const interactive = process.argv.includes("--interactive");
 const sanitize = process.argv.includes("--sanitize");
 const CC = process.env.CC || "gcc";
 
+/* Detect libsystemd availability for test linking */
+let haveSystemd = false;
+let systemdLibs = "";
+try {
+    const pkgLibs = execSync("pkg-config --libs libsystemd 2>/dev/null", { encoding: "utf8" }).trim();
+    if (pkgLibs) {
+        haveSystemd = true;
+        systemdLibs = pkgLibs;
+    }
+} catch { /* libsystemd not available */ }
+
 /* Ensure core library is built. If sanitizing, rebuild core with sanitizers. */
 if (sanitize || !existsSync(join(BUILD, "liblmux_core.a"))) {
     console.log("Building core library" + (sanitize ? " (with ASan/UBSan)" : "") + "...");
@@ -57,6 +68,7 @@ for (const t of testPrograms) {
         join(BUILD, "liblmux_core.a"),
         "-lm", "-lpthread",
         sanitize ? "-fsanitize=address,undefined" : "",
+        haveSystemd ? systemdLibs : "",
     ].filter(Boolean).join(" ");
 
     console.log(`\n--- ${t.name} ---`);
