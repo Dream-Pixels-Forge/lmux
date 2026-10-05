@@ -61,10 +61,11 @@ full strength.
    red was an artifact of the audit procedure, not the deliverable.
    **Never run two suites at once** (the python-side twin of the ETXTBSY
    rule). Fix candidate: only unlink sockets that refuse a connection.
-2. **`kill -9` on a runner leaves orphan daemons** (`lmux-integration-*`,
-   `lmux-iso-*`, `lmux-ptyd-*`) running forever — normal exit cleans them up.
-   This session's orphans were killed; **seven `lmux-ptyd-*` daemons from
-   Oct 4 18:49–20:50 are still alive** (pre-existing, deliberately untouched).
+2. **Every integration run leaks one `lmux-ptyd-*` daemon** — green exit or
+   SIGKILL alike (filed as issue #37; 14 orphans from Oct 4–5 were found and
+   killed, all with dead owner PIDs). Normal exit does clean up the
+   `lmux-integration-*` and `lmux-iso-*` daemons; `kill -9` strands those too.
+   The concurrent-runner socket unlink (Proven #1) is issue #38.
 
 ## Behaviour changes users may notice
 
@@ -94,8 +95,8 @@ full strength.
 3. **The Python integration suite is not in CI.** The 309 tests exist, run
    green locally, and are the only full gate. Adding them to CI is a natural
    next goal (needs the daemon + CLI built first).
-4. **The harness glob footgun** (Proven #1) — fix candidate, small, needs its
-   own RED test.
+4. **Harness defects filed as issues #37 (ptyd daemon leak per run) and
+   #38 (second runner unlinks live sockets)** — both need their own RED tests.
 
 ## Environment notes
 
