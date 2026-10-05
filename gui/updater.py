@@ -293,18 +293,68 @@ class SparkleUpdater:
 
     # ── private helpers ──────────────────────────────────────
 
+    @staticmethod
+    def _is_within(base: Path, target: Path) -> bool:
+        """True if *target* resolves inside *base*.
+
+        Uses ``Path.relative_to`` rather than a ``str.startswith`` prefix
+        test: a sibling directory that shares a name prefix
+        (``/a/.extract_x_evil`` vs base ``/a/.extract_x``) passes a
+        ``startswith`` check while being outside the tree.
+        """
+        try:
+            target.resolve().relative_to(base.resolve())
+            return True
+        except ValueError:
+            return False
+
+    @classmethod
+    def _validate_tar_members(cls, tf: tarfile.TarFile, dest: Path) -> bool:
+        """Reject any archive member that could write outside *dest*.
+
+        Covers three distinct escapes:
+
+        1. path traversal in the member name (``../``, absolute paths, and
+           prefix-sharing siblings);
+        2. symlinks/hardlinks whose *target* escapes, which would let a
+           later member be written through the link;
+        3. device/fifo entries, which have no place in an update payload.
+        """
+        for member in tf.getmembers():
+            if member.issym() or member.islnk():
+                # Link target is resolved relative to the member's own
+                # directory for relative links, and as-is for absolute.
+                if os.path.isabs(member.linkname):
+                    link_target = Path(member.linkname)
+                else:
+                    link_target = dest / member.name
+                    link_target = (link_target.parent / member.linkname)
+                if not cls._is_within(dest, link_target):
+                    log.error(
+                        "Refusing to extract %s — link target escapes (%s)",
+                        member.name,
+                        member.linkname,
+                    )
+                    return False
+                continue
+
+            if member.isdev() or member.isfifo():
+                log.error("Refusing to extract %s — special file", member.name)
+                return False
+
+            if not cls._is_within(dest, dest / member.name):
+                log.error("Refusing to extract %s — path escape", member.name)
+                return False
+        return True
+
     def _apply_tarball(self, archive: Path, install: Path) -> bool:
         tmp_extract = install.parent / f".extract_{archive.stem}"
         try:
             with tarfile.open(str(archive), "r:*") as tf:
-                # Security: reject paths that escape the target
-                for member in tf.getmembers():
-                    member_path = os.path.join(tmp_extract, member.name)
-                    if not os.path.abspath(member_path).startswith(
-                        os.path.abspath(str(tmp_extract))
-                    ):
-                        log.error("Refusing to extract %s — path escape", member.name)
-                        return False
+                # Security: reject members that escape the target, either by
+                # name or by link target.  This is the authoritative check.
+                if not self._validate_tar_members(tf, tmp_extract):
+                    return False
                 tf.extractall(str(tmp_extract))
 
             # Check for install script
