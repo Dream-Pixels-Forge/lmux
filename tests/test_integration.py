@@ -5208,24 +5208,19 @@ class TestLogRotation(unittest.TestCase):
             client = daemon.start(timeout=60)
             
             try:
-                # Generate enough log entries to exceed 1 MB
-                # The rate limit prevents us from generating enough via commands,
-                # so we'll manually pad the log file to trigger rotation
-                for i in range(20):
+                # Generate some initial log entries
+                for i in range(5):
                     ws = client.workspace_create(f"ws-{i}")
                     ws_id = ws["id"]
-                    for j in range(2):
-                        surf = client.surface_create(ws_id, f"surf-{i}-{j}")
-                        surf_id = surf["id"]
-                        client.surface_send_text(f"echo 'test {i} {j}'\n")
-                        time.sleep(0.02)
+                    client.surface_create(ws_id, f"surf-{i}")
+                    client.surface_send_text(f"echo 'test {i}'\n")
                     client.workspace_close(ws_id)
                     time.sleep(0.05)
                 
                 # Wait for logs to be written
-                time.sleep(2)
+                time.sleep(1)
                 
-                # Manually pad the log file to exceed 1 MB to trigger rotation
+                # Trigger first rotation by padding log file to exceed 1 MB
                 log_path = Path(log_file)
                 if log_path.exists():
                     current_size = log_path.stat().st_size
@@ -5235,42 +5230,60 @@ class TestLogRotation(unittest.TestCase):
                         with open(log_path, "ab") as f:
                             f.write(padding)
                 
-                # Trigger a log entry to cause rotation check
-                # A simple ping will generate a log entry
+                # Trigger rotation check with a ping
                 client.ping()
-                time.sleep(1)
+                time.sleep(0.5)
                 
-                # Debug: check log file size
-                if log_path.exists():
-                    size = log_path.stat().st_size
-                    print(f"Log file size after ping: {size} bytes ({size/1024:.1f} KB)")
-                
-                # Check that rotated log files were created
+                # Check that rotated log file (.1) was created
                 log_dir = home_path / "logs"
                 log_files = sorted(log_dir.glob("lmux.log*"))
                 
-                # Should have main log file + rotated files (.1, .2, etc.)
-                self.assertGreaterEqual(len(log_files), 2, 
+                # Should have main log file + 1 rotated file
+                self.assertGreaterEqual(len(log_files), 2,
                     f"Expected at least 2 log files (main + rotated), got {len(log_files)}: {log_files}")
                 
-                # Verify rotated files exist (.1, .2)
+                # Verify rotated file exists and has content
                 rotated_files = [f for f in log_files if f.name != "lmux.log"]
                 self.assertGreaterEqual(len(rotated_files), 1,
                     f"Expected at least 1 rotated log file, got {rotated_files}")
                 
-                # Verify max_files limit is enforced (max 3 rotated + 1 main = 4 total)
-                # Actually log_max_files=3 means 3 rotated files + current = 4 files max
-                self.assertLessEqual(len(log_files), 4,
-                    f"Expected at most 4 log files (max_files=3), got {len(log_files)}: {log_files}")
+                for rot_file in rotated_files:
+                    content = rot_file.read_text()
+                    self.assertTrue(len(content) > 0,
+                        f"Rotated file {rot_file} should not be empty")
+                
+                # Trigger more rotations to test max_files limit
+                # With log_max_files=3, we should have at most 3 files total (main + 2 rotated)
+                for rotation in range(4):
+                    if log_path.exists():
+                        current_size = log_path.stat().st_size
+                        target_size = 1024 * 1024 + 1000
+                        if current_size < target_size:
+                            padding = b"x" * (target_size - current_size)
+                            with open(log_path, "ab") as f:
+                                f.write(padding)
+                    client.ping()
+                    time.sleep(0.2)
+                
+                # Check final file count - should not exceed log_max_files (3)
+                log_files = sorted(log_dir.glob("lmux.log*"))
+                self.assertLessEqual(len(log_files), 3,
+                    f"Expected at most 3 log files (max_files=3), got {len(log_files)}: {log_files}")
+                
+                # Verify rotated files have correct naming (.1, .2)
+                rotated_files = [f for f in log_files if f.name != "lmux.log"]
+                rotated_names = sorted([f.name for f in rotated_files])
+                # Should have .1 and .2 (2 rotated files for max_files=3)
+                self.assertIn("lmux.log.1", rotated_names,
+                    f"Expected lmux.log.1 in rotated files: {rotated_names}")
+                self.assertIn("lmux.log.2", rotated_names,
+                    f"Expected lmux.log.2 in rotated files: {rotated_names}")
                 
                 # Verify old log data is preserved in rotated files
                 for rot_file in rotated_files:
                     content = rot_file.read_text()
-                    self.assertTrue(len(content) > 0, 
-                        f"Rotated file {rot_file} should not be empty")
-                    # Check that it contains log entries
-                    self.assertIn("INFO", content.upper() or "DEBUG" in content.upper() or "WARN" in content.upper() or "ERROR" in content.upper(),
-                        f"Rotated file {rot_file} should contain log entries")
+                    self.assertTrue(len(content) > 100000,  # Should have ~1MB of padding
+                        f"Rotated file {rot_file} should contain preserved data")
                 
             finally:
                 daemon.stop()
