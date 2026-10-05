@@ -56,6 +56,58 @@ typedef struct {
 static rate_limit_entry rate_limit_table[64] = {0};
 static int rate_limit_count = 0;
 
+/* Guards rate_limit_table / rate_limit_count.
+ *
+ * check_rate_limit() is reached from verify_socket_credentials(), which runs
+ * on a detached thread per accepted connection, so the lookup below is a
+ * shared read-modify-write.  Without this lock, `rate_limit_count++` can lose
+ * an update: two threads read the same value, both pass the bounds check, and
+ * both write the same slot while the counter advances only once.  That leaks
+ * a UID from the table and skews the fill count.
+ */
+static pthread_mutex_t rate_limit_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* ------------------------------------------------------------------ */
+/* Test seam                                                          */
+/*                                                                     */
+/* check_rate_limit() is static, so unit tests cannot reach it. These
+ * wrappers expose it for tests/test_server_rate_limit.c without changing
+ * production behaviour: they compile only under LMUX_TEST_RATE_LIMIT. */
+/* ------------------------------------------------------------------ */
+#ifdef LMUX_TEST_RATE_LIMIT
+
+static int check_rate_limit(uid_t uid); /* defined below; forward decl for the seam */
+
+int lmux_test_check_rate_limit(uid_t uid) {
+    return check_rate_limit(uid);
+}
+
+int lmux_test_rate_limit_count(void) {
+    return rate_limit_count;
+}
+
+int lmux_test_rate_limit_capacity(void) {
+    return (int)(sizeof rate_limit_table / sizeof rate_limit_table[0]);
+}
+
+/* Reset the table so each test starts from a known state. */
+void lmux_test_rate_limit_reset(void) {
+    memset(rate_limit_table, 0, sizeof rate_limit_table);
+    rate_limit_count = 0;
+}
+
+/* Count slots that actually hold an entry, independent of the shared
+ * index.  If the index and the contents disagree, an increment was lost. */
+int lmux_test_rate_limit_occupied(void) {
+    int n = 0;
+    for (size_t i = 0; i < sizeof rate_limit_table / sizeof rate_limit_table[0]; i++)
+        if (rate_limit_table[i].uid != 0)
+            n++;
+    return n;
+}
+
+#endif /* LMUX_TEST_RATE_LIMIT */
+
 /**
  * Check if a request from the given UID is allowed under rate limits.
  * Uses a sliding window counter approach.
@@ -65,7 +117,10 @@ static int rate_limit_count = 0;
  */
 static int check_rate_limit(uid_t uid) {
     time_t now = time(NULL);
-    
+    int result = -1;   /* fail closed unless a path allows the request */
+
+    pthread_mutex_lock(&rate_limit_lock);
+
     /* Find existing entry or create new one */
     for (int i = 0; i < rate_limit_count; i++) {
         if (rate_limit_table[i].uid == uid) {
@@ -73,31 +128,32 @@ static int check_rate_limit(uid_t uid) {
             if (now - rate_limit_table[i].window_start >= RATE_LIMIT_WINDOW_SECONDS) {
                 rate_limit_table[i].tokens = RATE_LIMIT_MAX_REQUESTS - 1;
                 rate_limit_table[i].window_start = now;
-                return 0;
-            }
-            
-            /* Check if rate limit exceeded */
-            if (rate_limit_table[i].tokens <= 0) {
-                return -1;
-            }
-            
-            rate_limit_table[i].tokens--;
-            return 0;
+                result = 0;
+            } else if (rate_limit_table[i].tokens > 0) {
+                rate_limit_table[i].tokens--;
+                result = 0;
+            } /* else: exhausted, keep result = -1 */
+            goto done;
         }
     }
-    
+
     /* Create new entry if table not full */
     if (rate_limit_count < 64) {
         rate_limit_table[rate_limit_count].uid = uid;
         rate_limit_table[rate_limit_count].tokens = RATE_LIMIT_MAX_REQUESTS - 1;
         rate_limit_table[rate_limit_count].window_start = now;
         rate_limit_count++;
-        return 0;
+        result = 0;
+        goto done;
     }
-    
+
     /* Table full, deny to prevent untracked abuse (fail closed) */
     lmux_log(LMUX_LOG_WARN, "server: rate limit table full, denying UID %u", uid);
-    return -1;
+    result = -1;
+
+done:
+    pthread_mutex_unlock(&rate_limit_lock);
+    return result;
 }
 
 /* ------------------------------------------------------------------ */

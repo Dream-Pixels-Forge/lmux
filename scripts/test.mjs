@@ -32,6 +32,7 @@ const testPrograms = [
     { name: "test_model",  sources: ["test_model.c"] },
     { name: "test_osc",    sources: ["test_osc.c"] },
     { name: "test_config", sources: ["test_config.c"] },
+    { name: "test_server_rate_limit", sources: ["test_server_rate_limit.c"] },
     { name: "test_fuzz",   sources: ["test_fuzz.c"] },
 ];
 
@@ -39,15 +40,22 @@ const testPrograms = [
 for (const t of testPrograms) {
     const binary = join(BUILD, t.name);
     const sources = t.sources.map(s => join(TESTS, s)).join(" ");
+    /* This test needs the LMUX_TEST_RATE_LIMIT seam compiled into server.c.
+     * The prebuilt static library is built without it, so recompile the one
+     * translation unit here and link it ahead of the archive. */
+    const extraSources = t.name === "test_server_rate_limit"
+        ? ["-DLMUX_TEST_RATE_LIMIT", join(ROOT, "src/core/server.c")]
+        : [];
     const cmd = [
         CC,
         "-std=c17", "-Wall", "-Wextra",
         sanitize ? "-fsanitize=address,undefined -fno-omit-frame-pointer" : "",
+        ...extraSources,
         "-I", join(ROOT, "include"),
         "-o", binary,
         sources,
         join(BUILD, "liblmux_core.a"),
-        "-lm",
+        "-lm", "-lpthread",
         sanitize ? "-fsanitize=address,undefined" : "",
     ].filter(Boolean).join(" ");
 
