@@ -155,3 +155,45 @@ jobs:
           name: lmux-deb
           path: dist/deb/*.deb
           retention-days: 30
+
+  # Root-cause fix for #31: all three of its defects (dead --build-arg, pip
+  # without network in the sandbox, wheel tags for a Python the SDK does not
+  # ship) survived because nothing ever ran flatpak-builder against this
+  # manifest — `test_ci_builds_the_flatpak_manifest` in tests/ pins that this
+  # job keeps existing.
+  flatpak:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install flatpak toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak flatpak-builder
+
+      - name: Add Flathub remote (user installation)
+        run: flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+
+      # The GNOME Platform + SDK are ~1.5 GB. The manifest is the only thing
+      # that pins the runtime version, so key on it with a fallback: a bump
+      # of runtime-version cold-starts once, everything else reuses the SDK.
+      - name: Cache GNOME runtime
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/flatpak
+          key: flatpak-${{ hashFiles('packaging/io.github.lmux.lmux.yml') }}
+          restore-keys: |
+            flatpak-
+
+      - name: Build the flatpak manifest
+        run: |
+          flatpak-builder --user --force-clean \
+            --install-deps-from=flathub \
+            --repo=build/flatpak/repo \
+            build/flatpak/build-dir \
+            packaging/io.github.lmux.lmux.yml
+
+      - name: Install and smoke-test the built flatpak
+        run: |
+          flatpak install --user build/flatpak/repo io.github.lmux.lmux -y
+          flatpak run io.github.lmux.lmux --version
