@@ -17,6 +17,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -732,12 +733,7 @@ class TestPtyDeferralOnRestore(unittest.TestCase):
                             f"restore of {n} workspaces took {elapsed:.2f}s, "
                             f"which is the un-deferred ~52ms/workspace cost")
         finally:
-            proc.kill()
-            try:
-                proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                pass
-            Path(sock).unlink(missing_ok=True)
+            _reap_strace_daemon(proc, sock)
             text = trace.read_text(errors="replace") if trace.exists() else ""
             shutil.rmtree(home, ignore_errors=True)
 
@@ -4826,12 +4822,201 @@ class TestGuiLocaleDirReadOnly(unittest.TestCase):
 
 
 
-if __name__ == "__main__":
-    # Clean up leftover test sockets
+# ====================================================================
+# Harness defects #37/#38 — teardown must not leak, startup must not kill
+# ====================================================================
+
+def _reap_strace_daemon(proc, sock):
+    """Kill an strace wrapper AND the daemon running under it (#37).
+
+    `proc` is the strace Popen handle; the real daemon is strace's child,
+    so killing strace alone orphans it. After reaping strace, kill any
+    process still serving `sock` (matched by its exact argv socket path),
+    TERM then KILL, and unlink the socket file.
+    """
+    try:
+        proc.kill()
+    except OSError:
+        pass
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        proc.wait()
+    except OSError:
+        pass
+    try:
+        out = subprocess.run(
+            ["pgrep", "-f", f"lmux.*--socket {sock}"],
+            capture_output=True, text=True, timeout=10,
+        )
+        pids = [int(p) for p in out.stdout.split() if p.strip().isdigit()]
+    except Exception:  # noqa: BLE001 - pgrep missing or no match
+        pids = []
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    deadline = time.time() + 10
+    while time.time() < deadline and pids:
+        time.sleep(0.2)
+        pids = [p for p in pids if _pid_alive(p)]
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    try:
+        Path(sock).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _pid_alive(pid):
+    """True iff pid exists and is not a zombie."""
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            state = f.read().rsplit(")", 1)[-1].split()[0]
+        return state != "Z"
+    except OSError:
+        return False
+
+
+def _socket_is_live(path):
+    """True iff something answers on the AF_UNIX socket at path."""
+    s = socket.socket(socket.AF_UNIX)
+    try:
+        s.settimeout(2)
+        s.connect(str(path))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def _cleanup_stale_integration_sockets():
+    """Unlink only DEAD /tmp/lmux-integration-*.sock files (#38).
+
+    A second runner must never delete a live runner's active socket: probe
+    first, unlink only on refusal/timeout.
+    """
     for f in Path("/tmp").glob("lmux-integration-*.sock"):
         try:
+            if _socket_is_live(f):
+                continue
             f.unlink()
         except OSError:
             pass
+
+
+class TestHarnessSocketCleanup(unittest.TestCase):
+    """#38: startup cleanup must not unlink a live runner's socket."""
+
+    def test_startup_cleanup_preserves_a_live_socket(self):
+        """T1: a live listener on a matching path survives the cleanup."""
+        sock_path = Path(f"/tmp/lmux-integration-harnessprobe-{os.getpid()}.sock")
+        sock_path.unlink(missing_ok=True)
+        listener = socket.socket(socket.AF_UNIX)
+        listener.bind(str(sock_path))
+        listener.listen(1)
+        try:
+            _cleanup_stale_integration_sockets()
+            self.assertTrue(sock_path.exists(),
+                            "cleanup deleted a LIVE socket — #38 regressed")
+            self.assertTrue(_socket_is_live(sock_path),
+                            "live socket stopped answering after cleanup")
+        finally:
+            listener.close()
+            sock_path.unlink(missing_ok=True)
+
+    def test_startup_cleanup_removes_a_dead_socket(self):
+        """Guard: a stale (no listener) socket file is still reaped."""
+        sock_path = Path(f"/tmp/lmux-integration-harnessdead-{os.getpid()}.sock")
+        listener = socket.socket(socket.AF_UNIX)
+        listener.bind(str(sock_path))
+        listener.close()  # bound then closed: file remains, nobody listens
+        self.assertTrue(sock_path.exists())
+        try:
+            _cleanup_stale_integration_sockets()
+            self.assertFalse(sock_path.exists(),
+                             "dead socket file was not reaped")
+        finally:
+            sock_path.unlink(missing_ok=True)
+
+    def test_socket_liveness_probe(self):
+        """Guard: the probe reports live vs dead correctly."""
+        live_path = Path(f"/tmp/lmux-integration-harnesslive-{os.getpid()}.sock")
+        dead_path = Path(f"/tmp/lmux-integration-harnessgone-{os.getpid()}.sock")
+        live_path.unlink(missing_ok=True)
+        dead_path.unlink(missing_ok=True)
+        listener = socket.socket(socket.AF_UNIX)
+        listener.bind(str(live_path))
+        listener.listen(1)
+        try:
+            self.assertTrue(_socket_is_live(live_path))
+            self.assertFalse(_socket_is_live(dead_path))
+        finally:
+            listener.close()
+            live_path.unlink(missing_ok=True)
+
+
+class TestHarnessPtydTeardown(unittest.TestCase):
+    """#37: the ptyd-pattern helper daemon must die with its test."""
+
+    def test_strace_pattern_daemon_is_reaped(self):
+        """T2: the traced daemon must not survive as a pid after teardown.
+
+        Mirrors test_restore_forks_no_pty exactly: daemon launched under
+        strace, teardown kills strace. Without the fix the traced daemon
+        survives as a live process (issue #37: 14 orphans) even though its
+        socket file is gone — so assert on the PID via pgrep, not on the
+        socket. _reap_strace_daemon must leave no matching pid alive.
+        """
+        sock = f"/tmp/lmux-ptyd-harness-{os.getpid()}.sock"
+        Path(sock).unlink(missing_ok=True)
+        repo_root = Path(__file__).parent.parent
+        proc = subprocess.Popen(
+            ["strace", "-f", "-c", "-e", "trace=clone,clone3,fork,vfork",
+             "-o", "/dev/null",
+             str(repo_root / "build" / "lmux"), "--socket", sock, "daemon"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        try:
+            client = None
+            deadline = time.time() + 30
+            while time.time() < deadline and client is None:
+                time.sleep(0.25)
+                try:
+                    client = LmuxClient(sock)
+                except Exception:  # noqa: BLE001 - not up yet
+                    client = None
+            self.assertIsNotNone(client, "daemon did not come up")
+            self.assertTrue(LmuxClient(sock, timeout=5.0).send("ping", {}).get("ok"))
+        finally:
+            _reap_strace_daemon(proc, sock)
+        time.sleep(1)
+        out = subprocess.run(
+            ["pgrep", "-f", f"lmux.*--socket {sock}"],
+            capture_output=True, text=True, timeout=10,
+        )
+        survivors = [p for p in out.stdout.split()
+                     if p.strip().isdigit() and _pid_alive(int(p))]
+        self.assertEqual(survivors, [],
+                         f"daemon survived its teardown as pid(s) {survivors} — #37 regressed")
+
+
+if __name__ == "__main__":
+    # Clean up leftover test sockets — only the dead ones (#38): never
+    # unlink a socket that still answers, it may belong to a live runner.
+    _cleanup_stale_integration_sockets()
 
     unittest.main(verbosity=2)
