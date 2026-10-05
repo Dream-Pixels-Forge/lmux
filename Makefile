@@ -120,7 +120,7 @@ install-deb: deb
 
 # ── Install / Uninstall ──────────────────────────────────────────────────────
 
-install: build
+install: build install-systemd
 	@echo "==> Installing lmux v$(VERSION) to $(DESTDIR)$(PREFIX)"
 	install -d $(DESTDIR)$(BINDIR)
 	install -m 755 build/lmux $(DESTDIR)$(BINDIR)/lmux
@@ -132,7 +132,7 @@ install: build
 	find $(DESTDIR)$(LIBDIR)/gui -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true
 	@echo "✓ Installed to $(DESTDIR)$(PREFIX)"
 
-uninstall:
+uninstall: uninstall-systemd
 	@echo "==> Removing lmux from $(DESTDIR)$(PREFIX)"
 	rm -f  $(DESTDIR)$(BINDIR)/lmux
 	rm -rf $(DESTDIR)$(LIBDIR)
@@ -169,6 +169,20 @@ man:
 		echo "  Neither lowdown nor pandoc found, skipping man page generation"; }
 	@echo "✓ Man page: dist/man/lmux.1"
 
+# Install systemd user units
+install-systemd:
+	@echo "==> Installing systemd user units..."
+	install -d $(DESTDIR)/usr/lib/systemd/user
+	install -m 644 packaging/systemd/lmux.service $(DESTDIR)/usr/lib/systemd/user/lmux.service
+	install -m 644 packaging/systemd/lmux.socket $(DESTDIR)/usr/lib/systemd/user/lmux.socket
+	@echo "✓ Systemd units installed to $(DESTDIR)/usr/lib/systemd/user/"
+
+uninstall-systemd:
+	@echo "==> Removing systemd user units..."
+	rm -f $(DESTDIR)/usr/lib/systemd/user/lmux.service
+	rm -f $(DESTDIR)/usr/lib/systemd/user/lmux.socket
+	@echo "✓ Systemd units removed"
+
 # =============================================================================
 # Help
 # =============================================================================
@@ -200,6 +214,8 @@ help:
 	@echo "  all-packages      Build deb + appimage + flatpak"
 	@echo "  install           Install to $(PREFIX) (may need sudo)"
 	@echo "  uninstall         Remove from $(PREFIX)"
+	@echo "  install-systemd   Install systemd user units"
+	@echo "  uninstall-systemd Remove systemd user units"
 	@echo ""
 	@echo "Distribution:"
 	@echo "  dist              Collect all artifacts into dist/"

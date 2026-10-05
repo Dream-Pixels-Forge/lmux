@@ -1,0 +1,30 @@
+[Unit]
+Description=lmux terminal multiplexer daemon
+Documentation=man:lmux(1)
+After=network.target
+ConditionPathExists=%t/lmux.sock
+
+[Service]
+Type=notify
+ExecStart=/usr/bin/lmux daemon
+Restart=on-failure
+RestartSec=2
+KillMode=mixed
+TimeoutStopSec=10
+# Security hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=default.target

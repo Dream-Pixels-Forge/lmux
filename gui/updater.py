@@ -59,6 +59,23 @@ def _parse_version(v: str) -> tuple[int, ...]:
         return (0, 0, 0)
 
 
+def compare_versions(a: str, b: str) -> int:
+    """Compare two version strings.
+    
+    Returns:
+        1 if a > b (a is newer)
+        0 if a == b
+        -1 if a < b (a is older)
+    """
+    va = _parse_version(a)
+    vb = _parse_version(b)
+    if va > vb:
+        return 1
+    elif va < vb:
+        return -1
+    return 0
+
+
 # ── Data model ───────────────────────────────────────────────
 
 @dataclasses.dataclass(frozen=True)

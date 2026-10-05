@@ -60,6 +60,11 @@ void lmux_log(lmux_log_level level, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));
 void lmux_log_request(const char *request_id, const char *cmd, bool ok, const char *detail);
 
+/* Log file management (open/close/rotate) */
+void lmux_log_open_file(const char *path, int max_size_mb, int max_files, int log_level, bool log_json);
+
+
+
 /* ------------------------------------------------------------------ */
 /* Opaque handles                                                      */
 /* ------------------------------------------------------------------ */
@@ -460,7 +465,20 @@ typedef struct {
     lmux_config_vec workspace_groups;  /* lmux_workspace_group* items */
     char default_shell[256];
     char agent_paths[5][512];  /* claude-code, opencode, codex, aider, goose */
+
+    /* Logging configuration */
+    int  log_level;                /* 0=DEBUG, 1=INFO, 2=WARN, 3=ERROR */
+    char log_file[512];            /* Path to log file (empty = stdout only) */
+    int  log_max_size_mb;          /* Max log file size in MB before rotation */
+    int  log_max_files;            /* Max number of rotated log files to keep */
+    bool log_json;                 /* Output logs as JSON (vs plain text) */
 } lmux_config;
+
+/* Get app config (for CLI access to config) */
+const lmux_config *lmux_app_config(const lmux_app *app);
+
+/* Check if daemon should exit (for health.ready) */
+bool lmux_daemon_should_exit(void);
 
 lmux_config *lmux_config_new(void);
 void         lmux_config_free(lmux_config *cfg);

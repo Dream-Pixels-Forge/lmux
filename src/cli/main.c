@@ -31,6 +31,40 @@
 #include <fcntl.h>
 #include <sys/wait.h>
 
+/* systemd notify support (optional, no hard dependency) */
+#include <sys/types.h>
+#include <sys/stat.h>
+
+/* ------------------------------------------------------------------ */
+/* systemd sd_notify implementation (no libsystemd dependency)        */
+/* ------------------------------------------------------------------ */
+
+static void sd_notify_ready(void) {
+    const char *notify_socket = getenv("NOTIFY_SOCKET");
+    if (!notify_socket || !notify_socket[0]) {
+        return; /* Not running under systemd */
+    }
+
+    int fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) {
+        return;
+    }
+
+    struct sockaddr_un addr = {0};
+    addr.sun_family = AF_UNIX;
+    /* Abstract namespace socket starts with '\0' */
+    if (notify_socket[0] == '@') {
+        addr.sun_path[0] = '\0';
+        strncpy(addr.sun_path + 1, notify_socket + 1, sizeof(addr.sun_path) - 2);
+    } else {
+        strncpy(addr.sun_path, notify_socket, sizeof(addr.sun_path) - 1);
+    }
+
+    const char *msg = "READY=1\nSTATUS=lmux daemon ready";
+    sendto(fd, msg, strlen(msg), 0, (struct sockaddr *)&addr, sizeof(addr));
+    close(fd);
+}
+
 /* Suppress format-truncation warnings in tmux translation functions.
  * The buffers are sized appropriately; GCC can't prove it at compile time. */
 #pragma GCC diagnostic push
@@ -40,7 +74,7 @@
 /* Graceful shutdown for daemon mode                                    */
 /* ------------------------------------------------------------------ */
 
-static volatile sig_atomic_t daemon_should_exit = 0;
+extern volatile sig_atomic_t daemon_should_exit;
 static lmux_app *daemon_app_global = NULL;
 
 /* Async-signal-safe SIGCHLD handler: reap terminated children immediately. */
@@ -570,6 +604,23 @@ static char *build_json_command(int argc, char **argv) {
             if (argc >= 3) {
                 args_len += snprintf(args_buf + args_len, sizeof args_buf - args_len, ",\"workspace_id\":\"%s\"", (json_escape(argv[2], _esc, sizeof _esc), _esc));
             }
+        }
+    }
+    /* logs [--follow] [--level <level>] */
+    else if (strcmp(cmd, "logs") == 0) {
+        bool follow = false;
+        const char *level = NULL;
+        for (int i = 1; i < argc; i++) {
+            if (strcmp(argv[i], "--follow") == 0 || strcmp(argv[i], "-f") == 0) {
+                follow = true;
+            } else if (strcmp(argv[i], "--level") == 0 && i + 1 < argc) {
+                level = argv[++i];
+            }
+        }
+        if (follow) args_len = snprintf(args_buf, sizeof args_buf, "\"follow\":true");
+        if (level) {
+            if (follow) args_len += snprintf(args_buf + args_len, sizeof args_buf - args_len, ",");
+            args_len += snprintf(args_buf + args_len, sizeof args_buf - args_len, "\"level\":\"%s\"", (json_escape(level, _esc, sizeof _esc), _esc));
         }
     }
     /* capabilities */
@@ -1283,7 +1334,8 @@ static void print_usage(void) {
     printf("  capabilities                       Print server capabilities\n");
     printf("  health.live                        Check if daemon is alive\n");
     printf("  health.ready                       Check if daemon is ready\n");
-    printf("  metrics                            Show server metrics\n\n");
+    printf("  metrics                            Show server metrics\n");
+    printf("  logs [--follow] [--level <level>]  View daemon logs (follow like tail -f)\n\n");
     printf("Tmux compatibility:\n");
     printf("  lmux tmux new-session [-s name]    Create a new workspace\n");
     printf("  lmux tmux kill-session [-t name]   Close a workspace\n");
@@ -1394,6 +1446,13 @@ int main(int argc, char **argv) {
             fprintf(stderr, "lmux: failed to create app\n");
             return 1;
         }
+        /* Initialize logging from config */
+        const lmux_config *cfg = lmux_app_config(app);
+        if (cfg) {
+            lmux_log_open_file(cfg->log_file, cfg->log_max_size_mb,
+                          cfg->log_max_files, cfg->log_level, cfg->log_json);
+            lmux_log_set_level(cfg->log_level);
+        }
         /* Set up signal handlers for graceful shutdown */
         struct sigaction sa;
         memset(&sa, 0, sizeof sa);
@@ -1429,6 +1488,8 @@ int main(int argc, char **argv) {
         }
         printf("lmux daemon ready. PID=%d\n", getpid());
         fflush(stdout);
+        /* Notify systemd that we're ready (if running under systemd). */
+        sd_notify_ready();
         /* Main loop: check both app state and async exit flag. */
         while (lmux_app_is_running(app) && !daemon_should_exit) {
             lmux_app_tick(app);

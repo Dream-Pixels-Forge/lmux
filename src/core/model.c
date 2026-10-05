@@ -23,6 +23,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
+#include <ctype.h>
 
 #include <unistd.h>
 #include <sys/types.h>
@@ -968,15 +969,123 @@ void lmux_app_free(lmux_app *a) {
 /* Global log level shared by all apps in process. */
 static lmux_log_level g_log_level = LMUX_LOG_INFO;
 
-/* JSON logging mode: enabled via LMUX_LOG_JSON=1 environment variable. */
+/* JSON logging mode: enabled via LMUX_LOG_JSON=1 environment variable or config. */
 static int g_log_json = -1;  /* -1 = not checked yet */
 
+/* Log file state (per-process, not per-app since logging is global) */
+static FILE *g_log_file_fp = NULL;
+static char g_log_file_path[512] = {0};
+static int g_log_max_size_mb = 10;
+static int g_log_max_files = 5;
+static bool g_log_json_config = false;
+static int g_log_level_config = LMUX_LOG_INFO;
+
+/* Daemon shutdown flag (shared with main.c via extern) */
+volatile sig_atomic_t daemon_should_exit = 0;
+
+/* Accessor for daemon_should_exit (used by health.ready) */
+bool lmux_daemon_should_exit(void) {
+    return daemon_should_exit;
+}
+
+/* Check if JSON logging is enabled (env var or config) */
 static int log_json_enabled(void) {
     if (g_log_json < 0) {
         const char *val = getenv("LMUX_LOG_JSON");
         g_log_json = (val && (strcmp(val, "1") == 0 || strcmp(val, "true") == 0)) ? 1 : 0;
     }
-    return g_log_json;
+    return g_log_json || g_log_json_config;
+}
+
+/* Extract log level from a log line (JSON or legacy format).
+ * Returns: 0=debug, 1=info, 2=warn, 3=error, -1=unknown */
+static int log_line_get_level(const char *line) {
+    /* JSON format: {"timestamp":"...","level":"debug","message":"...","service":"lmux"} */
+    const char *level_key = strstr(line, "\"level\":\"");
+    if (level_key) {
+        level_key += 9;  /* skip "\"level\":\"" */
+        if (strncmp(level_key, "debug", 5) == 0) return 0;
+        if (strncmp(level_key, "info", 4) == 0) return 1;
+        if (strncmp(level_key, "warn", 4) == 0) return 2;
+        if (strncmp(level_key, "error", 5) == 0) return 3;
+    }
+    /* Legacy format: [lmux DEBUG] message */
+    const char *bracket = strstr(line, "[lmux ");
+    if (bracket) {
+        bracket += 6;  /* skip "[lmux " */
+        if (strncmp(bracket, "DEBUG", 5) == 0) return 0;
+        if (strncmp(bracket, "INFO ", 5) == 0) return 1;
+        if (strncmp(bracket, "WARN ", 5) == 0) return 2;
+        if (strncmp(bracket, "ERROR", 5) == 0) return 3;
+    }
+    return -1;  /* Unknown level, treat as debug (include all) */
+}
+
+/* Check if log file rotation is needed and rotate if necessary */
+static void log_check_rotation(void) {
+    if (!g_log_file_fp || g_log_file_path[0] == '\0') {
+        return;
+    }
+
+    struct stat st;
+    if (fstat(fileno(g_log_file_fp), &st) != 0) {
+        return;
+    }
+
+    off_t max_size = (off_t)g_log_max_size_mb * 1024 * 1024;
+    if (st.st_size < max_size) {
+        return;
+    }
+
+    /* Rotate log files */
+    for (int i = g_log_max_files - 1; i >= 1; i--) {
+        char old_path[1024], new_path[1024];
+        if (i == 1) {
+            snprintf(old_path, sizeof old_path, "%s", g_log_file_path);
+        } else {
+            snprintf(old_path, sizeof old_path, "%s.%d", g_log_file_path, i - 1);
+        }
+        snprintf(new_path, sizeof new_path, "%s.%d", g_log_file_path, i);
+        rename(old_path, new_path);
+    }
+
+    /* Reopen log file */
+    fclose(g_log_file_fp);
+    g_log_file_fp = fopen(g_log_file_path, "a");
+}
+
+/* Open log file if configured */
+static void log_open_file(const char *path, int max_size_mb, int max_files, int log_level, bool log_json) {
+    if (g_log_file_fp) {
+        fclose(g_log_file_fp);
+        g_log_file_fp = NULL;
+    }
+
+    if (!path || path[0] == '\0') {
+        return;  /* No log file configured */
+    }
+
+    strncpy(g_log_file_path, path, sizeof g_log_file_path - 1);
+    g_log_file_path[sizeof g_log_file_path - 1] = '\0';
+    g_log_max_size_mb = max_size_mb > 0 ? max_size_mb : 10;
+    g_log_max_files = max_files > 0 ? max_files : 5;
+    g_log_json_config = log_json;
+    g_log_level_config = log_level;
+
+    g_log_file_fp = fopen(g_log_file_path, "a");
+    if (!g_log_file_fp) {
+        fprintf(stderr, "[lmux WARN] Failed to open log file %s: %s\n", path, strerror(errno));
+    }
+}
+
+/* Public API wrapper for log_open_file */
+void lmux_log_open_file(const char *path, int max_size_mb, int max_files, int log_level, bool log_json) {
+    log_open_file(path, max_size_mb, max_files, log_level, log_json);
+}
+
+/* Get app config (for CLI access to config) */
+const lmux_config *lmux_app_config(const lmux_app *app) {
+    return app ? app->config : NULL;
 }
 
 /* Escape a string for safe inclusion in a JSON string value.
@@ -1005,40 +1114,60 @@ void lmux_log_set_level(lmux_log_level level) {
 }
 
 void lmux_log(lmux_log_level level, const char *fmt, ...) {
-    if (level < g_log_level) return;
+    if (level < g_log_level && level < g_log_level_config) return;
+
+    /* Check rotation before logging */
+    log_check_rotation();
+
     static const char *names[] = {"DEBUG", "INFO ", "WARN ", "ERROR"};
     static const char *json_levels[] = {"debug", "info", "warn", "error"};
 
-    if (log_json_enabled()) {
-        /* JSON structured log: {"timestamp":"...","level":"...","message":"...","service":"lmux"} */
+    /* Format the message into a buffer */
+    char msg_buf[4096];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg_buf, sizeof msg_buf, fmt, ap);
+    va_end(ap);
+
+    /* Check if JSON logging is enabled */
+    bool json_mode = log_json_enabled();
+
+    /* Build JSON log entry */
+    if (json_mode) {
         time_t now = time(NULL);
         struct tm tm_buf;
         struct tm *tm = localtime_r(&now, &tm_buf);
         char timestamp[32];
         strftime(timestamp, sizeof timestamp, "%Y-%m-%dT%H:%M:%S", tm);
 
-        /* Format the message into a buffer */
-        char msg_buf[4096];
-        va_list ap;
-        va_start(ap, fmt);
-        vsnprintf(msg_buf, sizeof msg_buf, fmt, ap);
-        va_end(ap);
-
         /* Escape the message for JSON */
         char escaped[8192];
         log_json_escape(msg_buf, escaped, sizeof escaped);
 
-        fprintf(stderr,
-            "{\"timestamp\":\"%s\",\"level\":\"%s\",\"message\":\"%s\",\"service\":\"lmux\"}\n",
+        const char *json_line = NULL;
+        static char json_buf[16384];
+        snprintf(json_buf, sizeof json_buf,
+            "{\"timestamp\":\"%s\",\"level\":\"%s\",\"message\":\"%s\",\"service\":\"lmux\"}",
             timestamp, json_levels[level], escaped);
+        json_line = json_buf;
+
+        /* Write to stderr (systemd journal) */
+        fprintf(stderr, "%s\n", json_line);
+
+        /* Write to log file if configured */
+        if (g_log_file_fp) {
+            fprintf(g_log_file_fp, "%s\n", json_line);
+            fflush(g_log_file_fp);
+        }
     } else {
-        /* Legacy plain-text format */
-        fprintf(stderr, "[lmux %s] ", names[level]);
-        va_list ap;
-        va_start(ap, fmt);
-        vfprintf(stderr, fmt, ap);
-        va_end(ap);
-        fputc('\n', stderr);
+        /* Legacy plain-text format to stderr */
+        fprintf(stderr, "[lmux %s] %s\n", names[level], msg_buf);
+
+        /* Write to log file if configured */
+        if (g_log_file_fp) {
+            fprintf(g_log_file_fp, "[lmux %s] %s\n", names[level], msg_buf);
+            fflush(g_log_file_fp);
+        }
     }
 }
 
@@ -1050,8 +1179,16 @@ void lmux_log(lmux_log_level level, const char *fmt, ...) {
  * @param ok          Whether the request succeeded.
  * @param detail      Optional detail message (can be NULL).
  */
+/**
+ * Log a request/response with a correlation ID for distributed tracing.
+ *
+ * @param request_id  Unique ID for this request (e.g., "req-12345").
+ * @param cmd         The command name (e.g., "workspace.create").
+ * @param ok          Whether the request succeeded.
+ * @param detail      Optional detail message (can be NULL).
+ */
 void lmux_log_request(const char *request_id, const char *cmd, bool ok, const char *detail) {
-    if (g_log_level > LMUX_LOG_INFO) return;
+    if (g_log_level > LMUX_LOG_INFO && g_log_level_config > LMUX_LOG_INFO) return;
 
     if (log_json_enabled()) {
         time_t now = time(NULL);
@@ -1064,23 +1201,42 @@ void lmux_log_request(const char *request_id, const char *cmd, bool ok, const ch
         log_json_escape(cmd ? cmd : "", cmd_escaped, sizeof cmd_escaped);
         log_json_escape(detail ? detail : "", detail_escaped, sizeof detail_escaped);
 
-        fprintf(stderr,
+        char json_line[4096];
+        snprintf(json_line, sizeof json_line,
             "{\"timestamp\":\"%s\",\"level\":\"info\",\"service\":\"lmux\","
-            "\"trace_id\":\"%s\",\"cmd\":\"%s\",\"ok\":%s",
+            "\"trace_id\":\"%s\",\"cmd\":\"%s\",\"ok\":%s}",
             timestamp, request_id ? request_id : "null", cmd_escaped,
             ok ? "true" : "false");
         if (detail && detail[0]) {
-            fprintf(stderr, ",\"detail\":\"%s\"", detail_escaped);
+            strncat(json_line, ",\"detail\":\"", sizeof json_line - strlen(json_line) - 1);
+            strncat(json_line, detail_escaped, sizeof json_line - strlen(json_line) - 1);
+            strncat(json_line, "\"", sizeof json_line - strlen(json_line) - 1);
         }
-        fprintf(stderr, "}\n");
+        strncat(json_line, "}", sizeof json_line - strlen(json_line) - 1);
+
+        /* Write to stderr (systemd journal) */
+        fprintf(stderr, "%s\n", json_line);
+
+        /* Write to log file if configured */
+        if (g_log_file_fp) {
+            fprintf(g_log_file_fp, "%s\n", json_line);
+            fflush(g_log_file_fp);
+        }
     } else {
         /* Legacy format */
         fprintf(stderr, "[lmux INFO ] %s: %s %s\n",
                 request_id ? request_id : "-", cmd ? cmd : "-",
                 ok ? "OK" : "FAIL");
+
+        /* Write to log file if configured */
+        if (g_log_file_fp) {
+            fprintf(g_log_file_fp, "[lmux INFO ] %s: %s %s\n",
+                    request_id ? request_id : "-", cmd ? cmd : "-",
+                    ok ? "OK" : "FAIL");
+            fflush(g_log_file_fp);
+        }
     }
 }
-
 void lmux_app_quit(lmux_app *a, int code) {
     /* Auto-save session before quitting */
     if (a && a->auto_save_path[0]) {
@@ -3956,14 +4112,40 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
 
     /* --- health.ready --- All dependencies healthy. */
     if (strcmp(cmd, "health.ready") == 0) {
-        /* Check: app running, workspaces accessible, server listening. */
-        bool ready = app->running && app->listen_fd >= 0;
+        /* Check: app running, workspaces accessible, server listening,
+         * model not locked (rwlock), not shutting down. */
+        bool rwlock_free = pthread_rwlock_tryrdlock(&app->rw_lock) == 0;
+        if (rwlock_free) pthread_rwlock_unlock(&app->rw_lock);
+
+        bool ready = app->running
+                     && app->listen_fd >= 0
+                     && !lmux_daemon_should_exit()
+                     && rwlock_free
+                     && app->workspaces.len > 0;
+
+        /* Sum surfaces across all workspaces */
+        size_t total_surfaces = 0;
+        for (size_t i = 0; i < app->workspaces.len; i++) {
+            lmux_workspace *ws = app->workspaces.items[i];
+            total_surfaces += ws->surfaces.len;
+        }
+
+        const char *reason = "ready";
+        if (!app->running) reason = "app_not_running";
+        else if (app->listen_fd < 0) reason = "server_not_listening";
+        else if (lmux_daemon_should_exit()) reason = "shutting_down";
+        else if (!rwlock_free) reason = "model_locked";
+        else if (app->workspaces.len == 0) reason = "no_workspaces";
+
         written = snprintf(result, result_cap,
-            "{\"ok\":%s,\"result\":{\"status\":\"%s\",\"workspaces\":%zu,\"surfaces\":%zu}}",
+            "{\"ok\":%s,\"result\":{\"status\":\"%s\",\"reason\":\"%s\","
+            "\"workspaces\":%zu,\"surfaces\":%zu,\"uptime_seconds\":%ld}}",
             ready ? "true" : "false",
             ready ? "ready" : "not_ready",
+            reason,
             app->workspaces.len,
-            (size_t)0);  /* surface count summed below if needed */
+            total_surfaces,
+            (long)(time(NULL) - app->start_time));
         goto done;
     }
 
@@ -3981,6 +4163,95 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         goto done;
     }
 
+    /* --- logs --- View daemon logs */
+    if (strcmp(cmd, "logs") == 0) {
+        bool follow = false;
+        char level[64] = {0};
+        json_extract_bool(args_json, "follow", &follow);
+        json_extract_string(args_json, "level", level, sizeof level);
+
+        /* Parse requested log level filter */
+        int filter_level = -1;  /* -1 means no filter (show all) */
+        if (level[0]) {
+            char lvl_lower[64];
+            for (size_t i = 0; i < sizeof lvl_lower - 1 && level[i]; i++) {
+                lvl_lower[i] = tolower((unsigned char)level[i]);
+            }
+            lvl_lower[sizeof lvl_lower - 1] = '\0';
+            if (strcmp(lvl_lower, "debug") == 0) filter_level = 0;
+            else if (strcmp(lvl_lower, "info") == 0) filter_level = 1;
+            else if (strcmp(lvl_lower, "warn") == 0) filter_level = 2;
+            else if (strcmp(lvl_lower, "error") == 0) filter_level = 3;
+            else {
+                written = snprintf(result, result_cap,
+                    "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"invalid log level\"}}");
+                goto done;
+            }
+        }
+
+        /* For now, just return recent log entries from the log file if configured */
+        /* In a full implementation, this would stream logs if follow=true */
+        const char *log_path = app->config ? app->config->log_file : "";
+        if (!log_path || log_path[0] == '\0') {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"no_log_file\",\"message\":\"No log file configured\"}}");
+            goto done;
+        }
+
+        FILE *f = fopen(log_path, "r");
+        if (!f) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"log_file_not_found\",\"message\":\"Log file not found\"}}");
+            goto done;
+        }
+
+        /* Read all lines and filter by level */
+        char **lines = NULL;
+        size_t line_count = 0, line_cap = 100;
+        lines = malloc(line_cap * sizeof(char *));
+        char line[4096];
+        while (fgets(line, sizeof line, f)) {
+            int line_level = log_line_get_level(line);
+            /* Apply filter: if filter_level >= 0, only include lines with level >= filter_level */
+            if (filter_level >= 0 && line_level >= 0 && line_level < filter_level) {
+                continue;  /* Skip this line */
+            }
+            if (line_count == line_cap) {
+                line_cap *= 2;
+                lines = realloc(lines, line_cap * sizeof(char *));
+            }
+            line[strcspn(line, "\n")] = 0;
+            lines[line_count++] = strdup(line);
+        }
+        fclose(f);
+
+        /* Build JSON response with last 100 lines (after filtering) */
+        size_t start = (line_count > 100) ? line_count - 100 : 0;
+        char *json = malloc(8192);
+        size_t json_len = snprintf(json, 8192,
+            "{\"ok\":true,\"result\":{\"follow\":%s,\"lines\":[",
+            follow ? "true" : "false");
+
+        for (size_t i = start; i < line_count; i++) {
+            char escaped[4096];
+            log_json_escape(lines[i], escaped, sizeof escaped);
+            size_t needed = json_len + strlen(escaped) + 3;
+            if (needed >= 8192) break;
+            if (i > start) json[json_len++] = ',';
+            json_len += snprintf(json + json_len, 8192 - json_len, "\"%s\"", escaped);
+        }
+        json_len += snprintf(json + json_len, 8192 - json_len, "],\"total\":%zu}}", line_count);
+        if (json_len < 8192) {
+            written = snprintf(result, result_cap, "%s", json);
+        } else {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"response_too_large\"}}");
+        }
+        free(json);
+        for (size_t i = 0; i < line_count; i++) free(lines[i]);
+        free(lines);
+        goto done;
+    }
 
     /* --- clear-history --- */
     if (strcmp(cmd, "clear-history") == 0 || strcmp(cmd, "clear_history") == 0) {

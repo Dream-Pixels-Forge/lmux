@@ -293,6 +293,14 @@ class LmuxClient:
     def capabilities(self) -> dict:
         return self.assert_ok("capabilities")
 
+    def logs(self, follow: bool = False, level: Optional[str] = None) -> dict:
+        args = {}
+        if follow:
+            args["follow"] = True
+        if level:
+            args["level"] = level
+        return self.assert_ok("logs", args)
+
 
 class LmuxDaemon:
     """Manage an lmux daemon process for testing."""

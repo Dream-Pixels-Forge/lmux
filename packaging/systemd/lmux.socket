@@ -1,0 +1,13 @@
+[Unit]
+Description=lmux terminal multiplexer socket
+Documentation=man:lmux(1)
+Before=lmux.service
+
+[Socket]
+ListenStream=%t/lmux.sock
+SocketMode=0600
+SocketUser=%U
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

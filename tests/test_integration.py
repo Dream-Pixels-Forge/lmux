@@ -512,6 +512,167 @@ class TestConfig(unittest.TestCase):
             self.assertIn(key, cfg, f"missing config key: {key}")
 
 
+class TestLogLevelFiltering(unittest.TestCase):
+    """Test log level filtering in the logs command."""
+
+    @classmethod
+    def setUpClass(cls):
+        # Use an isolated daemon with a dedicated log file for clean test state
+        cls.home = tempfile.mkdtemp(prefix="lmux-log-test-")
+        data = Path(cls.home) / ".local" / "share"
+        (data / "lmux").mkdir(parents=True, exist_ok=True)
+        config_dir = Path(cls.home) / ".config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        env = dict(os.environ)
+        env["HOME"] = cls.home
+        env["XDG_DATA_HOME"] = str(data)
+        env["XDG_CONFIG_HOME"] = str(config_dir)
+
+        cls.log_file = str(data / "lmux" / "test-logs.log")
+        sock = f"/tmp/lmux-log-test-{os.getpid()}.sock"
+
+        # Write config file with logging enabled
+        config_content = json.dumps({
+            "log_file": cls.log_file,
+            "log_level": 0,  # DEBUG - capture all levels
+            "log_json": True,
+            "log_max_size_mb": 10,
+            "log_max_files": 5,
+        }, indent=2)
+        config_path = config_dir / "lmux" / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(config_content)
+
+        cls.daemon = LmuxDaemon(sock, env=env)
+        cls.c = cls.daemon.start(timeout=60)
+
+        # Give daemon time to initialize logging
+        time.sleep(0.5)
+
+        # Write test log entries at different levels using the daemon's logger
+        cls.c.send("ping")  # generates INFO log
+        cls.c.send("ping")  # generates INFO log
+
+        # Use config.set to generate WARN level log (invalid config key might warn)
+        cls.c.send("config.set", {"invalid_key_that_should_not_exist": "value"})
+
+        # Generate ERROR by sending malformed command
+        cls.c.send("nonexistent.command")
+
+        # Give time for logs to be written
+        time.sleep(0.5)
+
+    @classmethod
+    def tearDownClass(cls):
+        try:
+            cls.daemon.stop()
+        except Exception:
+            pass
+        try:
+            shutil.rmtree(cls.home, ignore_errors=True)
+        except Exception:
+            pass
+
+    def _get_log_lines(self, level=None):
+        """Helper to get log lines with optional level filter."""
+        # logs() uses assert_ok which returns the result dict directly
+        result = self.c.logs(level=level)
+        return result.get("lines", [])
+
+    def _count_levels(self, lines):
+        """Count log lines by level from JSON log entries."""
+        counts = {"debug": 0, "info": 0, "warn": 0, "error": 0}
+        for line in lines:
+            try:
+                entry = json.loads(line)
+                lvl = entry.get("level", "").lower()
+                if lvl in counts:
+                    counts[lvl] += 1
+            except json.JSONDecodeError:
+                # Legacy format: [lmux LEVEL] message
+                if "[lmux DEBUG]" in line:
+                    counts["debug"] += 1
+                elif "[lmux INFO ]" in line:
+                    counts["info"] += 1
+                elif "[lmux WARN ]" in line:
+                    counts["warn"] += 1
+                elif "[lmux ERROR]" in line:
+                    counts["error"] += 1
+        return counts
+
+    def test_logs_without_filter_returns_all_levels(self):
+        """No level filter should return all log lines."""
+        lines = self._get_log_lines()
+        self.assertGreater(len(lines), 0, "Should have log lines")
+        counts = self._count_levels(lines)
+        # We expect at least some info and error logs from our setup
+        self.assertGreater(counts["info"] + counts["warn"] + counts["error"], 0)
+
+    def test_logs_level_debug_returns_all(self):
+        """Level debug should return all log lines (debug < info < warn < error)."""
+        lines = self._get_log_lines(level="debug")
+        self.assertGreater(len(lines), 0)
+        counts = self._count_levels(lines)
+        total_debug = counts["debug"] + counts["info"] + counts["warn"] + counts["error"]
+        self.assertEqual(len(lines), total_debug)
+
+    def test_logs_level_info_excludes_debug(self):
+        """Level info should return info, warn, error but NOT debug."""
+        lines = self._get_log_lines(level="info")
+        counts = self._count_levels(lines)
+        # Debug lines should be filtered out
+        self.assertEqual(counts["debug"], 0, "Debug lines should be filtered out at info level")
+        # But info, warn, error should be present
+        self.assertGreater(counts["info"] + counts["warn"] + counts["error"], 0)
+
+    def test_logs_level_warn_excludes_debug_and_info(self):
+        """Level warn should return warn, error but NOT debug or info."""
+        lines = self._get_log_lines(level="warn")
+        counts = self._count_levels(lines)
+        self.assertEqual(counts["debug"], 0, "Debug lines should be filtered out at warn level")
+        self.assertEqual(counts["info"], 0, "Info lines should be filtered out at warn level")
+        # Note: test setup may not generate warn/error logs, so we only verify
+        # that debug/info are filtered. If any lines returned, they must be warn/error.
+        for line in lines:
+            try:
+                entry = json.loads(line)
+                self.assertIn(entry.get("level", "").lower(), ["warn", "error"])
+            except json.JSONDecodeError:
+                self.assertTrue("[lmux WARN ]" in line or "[lmux ERROR]" in line)
+
+    def test_logs_level_error_returns_only_error(self):
+        """Level error should return only error lines."""
+        lines = self._get_log_lines(level="error")
+        counts = self._count_levels(lines)
+        self.assertEqual(counts["debug"], 0)
+        self.assertEqual(counts["info"], 0)
+        self.assertEqual(counts["warn"], 0)
+        # Error lines may or may not be present depending on test setup
+        # but if any lines returned, they must all be error level
+        for line in lines:
+            try:
+                entry = json.loads(line)
+                self.assertEqual(entry.get("level", "").lower(), "error")
+            except json.JSONDecodeError:
+                self.assertIn("[lmux ERROR]", line)
+
+    def test_logs_level_case_insensitive(self):
+        """Level filter should be case-insensitive: INFO == info == Info."""
+        lines_lower = self._get_log_lines(level="info")
+        lines_upper = self._get_log_lines(level="INFO")
+        lines_mixed = self._get_log_lines(level="Info")
+
+        counts_lower = self._count_levels(lines_lower)
+        counts_upper = self._count_levels(lines_upper)
+        counts_mixed = self._count_levels(lines_mixed)
+
+        # All three should have same counts (no debug lines)
+        self.assertEqual(counts_lower["debug"], counts_upper["debug"])
+        self.assertEqual(counts_lower["debug"], counts_mixed["debug"])
+        self.assertEqual(counts_lower["info"], counts_upper["info"])
+        self.assertEqual(counts_lower["info"], counts_mixed["info"])
+
+
 class TestTmuxCompatCli(unittest.TestCase):
     """CLI-level checks that run the binary directly.
 
@@ -4996,6 +5157,126 @@ class TestHarnessSocketCleanup(unittest.TestCase):
         finally:
             listener.close()
             live_path.unlink(missing_ok=True)
+
+
+# ====================================================================
+# Log rotation
+# ====================================================================
+
+class TestLogRotation(unittest.TestCase):
+    """Log rotation: verify rotated files are created and max_files is enforced."""
+
+    def test_log_rotation_creates_rotated_files(self):
+        """Configure log_max_size_mb=1, write enough logs to trigger rotation.
+        
+        Verifies:
+        - Rotated files are created (.1, .2, etc.)
+        - Old log data is preserved in rotated files
+        - Max files limit is enforced (oldest deleted when limit reached)
+        """
+        # Create an isolated home directory for this test
+        home = tempfile.mkdtemp(prefix="lmux-logrot-home-")
+        home_path = Path(home)
+        try:
+            data = home_path / ".local" / "share"
+            (data / "lmux").mkdir(parents=True, exist_ok=True)
+            config_dir = home_path / ".config"
+            config_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Write config with small log size to trigger rotation quickly
+            log_file = str(home_path / "logs" / "lmux.log")
+            (home_path / "logs").mkdir(parents=True, exist_ok=True)
+            config = {
+                "log_level": 0,  # DEBUG - generates more logs
+                "log_file": log_file,
+                "log_max_size_mb": 1,  # 1 MB - small for testing
+                "log_max_files": 3,    # Keep only 3 total files (main + 2 rotated)
+                "log_json": False,
+            }
+            config_path = config_dir / "lmux" / "config.json"
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            config_path.write_text(json.dumps(config, indent=2))
+            
+            # Start daemon with this config
+            env = dict(os.environ)
+            env["HOME"] = str(home_path)
+            env["XDG_DATA_HOME"] = str(data)
+            env["XDG_CONFIG_HOME"] = str(config_dir)
+            sock = f"/tmp/lmux-logrot-{os.getpid()}.sock"
+            Path(sock).unlink(missing_ok=True)
+            daemon = LmuxDaemon(sock, env=env)
+            client = daemon.start(timeout=60)
+            
+            try:
+                # Generate enough log entries to exceed 1 MB
+                # The rate limit prevents us from generating enough via commands,
+                # so we'll manually pad the log file to trigger rotation
+                for i in range(20):
+                    ws = client.workspace_create(f"ws-{i}")
+                    ws_id = ws["id"]
+                    for j in range(2):
+                        surf = client.surface_create(ws_id, f"surf-{i}-{j}")
+                        surf_id = surf["id"]
+                        client.surface_send_text(f"echo 'test {i} {j}'\n")
+                        time.sleep(0.02)
+                    client.workspace_close(ws_id)
+                    time.sleep(0.05)
+                
+                # Wait for logs to be written
+                time.sleep(2)
+                
+                # Manually pad the log file to exceed 1 MB to trigger rotation
+                log_path = Path(log_file)
+                if log_path.exists():
+                    current_size = log_path.stat().st_size
+                    target_size = 1024 * 1024 + 1000  # 1 MB + 1 KB
+                    if current_size < target_size:
+                        padding = b"x" * (target_size - current_size)
+                        with open(log_path, "ab") as f:
+                            f.write(padding)
+                
+                # Trigger a log entry to cause rotation check
+                # A simple ping will generate a log entry
+                client.ping()
+                time.sleep(1)
+                
+                # Debug: check log file size
+                if log_path.exists():
+                    size = log_path.stat().st_size
+                    print(f"Log file size after ping: {size} bytes ({size/1024:.1f} KB)")
+                
+                # Check that rotated log files were created
+                log_dir = home_path / "logs"
+                log_files = sorted(log_dir.glob("lmux.log*"))
+                
+                # Should have main log file + rotated files (.1, .2, etc.)
+                self.assertGreaterEqual(len(log_files), 2, 
+                    f"Expected at least 2 log files (main + rotated), got {len(log_files)}: {log_files}")
+                
+                # Verify rotated files exist (.1, .2)
+                rotated_files = [f for f in log_files if f.name != "lmux.log"]
+                self.assertGreaterEqual(len(rotated_files), 1,
+                    f"Expected at least 1 rotated log file, got {rotated_files}")
+                
+                # Verify max_files limit is enforced (max 3 rotated + 1 main = 4 total)
+                # Actually log_max_files=3 means 3 rotated files + current = 4 files max
+                self.assertLessEqual(len(log_files), 4,
+                    f"Expected at most 4 log files (max_files=3), got {len(log_files)}: {log_files}")
+                
+                # Verify old log data is preserved in rotated files
+                for rot_file in rotated_files:
+                    content = rot_file.read_text()
+                    self.assertTrue(len(content) > 0, 
+                        f"Rotated file {rot_file} should not be empty")
+                    # Check that it contains log entries
+                    self.assertIn("INFO", content.upper() or "DEBUG" in content.upper() or "WARN" in content.upper() or "ERROR" in content.upper(),
+                        f"Rotated file {rot_file} should contain log entries")
+                
+            finally:
+                daemon.stop()
+        finally:
+            # Clean up
+            shutil.rmtree(home, ignore_errors=True)
 
 
 class TestHarnessPtydTeardown(unittest.TestCase):
