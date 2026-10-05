@@ -1,10 +1,10 @@
 # Handoff — lmux @ master
 
 **Date:** 2026-10-05 (evening update — memorius session)
-**Branch state:** `master` @ `4a50768` (PR #39), clean, in sync with origin
+**Branch state:** `master` @ `db369af` (PR #41), clean, in sync with origin
 **Version:** 1.1.2
-**Tests:** 309 integration (306 + 3 new) + 23 model + 8 osc + 12 config unit,
-fuzz 0 errors — all re-run fresh for the goal-met audit (gate PASS, 10/10).
+**Tests:** 314 integration (311 + 3 new) + 23 model + 8 osc + 12 config unit,
+fuzz 0 errors — all re-run fresh for the goal-met audits (gate PASS, 10/10).
 Sanitizer jobs run in CI only; not re-run locally this session.
 
 ---
@@ -21,6 +21,8 @@ Merged since the previous handoff:
 | #35 | `22cf3ce` | updater rejects tar members escaping the extraction directory |
 | #36 | `f28331a` | **the flatpak-CI goal** — CI builds the manifest; `make flatpak` manifest path fixed; wrapper runtime derived from manifest; 3 new tests (goal-loop MET, 10/10) |
 | #39 | `4a50768` | handoff correction (orphan-daemon claim) + issues #37/#38 filed |
+| #40 | `44ef100` | **harness fixes #37/#38** — `test_restore_forks_no_pty` finally reaps the traced daemon; `__main__` cleanup probes sockets before unlinking (only dead ones) |
+| #41 | `db369af` | **integration suite in CI** — new `integration` job builds core+CLI and runs the 314-test suite serially (strace+zsh deps, 20-min timeout). CI's first run caught a real portability bug: R1 hardcoded 'zsh' but runners spawn bash; test fixed to assert repeatability shell-agnostically. |
 
 Previous session executed the flatpak-CI open item (spec:
 `dev-notes/GOAL_FLATPAK_CI.md`, verdict MET via goal-loop):
@@ -51,7 +53,7 @@ own documentation). Fixed by rewording the two lines; the test is untouched at
 full strength.
 
 **CI never caught it: `ci.yml` runs `node scripts/test.mjs --unit` only — the
-309-test Python suite runs solely via `make test`, locally.**
+309-test Python suite runs solely via `make test`, locally.** (Now fixed by #41.)
 
 ## Proven this session (evidence, not theory)
 
@@ -70,6 +72,22 @@ full strength.
    `lmux-integration-*` and `lmux-iso-*` daemons; `kill -9` strands those too.
    The concurrent-runner socket unlink (Proven #1) is issue #38.
 
+## Both harness defects now FIXED and merged (PR #40)
+
+- **#37:** `test_restore_forks_no_pty` finally now calls `_reap_strace_daemon(proc, sock)` — kills the strace wrapper, then TERM→KILL any pid still serving the exact socket path, then unlinks. Root cause: killing strace alone orphans the traced daemon (pid survived, socket file gone — so T2 asserts on pid via pgrep, not on the socket).
+- **#38:** `__main__` cleanup now probes each `/tmp/lmux-integration-*.sock` with an AF_UNIX connect (`_socket_is_live`) and unlinks only dead ones. Helpers: `_socket_is_live()`, `_cleanup_stale_integration_sockets()`.
+
+Evidence: mutation-checked in a pristine worktree — MUT-T1 and MUT-T2 both reproduced on master, both pass on branch. Full suite serially: **313 tests OK (309 + 4)**, unit+fuzz pass, zero `lmux-ptyd` strays. Issues #37, #38 auto-closed.
+
+## Integration suite now runs in CI (PR #41)
+
+- New `integration` job in `.github/workflows/ci.yml`: builds core+CLI, installs `strace` + `zsh`, runs `python3 tests/test_integration.py` serially (20-min timeout). No matrix — shared-socket assumptions + Proven #1 require serial runs.
+- T1 `test_ci_runs_the_integration_suite` pins the job the same way `test_ci_builds_the_flatpak_manifest` pins the flatpak job.
+- CI first run caught a **real portability defect**: R1 `test_repeated_read_screen_keeps_returning_content` asserted `'zsh'` in capture text, but GitHub runners spawn `$SHELL` (bash). Fixed test-only to assert repeatability shell-agnostically (`second` retains `first`'s content). Verified locally under zsh (3 OK) and `SHELL=/bin/bash` (1 OK).
+- Re-run: **`integration` PASS** — 314 tests OK in ~31s on the runner.
+
+**All 8 CI checks green at merge.** The only full gate (314-test suite) now runs on every PR and push to master.
+
 ## Behaviour changes users may notice
 
 - `make flatpak` now actually builds (it referenced a nonexistent manifest
@@ -77,6 +95,7 @@ full strength.
 - `packaging/flatpak-wrapper.sh` installs whatever runtime the manifest
   declares instead of a hardcoded one.
 - CI has a new `flatpak` job; PRs now build and smoke-test the flatpak.
+- **CI now runs the full Python integration suite (314 tests) on every PR and push** — the only full gate is no longer local-only.
 
 ## Practices now enforced
 
@@ -87,20 +106,12 @@ full strength.
   trap).
 - `goal-loop` after every goal: `goal-writer` → execute (TDD) → `goal-met`.
 
-## Open items
+## Open items — NONE
 
-1. **Duplicate `flathub` remotes** (unchanged; needs sudo → owner decision):
-   `sudo apt install flatpak-builder`, then `flatpak uninstall --user
-   --unused`, `flatpak uninstall --user org.flatpak.Builder`,
-   `flatpak remote-delete --user flathub`.
-2. **The Python integration suite is not in CI.** The 309 tests exist, run
-   green locally, and are the only full gate. Adding them to CI is a natural
-   next goal (needs the daemon + CLI built first).
-3. **Harness defects filed as issues #37 (ptyd daemon leak per run) and
-   #38 (second runner unlinks live sockets)** — both OPEN, both need their
-   own RED tests.
-4. **No stray processes left** — verified `no_stray_processes` before writing
-   this handoff (all 14 Oct 4–5 orphans killed earlier).
+All handoff backlog items are resolved. The only remaining work is routine:
+- Periodic GNOME runtime attention (wheel tags pinned to SDK Python).
+- `snap_read_string` silent clamp (cosmetic).
+- Restored-pane PTY contract (uninvestigated; see Known gaps below).
 
 ## Environment notes
 
