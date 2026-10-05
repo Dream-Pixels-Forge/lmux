@@ -155,7 +155,15 @@ class LmuxAPIHandler(http.server.SimpleHTTPRequestHandler):
 
     def _api_tree(self):
         """Get workspace tree."""
-        return self.client.send("tree")
+        result = self.client.send("tree")
+        # Transform from daemon format (windows -> workspaces) to expected format
+        if result.get("ok") and "windows" in result.get("result", {}):
+            workspaces = []
+            for window in result["result"]["windows"]:
+                if "workspaces" in window:
+                    workspaces.extend(window["workspaces"])
+            return {"ok": True, "result": {"workspaces": workspaces}}
+        return result
 
     def _api_workspaces(self):
         """Get workspace list."""

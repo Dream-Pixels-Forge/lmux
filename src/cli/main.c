@@ -952,7 +952,59 @@ static char *build_json_command(int argc, char **argv) {
         }
     }
 
-    /* Shorthand mappings: bare command name → default subcommand */
+    
+
+    /* file_explorer.open [path] */
+    else if (strcmp(cmd, "file_explorer.open") == 0) {
+        if (argc >= 2) {
+            args_len = snprintf(args_buf, sizeof args_buf, "\"path\":\"%s\"", (json_escape(argv[1], _esc, sizeof _esc), _esc));
+        }
+    }
+    /* file_explorer.navigate <path> */
+    else if (strcmp(cmd, "file_explorer.navigate") == 0 && argc >= 2) {
+        args_len = snprintf(args_buf, sizeof args_buf, "\"path\":\"%s\"", (json_escape(argv[1], _esc, sizeof _esc), _esc));
+    }
+    /* file_explorer.list */
+    else if (strcmp(cmd, "file_explorer.list") == 0) {
+        /* no args */
+    }
+    /* file_explorer.refresh */
+    else if (strcmp(cmd, "file_explorer.refresh") == 0) {
+        /* no args */
+    }
+    /* file_explorer.filter <filter> */
+    else if (strcmp(cmd, "file_explorer.filter") == 0 && argc >= 2) {
+        args_len = snprintf(args_buf, sizeof args_buf, "\"filter\":\"%s\"", (json_escape(argv[1], _esc, sizeof _esc), _esc));
+    }
+    /* file_explorer.sort <mode> */
+    else if (strcmp(cmd, "file_explorer.sort") == 0 && argc >= 2) {
+        args_len = snprintf(args_buf, sizeof args_buf, "\"mode\":\"%s\"", (json_escape(argv[1], _esc, sizeof _esc), _esc));
+    }
+    /* file_explorer.open_file <name> */
+    else if (strcmp(cmd, "file_explorer.open_file") == 0 && argc >= 2) {
+        args_len = snprintf(args_buf, sizeof args_buf, "\"name\":\"%s\"", (json_escape(argv[1], _esc, sizeof _esc), _esc));
+    }
+    /* file_explorer.create_dir <name> */
+    else if (strcmp(cmd, "file_explorer.create_dir") == 0 && argc >= 2) {
+        args_len = snprintf(args_buf, sizeof args_buf, "\"name\":\"%s\"", (json_escape(argv[1], _esc, sizeof _esc), _esc));
+    }
+    /* file_explorer.delete <name> */
+    else if (strcmp(cmd, "file_explorer.delete") == 0 && argc >= 2) {
+        args_len = snprintf(args_buf, sizeof args_buf, "\"name\":\"%s\"", (json_escape(argv[1], _esc, sizeof _esc), _esc));
+    }
+    /* file_explorer.rename <old_name> <new_name> */
+    else if (strcmp(cmd, "file_explorer.rename") == 0 && argc >= 3) {
+        args_len = snprintf(args_buf, sizeof args_buf,
+            "\"old_name\":\"%s\",\"new_name\":\"%s\"",
+            (json_escape(argv[1], _esc, sizeof _esc), _esc),
+            (json_escape(argv[2], _esc, sizeof _esc), _esc));
+    }
+    /* file_explorer.close */
+    else if (strcmp(cmd, "file_explorer.close") == 0) {
+        /* no args */
+    }
+
+/* Shorthand mappings: bare command name → default subcommand */
     if (strcmp(cmd, "workspace") == 0) { cmd = "workspace.list"; }
     else if (strcmp(cmd, "surface") == 0) { cmd = "surface.list"; }
     else if (strcmp(cmd, "pane") == 0) { cmd = "pane.list"; }
@@ -961,6 +1013,7 @@ static char *build_json_command(int argc, char **argv) {
     else if (strcmp(cmd, "ssh") == 0) { cmd = "ssh.list"; }
     else if (strcmp(cmd, "agent") == 0) { cmd = "agent.list"; }
     else if (strcmp(cmd, "feed") == 0) { cmd = "feed.panel.list"; }
+    else if (strcmp(cmd, "file_explorer") == 0) { cmd = "file_explorer.open"; }
     else if (strcmp(cmd, "search") == 0) { cmd = "search.status"; }
     else if (strcmp(cmd, "hooks") == 0) { cmd = "hooks.list"; }
     else if (strcmp(cmd, "naming") == 0) { cmd = "naming.suggest"; }
@@ -999,6 +1052,9 @@ static char *build_json_command(int argc, char **argv) {
                strcmp(cmd, "feed.panel.create") == 0 || strcmp(cmd, "feed.panel.list") == 0 ||
                strcmp(cmd, "feed.panel.close") == 0 || strcmp(cmd, "feed.entry.add") == 0 ||
                strcmp(cmd, "feed.entry.list") == 0 || strcmp(cmd, "feed.panel.clear") == 0 ||
+               strcmp(cmd, "file_explorer.list") == 0 ||
+               strcmp(cmd, "file_explorer.refresh") == 0 ||
+               strcmp(cmd, "file_explorer.close") == 0 ||
                strcmp(cmd, "workspace.group.list") == 0 ||
                strcmp(cmd, "ssh.list") == 0 || strcmp(cmd, "ssh_list") == 0 ||
                strcmp(cmd, "hooks.list") == 0 || strcmp(cmd, "hooks_list") == 0 ||
@@ -1262,6 +1318,17 @@ static void print_usage(void) {
   printf("  session.restore                    Restore session from disk\n");
   printf("  config.get [key]                   Get config value(s)\n");
   printf("  config.set <key> <value>           Set config value\n");
+  printf("  file_explorer.open [path]          Open file explorer at path\n");
+  printf("  file_explorer.navigate <path>      Navigate to path\n");
+  printf("  file_explorer.list                 List current directory\n");
+  printf("  file_explorer.refresh              Refresh current directory\n");
+  printf("  file_explorer.filter <filter>      Filter entries (file|dir|all)\n");
+  printf("  file_explorer.sort <mode>          Sort by (name|size|time)\n");
+  printf("  file_explorer.open_file <name>     Open file in editor\n");
+  printf("  file_explorer.create_dir <name>    Create directory\n");
+  printf("  file_explorer.delete <name>        Delete file/directory\n");
+  printf("  file_explorer.rename <old> <new>   Rename file/directory\n");
+  printf("  file_explorer.close                Close file explorer\n");
   printf("  workspace.group.create <name>       Create a workspace group\n");
   printf("  workspace.group.list               List workspace groups\n");
   printf("  workspace.group.add <name> <ws_id> Add workspace to group\n");
@@ -1303,6 +1370,8 @@ static void print_usage(void) {
     printf("  browser.evaluate <js>              Execute JavaScript\n");
     printf("  browser.screenshot [path]          Capture screenshot\n");
     printf("  browser.list                       List open browsers\n");
+    printf("\nWeb dashboard:\n");
+    printf("  web [--port <port>]                Start web dashboard (default: 8080)\n");
 }
 
 static void print_version(void) {
