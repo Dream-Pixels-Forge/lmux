@@ -40,7 +40,7 @@ spent its effort removing.
 
 ### Verification Steps
 ```bash
-cd /home/dimona/Dream-Pixels-Forge/Dev/cli/lmux
+cd ~/path/to/lmux  # repo root
 make clean && node scripts/build-core.mjs
 ASAN_OPTIONS=detect_leaks=0 make test
 make test-fuzz

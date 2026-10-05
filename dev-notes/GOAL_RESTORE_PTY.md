@@ -78,7 +78,7 @@ it. That is defect **D2**.
 
 ### Verification Steps
 ```bash
-cd /home/dimona/Dream-Pixels-Forge/Dev/cli/lmux
+cd ~/path/to/lmux  # repo root
 git checkout -b fix/restore-pty-and-capture-pane master
 make clean && node scripts/build-core.mjs && node scripts/build-cli.mjs
 ASAN_OPTIONS=detect_leaks=0 make test      # serially

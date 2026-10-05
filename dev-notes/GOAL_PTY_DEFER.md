@@ -61,7 +61,7 @@ the `_ex` variants with `false`.
 
 ### Verification Steps
 ```bash
-cd /home/dimona/Dream-Pixels-Forge/Dev/cli/lmux
+cd ~/path/to/lmux  # repo root
 git checkout -b perf/defer-pty-on-restore master
 make clean && node scripts/build-core.mjs && node scripts/build-cli.mjs
 ASAN_OPTIONS=detect_leaks=0 make test      # serially

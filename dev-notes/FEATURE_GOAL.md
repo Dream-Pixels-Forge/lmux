@@ -108,7 +108,7 @@ All binary, all independently checkable:
 
 ### Verification Steps
 ```bash
-cd /home/dimona/Dream-Pixels-Forge/Dev/cli/lmux
+cd ~/path/to/lmux  # repo root
 make clean && node scripts/build-core.mjs && node scripts/build-cli.mjs
 pkill -9 lmux; sleep 1; nohup ./build/lmux daemon >/tmp/lmuxd.log 2>&1 & sleep 3
 

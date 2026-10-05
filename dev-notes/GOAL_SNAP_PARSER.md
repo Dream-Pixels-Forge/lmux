@@ -57,7 +57,7 @@ generic parser would be more code than the schema.
 
 ### Verification Steps
 ```bash
-cd /home/dimona/Dream-Pixels-Forge/Dev/cli/lmux
+cd ~/path/to/lmux  # repo root
 git checkout -b fix/snapshot-parser master
 make clean && node scripts/build-core.mjs && node scripts/build-cli.mjs
 ASAN_OPTIONS=detect_leaks=0 make test      # serially, never in parallel

@@ -2,7 +2,7 @@
 
 ## Project Overview
 - **Name:** lmux
-- **Location:** /home/dimona/Dream-Pixels-Forge/Dev/cli/lmux
+- **Location:** `<repo-root>` (lmux checkout)
 - **Type:** CLI tool with C core and Python GUI
 - **Build System:** Makefile + npm/pnpm scripts
 

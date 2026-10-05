@@ -1,7 +1,7 @@
 # P2 Features Implementation Context
 
 ## Project: lmux
-- Path: `/home/dimona/Dream-Pixels-Forge/Dev/cli/lmux/`
+- Path: `<repo-root>` (lmux checkout)
 - C17 core daemon + Python GTK3/VTE GUI
 - Client-server over Unix domain sockets (JSON wire protocol)
 - 85 integration tests (77 existing + 8 new canvas) + 22 C unit tests + 19 browser tests all passing
