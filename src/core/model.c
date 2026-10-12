@@ -755,6 +755,11 @@ lmux_app *lmux_app_new(const char *socket_path) {
             a->auto_save_interval = 0;
         }
         a->restore_on_start = a->config->auto_save_session;
+        
+        /* Set log file path for logging */
+        if (a->config->log_file[0]) {
+            lmux_log_set_file(a->config->log_file);
+        }
     }
 
     if (!a->auto_save_interval) a->auto_save_interval = 0;
@@ -967,6 +972,7 @@ void lmux_app_free(lmux_app *a) {
 
 /* Global log level shared by all apps in process. */
 static lmux_log_level g_log_level = LMUX_LOG_INFO;
+static char g_log_file_path[512] = {0};
 
 /* JSON logging mode: enabled via LMUX_LOG_JSON=1 environment variable. */
 static int g_log_json = -1;  /* -1 = not checked yet */
@@ -1004,6 +1010,15 @@ void lmux_log_set_level(lmux_log_level level) {
     g_log_level = level;
 }
 
+void lmux_log_set_file(const char *path)
+{
+    if (path) {
+        snprintf(g_log_file_path, sizeof g_log_file_path, "%s", path);
+    } else {
+        g_log_file_path[0] = '\0';
+    }
+}
+
 void lmux_log(lmux_log_level level, const char *fmt, ...) {
     if (level < g_log_level) return;
     static const char *names[] = {"DEBUG", "INFO ", "WARN ", "ERROR"};
@@ -1039,6 +1054,28 @@ void lmux_log(lmux_log_level level, const char *fmt, ...) {
         vfprintf(stderr, fmt, ap);
         va_end(ap);
         fputc('\n', stderr);
+    }
+
+    /* Also write to log file if configured */
+    if (g_log_file_path[0]) {
+        FILE *lf = fopen(g_log_file_path, "a");
+        if (lf) {
+            time_t now = time(NULL);
+            struct tm tm_buf;
+            struct tm *tm = localtime_r(&now, &tm_buf);
+            char timestamp[32];
+            strftime(timestamp, sizeof timestamp, "%Y-%m-%dT%H:%M:%S", tm);
+
+            /* Format the message into a buffer */
+            char msg_buf[4096];
+            va_list ap2;
+            va_start(ap2, fmt);
+            vsnprintf(msg_buf, sizeof msg_buf, fmt, ap2);
+            va_end(ap2);
+
+            fprintf(lf, "[%s] [%s] %s\n", timestamp, json_levels[level], msg_buf);
+            fclose(lf);
+        }
     }
 }
 
@@ -3981,6 +4018,58 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         goto done;
     }
 
+    /* --- logs --- Show recent logs with optional follow via SSE. */
+    if (strcmp(cmd, "logs") == 0) {
+        /* Read log lines from the configured log file, or from the global log file path */
+        char *log_file = app->config->log_file;
+        int count = 0;
+        char line_buf[4096];
+        char *lines[200]; /* array of line pointers */
+
+        /* If no log file configured in config, try the global log file path */
+        if (!log_file[0]) {
+            log_file = g_log_file_path;
+        }
+
+        if (log_file[0]) {
+            /* Read from log file */
+            FILE *lf = fopen(log_file, "r");
+            if (lf) {
+                /* Read lines from the log file */
+                while (fgets(line_buf, sizeof(line_buf), lf) != NULL && count < 200) {
+                    /* Strip trailing newline */
+                    size_t len = strlen(line_buf);
+                    if (len > 0 && line_buf[len - 1] == '\n') {
+                        line_buf[len - 1] = '\0';
+                        len--;
+                    }
+                    /* Skip empty lines */
+                    if (len == 0) {
+                        continue;
+                    }
+                    /* Store the line */
+                    lines[count] = strdup(line_buf);
+                    count++;
+                }
+                fclose(lf);
+            }
+        }
+
+        /* Build JSON response with lines */
+        written = snprintf(result, result_cap,
+            "{\\"ok\\":true,\\"result\\\":{\\"lines\\":[");
+        for (int k = 0; k < count; k++) {
+            if (k > 0) written += snprintf(result + written, result_cap - written, ",");
+            /* Escape the line for JSON */
+            char escaped[8192] = {0};
+            log_json_escape(lines[k], escaped, sizeof(escaped));
+            written += snprintf(result + written, result_cap - written,
+                "{\\"\\\":\\\"%s\\\"}", escaped);
+            free(lines[k]);
+        }
+        written += snprintf(result + written, result_cap - written, "]}}");
+        goto done;
+    }
 
     /* --- clear-history --- */
     if (strcmp(cmd, "clear-history") == 0 || strcmp(cmd, "clear_history") == 0) {
@@ -4348,7 +4437,8 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                 "\"auto_save_session\":%s,\"auto_save_interval_sec\":%d,"
                 "\"default_shell\":\"%s\","
                 "\"agent_claude_code\":\"%s\",\"agent_opencode\":\"%s\","
-                "\"agent_codex\":\"%s\",\"agent_aider\":\"%s\",\"agent_goose\":\"%s\"}}",
+                "\"agent_codex\":\"%s\",\"agent_aider\":\"%s\",\"agent_goose\":\"%s\","
+                "\"log_file\":\"%s\"}}",
                 app->config->font_family, app->config->font_size,
                 app->config->theme, app->config->scrollback_lines,
                 app->config->show_sidebar ? "true" : "false",
@@ -4358,7 +4448,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                 app->config->default_shell,
                 app->config->agent_paths[0], app->config->agent_paths[1],
                 app->config->agent_paths[2], app->config->agent_paths[3],
-                app->config->agent_paths[4]);
+                app->config->agent_paths[4], app->config->log_file);
         } else {
             /* Return single key value */
             char val[1024] = {0};
@@ -4370,7 +4460,8 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             else if (strcmp(key, "auto_save_session") == 0) snprintf(val, sizeof val, "%s", app->config->auto_save_session ? "true" : "false");
             else if (strcmp(key, "auto_save_interval_sec") == 0) snprintf(val, sizeof val, "%d", app->config->auto_save_interval_sec);
             else if (strcmp(key, "default_shell") == 0) snprintf(val, sizeof val, "\"%s\"", app->config->default_shell);
-            else snprintf(val, sizeof val, "null");
+            else if (strcmp(key, "log_file") == 0) snprintf(val, sizeof val, "\"%s\"", app->config->log_file);
+        else snprintf(val, sizeof val, "null");
             written = snprintf(result, result_cap,
                 "{\"ok\":true,\"result\":{\"key\":\"%s\",\"value\":%s}}", key, val);
         }
@@ -4413,6 +4504,10 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         else if (strcmp(key, "agent_codex") == 0) snprintf(app->config->agent_paths[2], 512, "%s", value);
         else if (strcmp(key, "agent_aider") == 0) snprintf(app->config->agent_paths[3], 512, "%s", value);
         else if (strcmp(key, "agent_goose") == 0) snprintf(app->config->agent_paths[4], 512, "%s", value);
+        else if (strcmp(key, "log_file") == 0) {
+            snprintf(app->config->log_file, sizeof app->config->log_file, "%s", value);
+            lmux_log_set_file(app->config->log_file);
+        }
         else {
             /* #6: unknown keys used to fall through and still report
              * {"ok":true}, so typos silently discarded the value while
@@ -9056,3 +9151,10 @@ void lmux_focus_history_clear(struct lmux_focus_history *h) {
     if (!h) return;
     memset(h, 0, sizeof(*h));
 }
+
+
+const char *lmux_app_get_log_file(const lmux_app *app) {
+    if (!app || !app->config) return "";
+    return app->config->log_file;
+}
+

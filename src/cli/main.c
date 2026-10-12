@@ -30,6 +30,9 @@
 #include <signal.h>
 #include <fcntl.h>
 #include <sys/wait.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <poll.h>
 
 /* Suppress format-truncation warnings in tmux translation functions.
  * The buffers are sized appropriately; GCC can't prove it at compile time. */
@@ -919,6 +922,37 @@ static char *build_json_command(int argc, char **argv) {
             args_len = snprintf(args_buf, sizeof args_buf, "\"session_id\":\"%s\"", (json_escape(argv[1], _esc, sizeof _esc), _esc));
         }
     }
+    /* logs [level] [--follow] [--limit N] */
+    else if (strcmp(cmd, "logs") == 0) {
+        int arg_idx = 1;
+        bool follow = false;
+        int limit = 100;
+        char level[32] = {0};
+
+        while (arg_idx < argc) {
+            if (strcmp(argv[arg_idx], "--follow") == 0 || strcmp(argv[arg_idx], "-f") == 0) {
+                follow = true;
+            } else if (strcmp(argv[arg_idx], "--limit") == 0 && arg_idx + 1 < argc) {
+                limit = atoi(argv[arg_idx + 1]);
+                arg_idx++;
+            } else if (argv[arg_idx][0] != '-') {
+                strncpy(level, argv[arg_idx], sizeof(level) - 1);
+            }
+            arg_idx++;
+        }
+
+        if (level[0]) {
+            args_len = snprintf(args_buf, sizeof args_buf, "\"level\":\"%s\"", level);
+        }
+        if (follow) {
+            if (args_len > 0) args_len += snprintf(args_buf + args_len, sizeof args_buf - args_len, ",");
+            args_len += snprintf(args_buf + args_len, sizeof args_buf - args_len, "\"follow\":true");
+        }
+        if (limit != 100) {
+            if (args_len > 0) args_len += snprintf(args_buf + args_len, sizeof args_buf - args_len, ",");
+            args_len += snprintf(args_buf + args_len, sizeof args_buf - args_len, "\"limit\":%d", limit);
+        }
+    }
     /* hooks.list — list registered hooks */
     else if (strcmp(cmd, "hooks.list") == 0 || strcmp(cmd, "hooks_list") == 0) {
         /* args: {} — args_len stays 0 */
@@ -1004,7 +1038,8 @@ static char *build_json_command(int argc, char **argv) {
                strcmp(cmd, "hooks.list") == 0 || strcmp(cmd, "hooks_list") == 0 ||
                strcmp(cmd, "focus.history") == 0 || strcmp(cmd, "focus_history") == 0 ||
                strcmp(cmd, "health.live") == 0 || strcmp(cmd, "health.ready") == 0 ||
-               strcmp(cmd, "metrics") == 0) {
+               strcmp(cmd, "metrics") == 0 ||
+               strcmp(cmd, "logs") == 0) {
         snprintf(json, 8192, "{\"cmd\":\"%s\",\"args\":{}}", cmd);
     } else if (strcmp(cmd, "help") == 0) {
         snprintf(json, 8192, "{\"cmd\":\"help\",\"args\":{}}");
@@ -1190,6 +1225,110 @@ static void print_response(const char *response, bool raw_json) {
     printf("%s\n", res);
 }
 
+/* SSE log streaming client */
+static int sse_stream_logs(const char *socket_path) {
+    (void)socket_path; /* unused, but kept for future use */
+
+    /* Connect to HTTP server on localhost:8080 */
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        fprintf(stderr, "lmux: failed to create socket: %s\n", strerror(errno));
+        return 1;
+    }
+
+    struct sockaddr_in addr = {0};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(8080);
+    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+
+    if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        fprintf(stderr, "lmux: failed to connect to HTTP server: %s\n", strerror(errno));
+        fprintf(stderr, "Is the daemon running with HTTP server enabled?\n");
+        close(sock);
+        return 1;
+    }
+
+    /* Send HTTP GET request for SSE endpoint */
+    const char *request = "GET /api/logs/stream HTTP/1.1\r\n"
+                          "Host: 127.0.0.1:8080\r\n"
+                          "Accept: text/event-stream\r\n"
+                          "Cache-Control: no-cache\r\n"
+                          "Connection: keep-alive\r\n"
+                          "\r\n";
+    if (write(sock, request, strlen(request)) < 0) {
+        fprintf(stderr, "lmux: failed to send request: %s\n", strerror(errno));
+        close(sock);
+        return 1;
+    }
+
+    /* Read and parse SSE events */
+    char buffer[8192];
+    char line[4096];
+    size_t line_pos = 0;
+    bool in_headers = true;
+    bool headers_done = false;
+
+    /* Set up signal handler for Ctrl+C */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = SIG_IGN;  /* We'll handle SIGINT manually via poll */
+    sigaction(SIGINT, &sa, NULL);
+
+    struct pollfd pfd;
+    pfd.fd = sock;
+    pfd.events = POLLIN | POLLHUP | POLLERR;
+
+    while (true) {
+        int poll_rc = poll(&pfd, 1, 1000);
+        if (poll_rc < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (poll_rc == 0) continue;  /* Timeout, check again */
+
+        if (pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) {
+            break;  /* Connection closed or error */
+        }
+
+        if (pfd.revents & POLLIN) {
+            ssize_t bytes = read(sock, buffer, sizeof(buffer) - 1);
+            if (bytes <= 0) break;  /* EOF or error */
+
+            buffer[bytes] = '\0';
+
+            /* Parse SSE data */
+            for (size_t i = 0; i < (size_t)bytes; i++) {
+                char c = buffer[i];
+                if (c == '\n') {
+                    line[line_pos] = '\0';
+                    line_pos = 0;
+
+                    if (in_headers) {
+                        if (line[0] == '\0' || (line[0] == '\r' && line[1] == '\0')) {
+                            in_headers = false;
+                            headers_done = true;
+                        }
+                    } else {
+                        /* Parse SSE data line */
+                        if (strncmp(line, "data: ", 6) == 0) {
+                            printf("%s\n", line + 6);
+                            fflush(stdout);
+                        }
+                        /* Ignore other SSE fields (event:, id:, retry:) */
+                    }
+                } else if (c != '\r') {
+                    if (line_pos < sizeof(line) - 1) {
+                        line[line_pos++] = c;
+                    }
+                }
+            }
+        }
+    }
+
+    close(sock);
+    return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* Main                                                                 */
 /* ------------------------------------------------------------------ */
@@ -1283,7 +1422,8 @@ static void print_usage(void) {
     printf("  capabilities                       Print server capabilities\n");
     printf("  health.live                        Check if daemon is alive\n");
     printf("  health.ready                       Check if daemon is ready\n");
-    printf("  metrics                            Show server metrics\n\n");
+    printf("  metrics                            Show server metrics\n");
+    printf("  logs [level] [--follow] [--limit N]  Show recent logs (level: debug|info|warn|error)\n\n");
     printf("Tmux compatibility:\n");
     printf("  lmux tmux new-session [-s name]    Create a new workspace\n");
     printf("  lmux tmux kill-session [-t name]   Close a workspace\n");
@@ -1427,6 +1567,10 @@ int main(int argc, char **argv) {
             lmux_app_free(app);
             return 1;
         }
+        /* Start HTTP server for SSE log streaming. */
+        if (lmux_http_server_start(app, 8080) != 0) {
+            fprintf(stderr, "lmux: failed to start HTTP server\n");
+        }
         printf("lmux daemon ready. PID=%d\n", getpid());
         fflush(stdout);
         /* Main loop: check both app state and async exit flag. */
@@ -1452,6 +1596,7 @@ int main(int argc, char **argv) {
             lmux_snapshot_save(daemon_app_global, snap_path);
             lmux_app_quit(daemon_app_global, 0);
         }
+        lmux_http_server_stop();
         lmux_server_stop(app);
         lmux_app_free(app);
         return 0;
@@ -1530,6 +1675,12 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    /* Check if this is a logs --follow command */
+    bool is_logs_follow = false;
+    if (strstr(json_request, "\"cmd\":\"logs\"") && strstr(json_request, "\"follow\":true")) {
+        is_logs_follow = true;
+    }
+
     int fd = connect_socket(socket_path);
     if (fd < 0) {
         fprintf(stderr, "lmux: is the daemon running? (socket: %s)\n", socket_path);
@@ -1544,6 +1695,17 @@ int main(int argc, char **argv) {
     if (!response) {
         free(json_request);
         return 1;
+    }
+
+    /* If logs --follow, connect to SSE endpoint and stream */
+    if (is_logs_follow) {
+        /* Check if response indicates SSE endpoint */
+        const char *sse_endpoint = strstr(response, "\"sse_endpoint\":\"/api/logs/stream\"");
+        if (sse_endpoint) {
+            free(response);
+            free(json_request);
+            return sse_stream_logs(socket_path);
+        }
     }
 
     print_response(response, raw_json);

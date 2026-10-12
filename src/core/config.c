@@ -301,6 +301,9 @@ bool lmux_config_load_buf(lmux_config *cfg, const char *buf, size_t len) {
     cfg_json_extract_string(buf, "agent_aider", cfg->agent_paths[3], 512);
     cfg_json_extract_string(buf, "agent_goose", cfg->agent_paths[4], 512);
 
+    /* Logging configuration */
+    cfg_json_extract_string(buf, "log_file", cfg->log_file, sizeof cfg->log_file);
+
     /* Parse keybindings. save() emits an array of {key, action} objects; the
      * legacy object-keyed-by-name form is still accepted. */
     {
@@ -559,6 +562,9 @@ bool lmux_config_save(const lmux_config *cfg, const char *path) {
     fprintf(f, "  \"agent_codex\": \"%s\",\n", cfg_json_escape(cfg->agent_paths[2], esc_buf, sizeof esc_buf));
     fprintf(f, "  \"agent_aider\": \"%s\",\n", cfg_json_escape(cfg->agent_paths[3], esc_buf, sizeof esc_buf));
     fprintf(f, "  \"agent_goose\": \"%s\",\n", cfg_json_escape(cfg->agent_paths[4], esc_buf, sizeof esc_buf));
+
+    /* Logging configuration */
+    fprintf(f, "  \"log_file\": \"%s\",\n", cfg_json_escape(cfg->log_file, esc_buf, sizeof esc_buf));
 
     /* Keybindings */
     fprintf(f, "  \"keybindings\": [\n");
