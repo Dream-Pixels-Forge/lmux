@@ -151,10 +151,17 @@ def verify_signature(
 ) -> bool:
     """Verify *download_data* against *signature*.
 
-    If *public_key* is supplied, try Ed25519 first.  Always fall back
-    to SHA-256 hex comparison when Ed25519 is unavailable or fails.
+    If *public_key* is supplied, try Ed25519 first.  Fall back to a
+    SHA-256 hex comparison when Ed25519 is unavailable.
+
+    Fail-closed (ISS-0001): when there is no signature to check against,
+    return ``False``.  Previously this path logged a warning and returned
+    ``True``, so a compromised feed could push unsigned payloads.
     """
-    from gui.updates.verify import verify_ed25519, verify_sha256
+    try:
+        from gui.updates.verify import verify_ed25519, verify_sha256
+    except ImportError:  # imported as top-level ``updater`` (tests/standalone)
+        from updates.verify import verify_ed25519, verify_sha256
 
     # Try Ed25519 first when a public key is available
     if public_key and signature:
@@ -169,9 +176,9 @@ def verify_signature(
     if signature and len(signature) == 64:
         return verify_sha256(download_data, signature)
 
-    # No signature to check against — accept silently but log warning
-    log.warning("No verifiable signature provided; update accepted without verification")
-    return True
+    # Fail closed: no verifiable signature — reject the update.
+    log.warning("No verifiable signature provided; update rejected")
+    return False
 
 
 # ── Public key loading ───────────────────────────────────────
@@ -271,12 +278,18 @@ class SparkleUpdater:
 
         return str(dest)
 
-    def apply_update(self, archive_path: str, install_dir: str) -> bool:
+    def apply_update(
+        self,
+        archive_path: str,
+        install_dir: str,
+        allow_exec: bool = False,
+    ) -> bool:
         """Extract *archive_path* into *install_dir*.
 
-        If the extracted tree contains an ``install.sh`` at its root,
-        it is executed (with *install_dir* as CWD).  Returns ``True``
-        on success.
+        ``install.sh`` handling (ISS-0001): a feed-supplied archive is
+        untrusted input, so an embedded ``install.sh`` is **not** executed
+        unless *allow_exec* is explicitly ``True``.  Payload files are
+        installed either way.  Returns ``True`` on success.
         """
         archive = Path(archive_path)
         install = Path(install_dir)
@@ -287,7 +300,7 @@ class SparkleUpdater:
 
         # Determine if it's a tarball or a plain zip
         if tarfile.is_tarfile(str(archive)):
-            return self._apply_tarball(archive, install)
+            return self._apply_tarball(archive, install, allow_exec=allow_exec)
         else:
             return self._apply_raw(archive, install)
 
@@ -347,7 +360,12 @@ class SparkleUpdater:
                 return False
         return True
 
-    def _apply_tarball(self, archive: Path, install: Path) -> bool:
+    def _apply_tarball(
+        self,
+        archive: Path,
+        install: Path,
+        allow_exec: bool = False,
+    ) -> bool:
         tmp_extract = install.parent / f".extract_{archive.stem}"
         try:
             with tarfile.open(str(archive), "r:*") as tf:
@@ -357,37 +375,62 @@ class SparkleUpdater:
                     return False
                 tf.extractall(str(tmp_extract))
 
-            # Check for install script
-            script = None
+            # Check for install script (detect first, move second — the
+            # script path must point at its post-move location, otherwise
+            # an opt-in exec would run a stale path or miss payload files).
+            script_name = None
+            wrapper = None
             for child in tmp_extract.iterdir():
                 if child.is_dir():
-                    candidate = child / "install.sh"
-                    if candidate.exists():
-                        script = candidate
-                        # Move contents from the top-level dir to install dir
-                        for item in child.iterdir():
-                            dest = install / item.name
-                            if dest.exists():
-                                dest.unlink() if dest.is_file() else shutil.rmtree(dest)
-                            shutil.move(str(item), str(dest))
+                    if (child / "install.sh").exists():
+                        script_name = "install.sh"
+                        wrapper = child
                         break
                 elif child.name == "install.sh":
-                    script = child
+                    script_name = "install.sh"
+                    wrapper = None
+                    break
+
+            def _move_into_place(src: Path) -> None:
+                dest = install / src.name
+                if dest.exists():
+                    dest.unlink() if dest.is_file() else shutil.rmtree(dest)
+                shutil.move(str(src), str(dest))
+
+            script = None
+            if script_name is not None:
+                if wrapper is not None:
+                    # Move contents from the top-level dir to install dir
+                    for item in list(wrapper.iterdir()):
+                        _move_into_place(item)
+                else:
+                    # Top-level install.sh: move it with everything else
+                    for item in list(tmp_extract.iterdir()):
+                        _move_into_place(item)
+                script = install / script_name
 
             if script:
-                result = subprocess.run(
-                    ["bash", str(script)],
-                    cwd=str(install),
-                    timeout=120,
-                    capture_output=True,
-                )
-                if result.returncode != 0:
-                    log.error(
-                        "install.sh failed (rc=%d): %s",
-                        result.returncode,
-                        result.stderr.decode(errors="replace"),
+                if not allow_exec:
+                    # ISS-0001: never auto-run scripts from an untrusted
+                    # archive.  Files are already moved into place above
+                    # (or copied below); just skip execution.
+                    log.warning(
+                        "install.sh present but allow_exec=False; skipping execution"
                     )
-                    return False
+                else:
+                    result = subprocess.run(
+                        ["bash", str(script)],
+                        cwd=str(install),
+                        timeout=120,
+                        capture_output=True,
+                    )
+                    if result.returncode != 0:
+                        log.error(
+                            "install.sh failed (rc=%d): %s",
+                            result.returncode,
+                            result.stderr.decode(errors="replace"),
+                        )
+                        return False
             else:
                 # No install script — copy extracted contents directly
                 for child in tmp_extract.iterdir():
