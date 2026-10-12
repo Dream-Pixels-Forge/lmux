@@ -4057,14 +4057,14 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
 
         /* Build JSON response with lines */
         written = snprintf(result, result_cap,
-            "{\\"ok\\":true,\\"result\\\":{\\"lines\\":[");
+            "{\"ok\":true,\"result\":{\"lines\":[");
         for (int k = 0; k < count; k++) {
             if (k > 0) written += snprintf(result + written, result_cap - written, ",");
             /* Escape the line for JSON */
             char escaped[8192] = {0};
             log_json_escape(lines[k], escaped, sizeof(escaped));
             written += snprintf(result + written, result_cap - written,
-                "{\\"\\\":\\\"%s\\\"}", escaped);
+                "{\"\":\"%s\"}", escaped);
             free(lines[k]);
         }
         written += snprintf(result + written, result_cap - written, "]}}");

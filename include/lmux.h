@@ -56,6 +56,7 @@ typedef enum {
 } lmux_log_level;
 
 void lmux_log_set_level(lmux_log_level level);
+void lmux_log_set_file(const char *path);
 void lmux_log(lmux_log_level level, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));
 void lmux_log_request(const char *request_id, const char *cmd, bool ok, const char *detail);
