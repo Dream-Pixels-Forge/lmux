@@ -19,6 +19,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "lmux.h"
+#include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -756,10 +757,15 @@ lmux_app *lmux_app_new(const char *socket_path) {
         }
         a->restore_on_start = a->config->auto_save_session;
         
-        /* Set log file path for logging */
+        /* Apply logging configuration (ISS-0002): file, level, format,
+         * rotation. These are per-process globals and each daemon is its
+         * own process, so per-app config maps cleanly onto them. */
         if (a->config->log_file[0]) {
             lmux_log_set_file(a->config->log_file);
         }
+        lmux_log_set_level((lmux_log_level)a->config->log_level);
+        lmux_log_set_json(a->config->log_json);
+        lmux_log_set_rotation(a->config->log_max_size_mb, a->config->log_max_files);
     }
 
     if (!a->auto_save_interval) a->auto_save_interval = 0;
@@ -1006,6 +1012,44 @@ static size_t log_json_escape(const char *in, char *out, size_t cap) {
     return j;
 }
 
+/* Classify a log line by level for the `logs` level filter (ISS-0002).
+ * Handles the JSON form ("level":"info"), the legacy "[lmux INFO ]"
+ * form, and the earlier "[timestamp] [level]" file form. Returns 0-3,
+ * or -1 when no level can be determined (unknown lines are kept by
+ * the filter rather than dropped). */
+static int log_line_level(const char *line) {
+    if (!line) return -1;
+    /* JSON: "level":"<name>" */
+    const char *p = strstr(line, "\"level\"");
+    if (p) {
+        p = strchr(p + 7, '"');
+        if (p) {
+            p++;
+            char name[16] = {0};
+            size_t k = 0;
+            while (*p && *p != '"' && k < sizeof name - 1)
+                name[k++] = (char)tolower((unsigned char)*p++);
+            if (strcmp(name, "debug") == 0) return 0;
+            if (strcmp(name, "info") == 0) return 1;
+            if (strcmp(name, "warn") == 0 || strcmp(name, "warning") == 0) return 2;
+            if (strcmp(name, "error") == 0) return 3;
+        }
+    }
+    /* Text forms: scan case-insensitively (debug/warn/error first so a
+     * message that merely mentions another level still classifies). */
+    char lower[256];
+    size_t n = strlen(line);
+    if (n > sizeof lower - 1) n = sizeof lower - 1;
+    for (size_t i = 0; i < n; i++)
+        lower[i] = (char)tolower((unsigned char)line[i]);
+    lower[n] = 0;
+    if (strstr(lower, "debug")) return 0;
+    if (strstr(lower, "warn")) return 2;
+    if (strstr(lower, "error")) return 3;
+    if (strstr(lower, "info")) return 1;
+    return -1;
+}
+
 void lmux_log_set_level(lmux_log_level level) {
     g_log_level = level;
 }
@@ -1019,63 +1063,89 @@ void lmux_log_set_file(const char *path)
     }
 }
 
+/* Log rotation limits (ISS-0002: configured via log_max_size_mb /
+ * log_max_files, applied from the config at startup). */
+static long g_log_max_bytes = 10L * 1024L * 1024L;
+static int g_log_max_files = 5;
+
+void lmux_log_set_json(bool enabled) {
+    g_log_json = enabled ? 1 : 0;
+}
+
+void lmux_log_set_rotation(int max_size_mb, int max_files) {
+    if (max_size_mb > 0) g_log_max_bytes = (long)max_size_mb * 1024L * 1024L;
+    if (max_files > 0) g_log_max_files = max_files;
+}
+
+/* Rotate the log file when the incoming write would exceed the size cap.
+ * Keeps main + (max_files - 1) rotated siblings (.1 newest). Called with
+ * the file closed; reopens are the caller's job (fopen "a" per write). */
+static void lmux_log_rotate_if_needed(size_t incoming) {
+    if (!g_log_file_path[0]) return;
+    if (g_log_max_bytes <= 0 || g_log_max_files <= 1) return;
+    struct stat st;
+    if (stat(g_log_file_path, &st) != 0) return;
+    if ((long)(st.st_size + (off_t)incoming) <= g_log_max_bytes) return;
+    /* Shift siblings down: drop .{max-1}, .{i-1} -> .{i}, main -> .1. */
+    char oldp[1024], newp[1024];
+    snprintf(oldp, sizeof oldp, "%s.%d", g_log_file_path, g_log_max_files - 1);
+    unlink(oldp);
+    for (int i = g_log_max_files - 1; i >= 2; i--) {
+        snprintf(oldp, sizeof oldp, "%s.%d", g_log_file_path, i - 1);
+        snprintf(newp, sizeof newp, "%s.%d", g_log_file_path, i);
+        rename(oldp, newp);
+    }
+    snprintf(newp, sizeof newp, "%s.1", g_log_file_path);
+    rename(g_log_file_path, newp);
+}
+
+/* Append one already-formatted line (with trailing '\n') to the log file,
+ * rotating first when the size cap would be exceeded. */
+static void lmux_log_to_file(const char *line) {
+    if (!g_log_file_path[0] || !line) return;
+    lmux_log_rotate_if_needed(strlen(line));
+    FILE *lf = fopen(g_log_file_path, "a");
+    if (lf) {
+        fputs(line, lf);
+        fclose(lf);
+    }
+}
+
 void lmux_log(lmux_log_level level, const char *fmt, ...) {
     if (level < g_log_level) return;
     static const char *names[] = {"DEBUG", "INFO ", "WARN ", "ERROR"};
     static const char *json_levels[] = {"debug", "info", "warn", "error"};
 
+    /* Format the message once; both sinks share it. */
+    char msg_buf[4096];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg_buf, sizeof msg_buf, fmt, ap);
+    va_end(ap);
+
+    time_t now = time(NULL);
+    struct tm tm_buf;
+    struct tm *tm = localtime_r(&now, &tm_buf);
+    char timestamp[32];
+    strftime(timestamp, sizeof timestamp, "%Y-%m-%dT%H:%M:%S", tm);
+
     if (log_json_enabled()) {
         /* JSON structured log: {"timestamp":"...","level":"...","message":"...","service":"lmux"} */
-        time_t now = time(NULL);
-        struct tm tm_buf;
-        struct tm *tm = localtime_r(&now, &tm_buf);
-        char timestamp[32];
-        strftime(timestamp, sizeof timestamp, "%Y-%m-%dT%H:%M:%S", tm);
-
-        /* Format the message into a buffer */
-        char msg_buf[4096];
-        va_list ap;
-        va_start(ap, fmt);
-        vsnprintf(msg_buf, sizeof msg_buf, fmt, ap);
-        va_end(ap);
-
-        /* Escape the message for JSON */
         char escaped[8192];
         log_json_escape(msg_buf, escaped, sizeof escaped);
 
-        fprintf(stderr,
+        char line[12288];
+        snprintf(line, sizeof line,
             "{\"timestamp\":\"%s\",\"level\":\"%s\",\"message\":\"%s\",\"service\":\"lmux\"}\n",
             timestamp, json_levels[level], escaped);
+        fputs(line, stderr);
+        lmux_log_to_file(line);
     } else {
         /* Legacy plain-text format */
-        fprintf(stderr, "[lmux %s] ", names[level]);
-        va_list ap;
-        va_start(ap, fmt);
-        vfprintf(stderr, fmt, ap);
-        va_end(ap);
-        fputc('\n', stderr);
-    }
-
-    /* Also write to log file if configured */
-    if (g_log_file_path[0]) {
-        FILE *lf = fopen(g_log_file_path, "a");
-        if (lf) {
-            time_t now = time(NULL);
-            struct tm tm_buf;
-            struct tm *tm = localtime_r(&now, &tm_buf);
-            char timestamp[32];
-            strftime(timestamp, sizeof timestamp, "%Y-%m-%dT%H:%M:%S", tm);
-
-            /* Format the message into a buffer */
-            char msg_buf[4096];
-            va_list ap2;
-            va_start(ap2, fmt);
-            vsnprintf(msg_buf, sizeof msg_buf, fmt, ap2);
-            va_end(ap2);
-
-            fprintf(lf, "[%s] [%s] %s\n", timestamp, json_levels[level], msg_buf);
-            fclose(lf);
-        }
+        char line[8192];
+        snprintf(line, sizeof line, "[lmux %s] %s\n", names[level], msg_buf);
+        fputs(line, stderr);
+        lmux_log_to_file(line);
     }
 }
 
@@ -1090,6 +1160,9 @@ void lmux_log(lmux_log_level level, const char *fmt, ...) {
 void lmux_log_request(const char *request_id, const char *cmd, bool ok, const char *detail) {
     if (g_log_level > LMUX_LOG_INFO) return;
 
+    /* Build the line once; stderr and the log file share it so `logs`
+     * and /api/logs can serve request history (ISS-0002). */
+    char line[2048];
     if (log_json_enabled()) {
         time_t now = time(NULL);
         struct tm tm_buf;
@@ -1101,21 +1174,24 @@ void lmux_log_request(const char *request_id, const char *cmd, bool ok, const ch
         log_json_escape(cmd ? cmd : "", cmd_escaped, sizeof cmd_escaped);
         log_json_escape(detail ? detail : "", detail_escaped, sizeof detail_escaped);
 
-        fprintf(stderr,
+        int n = snprintf(line, sizeof line,
             "{\"timestamp\":\"%s\",\"level\":\"info\",\"service\":\"lmux\","
             "\"trace_id\":\"%s\",\"cmd\":\"%s\",\"ok\":%s",
             timestamp, request_id ? request_id : "null", cmd_escaped,
             ok ? "true" : "false");
-        if (detail && detail[0]) {
-            fprintf(stderr, ",\"detail\":\"%s\"", detail_escaped);
+        if (detail && detail[0] && n > 0 && (size_t)n < sizeof line) {
+            snprintf(line + n, sizeof line - (size_t)n,
+                ",\"detail\":\"%s\"", detail_escaped);
         }
-        fprintf(stderr, "}\n");
+        strncat(line, "}\n", sizeof line - strlen(line) - 1);
     } else {
         /* Legacy format */
-        fprintf(stderr, "[lmux INFO ] %s: %s %s\n",
+        snprintf(line, sizeof line, "[lmux INFO ] %s: %s %s\n",
                 request_id ? request_id : "-", cmd ? cmd : "-",
                 ok ? "OK" : "FAIL");
     }
+    fputs(line, stderr);
+    lmux_log_to_file(line);
 }
 
 void lmux_app_quit(lmux_app *a, int code) {
@@ -4020,6 +4096,17 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
 
     /* --- logs --- Show recent logs with optional follow via SSE. */
     if (strcmp(cmd, "logs") == 0) {
+        /* Optional level filter: debug|info|warn|error (case-insensitive).
+         * Unknown/absent values return everything. */
+        char level_arg[32] = {0};
+        json_extract_string(args_json, "level", level_arg, sizeof level_arg);
+        for (char *c = level_arg; *c; c++) *c = (char)tolower((unsigned char)*c);
+        int min_level = -1;
+        if (strcmp(level_arg, "debug") == 0) min_level = 0;
+        else if (strcmp(level_arg, "info") == 0) min_level = 1;
+        else if (strcmp(level_arg, "warn") == 0 || strcmp(level_arg, "warning") == 0) min_level = 2;
+        else if (strcmp(level_arg, "error") == 0) min_level = 3;
+
         /* Read log lines from the configured log file, or from the global log file path */
         char *log_file = app->config->log_file;
         int count = 0;
@@ -4047,15 +4134,24 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                     if (len == 0) {
                         continue;
                     }
+                    /* Apply the level filter (ISS-0002); lines whose
+                     * level cannot be determined are kept. */
+                    if (min_level >= 0) {
+                        int lvl = log_line_level(line_buf);
+                        if (lvl >= 0 && lvl < min_level) {
+                            continue;
+                        }
+                    }
                     /* Store the line */
                     lines[count] = strdup(line_buf);
+                    if (!lines[count]) break;
                     count++;
                 }
                 fclose(lf);
             }
         }
 
-        /* Build JSON response with lines */
+        /* Build JSON response with lines (proper JSON strings, escaped). */
         written = snprintf(result, result_cap,
             "{\"ok\":true,\"result\":{\"lines\":[");
         for (int k = 0; k < count; k++) {
@@ -4064,7 +4160,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             char escaped[8192] = {0};
             log_json_escape(lines[k], escaped, sizeof(escaped));
             written += snprintf(result + written, result_cap - written,
-                "{\"\":\"%s\"}", escaped);
+                "\"%s\"", escaped);
             free(lines[k]);
         }
         written += snprintf(result + written, result_cap - written, "]}}");
@@ -8151,6 +8247,16 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         cmd);
 
 done:
+    /* ISS-0002: record every dispatched request in the log stream so
+     * `logs` and /api/logs serve real history. lmux_log_request
+     * previously had no callers, so the log file stayed empty. The
+     * `logs` query itself is excluded: logging it would append a line
+     * between the read and the response, so back-to-back identical
+     * queries would never agree. */
+    if (!cmd || strcmp(cmd, "logs") != 0) {
+        lmux_log_request(NULL, cmd ? cmd : "",
+            result && strstr(result, "\"ok\":true") != NULL, NULL);
+    }
     return result;
 }
 

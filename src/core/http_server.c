@@ -38,6 +38,29 @@ static const char *http_get_mime_type(const char *path) {
     return "text/plain";
 }
 
+/* Escape a string for safe inclusion in a JSON string value (ISS-0002:
+ * log lines are untrusted input — a quote, backslash or control
+ * character in any line must not be able to break the /api/logs
+ * response or inject JSON). Mirrors log_json_escape in model.c. */
+static size_t http_json_escape(const char *in, char *out, size_t cap) {
+    size_t j = 0;
+    for (const char *p = in; *p && j + 1 < cap; p++) {
+        char c = *p;
+        if (c == '"' || c == '\\') {
+            if (j + 2 >= cap) break;
+            out[j++] = '\\';
+            out[j++] = c;
+        } else if ((unsigned char)c < 0x20) {
+            if (j + 6 >= cap) break;
+            j += (size_t)snprintf(out + j, cap - j, "\\u%04x", (unsigned char)c);
+        } else {
+            out[j++] = c;
+        }
+    }
+    out[j] = 0;
+    return j;
+}
+
 static void http_send_response(int client_fd, int status, const char *content_type, const char *body) {
     char header[1024];
     int body_len = body ? strlen(body) : 0;
@@ -210,11 +233,13 @@ static void *http_client_thread(void *arg) {
                         size_t len = strlen(line_buf);
                         if (len > 0 && line_buf[len - 1] == '\n') line_buf[len - 1] = '\0';
                         if (count > 0) json_len += snprintf(json + json_len, 65536 - json_len, ",");
-                        json_len += snprintf(json + json_len, 65536 - json_len, "\"%s\"", line_buf);
+                        char escaped[8192];
+                        http_json_escape(line_buf, escaped, sizeof escaped);
+                        json_len += snprintf(json + json_len, 65536 - json_len, "\"%s\"", escaped);
                         count++;
                     }
                     fclose(fp);
-                    json_len += snprintf(json + json_len, 65536 - json_len, "]\",\"count\":%d}}", count);
+                    json_len += snprintf(json + json_len, 65536 - json_len, "],\"count\":%d}", count);
                     if (json_len < 65536) {
                         http_send_response(client_fd, 200, "application/json", json);
                     } else {
@@ -285,6 +310,12 @@ static void *http_client_thread(void *arg) {
         server->port = port;
         server->running = true;
         server->listen_fd = -1;
+        /* calloc() zeroes client_fds, but 0 is a valid fd number — the
+         * accept loop looks for slots < 0, so without this every
+         * connection is dropped (and stop() would close fd 0). */
+        for (int i = 0; i < HTTP_MAX_CLIENTS; i++) {
+            server->client_fds[i] = -1;
+        }
 
         int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
         if (listen_fd < 0) {
@@ -298,7 +329,11 @@ static void *http_client_thread(void *arg) {
         struct sockaddr_in addr = {0};
         addr.sin_family = AF_INET;
         addr.sin_port = htons(port);
-        addr.sin_addr.s_addr = INADDR_ANY;
+        /* ISS-0002: bind the loopback interface (127.0.0.1) only. The
+         * daemon's Unix socket already assumes local-only clients
+         * (SO_PEERCRED UID check); exposing the log stream on every
+         * interface with no auth would leak logs to the whole network. */
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
         if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
             close(listen_fd);

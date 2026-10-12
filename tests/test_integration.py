@@ -673,6 +673,135 @@ class TestLogLevelFiltering(unittest.TestCase):
         self.assertEqual(counts_lower["info"], counts_mixed["info"])
 
 
+class TestHttpLogServerSecurity(unittest.TestCase):
+    """ISS-0002: the C HTTP log server must bind loopback only and serve
+    valid, escaped JSON.
+
+    Background: ``http_server.c`` bound ``INADDR_ANY`` with no auth (any
+    host on the network could read daemon logs) and interpolated raw log
+    lines into a JSON array (a quote/backslash/control char in any line
+    breaks the response, and the ``count`` field was malformed JSON).
+    The ``logs`` socket command had the same escaping/shape defect.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.c = _ensure_daemon()
+        cls.repo = Path(__file__).parent.parent
+        cls.http_c = (cls.repo / "src" / "core" / "http_server.c").read_text()
+        # Point the shared daemon's log file at a scratch file so the
+        # HTTP tests exercise the file-backed branch deterministically.
+        cls.log_file = str(
+            Path(tempfile.gettempdir()) / f"lmux-http-test-{os.getpid()}.log")
+        Path(cls.log_file).write_text("")
+        cls.c.send("config.set", {"key": "log_file", "value": cls.log_file})
+        cls.c.send("ping")
+
+    def test_does_not_bind_all_interfaces(self):
+        self.assertNotIn(
+            "INADDR_ANY", self.http_c,
+            "log server must not listen on all interfaces (no auth)",
+        )
+
+    def test_binds_loopback(self):
+        self.assertIn(
+            "127.0.0.1", self.http_c,
+            "log server must bind the loopback interface explicitly",
+        )
+
+    def _api_logs_body(self):
+        import urllib.request
+        try:
+            with urllib.request.urlopen(
+                "http://127.0.0.1:8080/api/logs", timeout=10
+            ) as resp:
+                return resp.read().decode(errors="replace")
+        except Exception as exc:  # noqa: BLE001 - optional service
+            self.skipTest(f"HTTP log server not reachable: {exc}")
+
+    def _proc_listener_ip(self):
+        """Hex IP the process listens on for port 8080, or None."""
+        try:
+            text = Path("/proc/net/tcp").read_text()
+        except OSError:
+            return None
+        for line in text.splitlines()[1:]:
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            ip_hex, port_hex = parts[1].rsplit(":", 1)
+            if port_hex.upper() == "1F90" and parts[3] == "0A":
+                return ip_hex.upper()
+        return None
+
+    def test_listener_is_loopback_only(self):
+        ip = self._proc_listener_ip()
+        if ip is None:
+            self.skipTest("no TCP listener on 8080 (HTTP server not running)")
+        self.assertEqual(
+            ip, "0100007F",
+            f"port 8080 must listen on 127.0.0.1, not {ip}",
+        )
+
+    def test_api_logs_returns_valid_json(self):
+        body = self._api_logs_body()
+        doc = json.loads(body)  # malformed JSON fails here
+        self.assertIn("lines", doc)
+        self.assertIn("count", doc)
+        self.assertIsInstance(doc["lines"], list)
+        self.assertEqual(doc["count"], len(doc["lines"]))
+
+    def test_api_logs_escapes_hostile_content(self):
+        hostile = 'quote" backslash\\ ctrl\x01 tab\t end'
+        with open(self.log_file, "a") as fh:
+            fh.write(hostile + "\n")
+        body = self._api_logs_body()
+        doc = json.loads(body)  # unescaped content breaks parsing here
+        self.assertIn(
+            hostile, doc["lines"],
+            f"hostile log line must round-trip exactly: {doc['lines']!r}",
+        )
+
+    def test_logs_command_returns_string_lines(self):
+        result = self.c.logs()
+        lines = result.get("lines", [])
+        self.assertGreater(len(lines), 0, "expected log lines from ping")
+        for line in lines:
+            self.assertIsInstance(
+                line, str, f"log line must be a JSON string: {line!r}")
+
+
+class TestLogsHostileRoundTrip(unittest.TestCase):
+    """The ``logs`` socket command must return hostile file content
+    verbatim (escaped in transit, exact after parsing)."""
+
+    def test_hostile_lines_round_trip_exactly(self):
+        client, daemon, home = _isolated_client()
+        try:
+            data = home / ".local" / "share" / "lmux"
+            log_file = str(data / "hostile.log")
+            Path(log_file).write_text("")
+            client.send("config.set", {"key": "log_file", "value": log_file})
+            client.send("ping")
+            hostile = [
+                'quote"inside',
+                'backslash\\inside',
+                'ctrl\x01char',
+                'tab\there',
+                '{"looks": "like json"}',
+            ]
+            with open(log_file, "a") as fh:
+                for line in hostile:
+                    fh.write(line + "\n")
+            result = client.logs()
+            lines = result.get("lines", [])
+            for want in hostile:
+                self.assertIn(
+                    want, lines, f"hostile line must round-trip: {want!r}")
+        finally:
+            _shutdown_isolated(daemon, home)
+
+
 class TestTmuxCompatCli(unittest.TestCase):
     """CLI-level checks that run the binary directly.
 
