@@ -37,6 +37,7 @@
 
 #include <fcntl.h>
 #include <errno.h>
+#include <limits.h>
 #include <sys/wait.h>
 #include <sys/ioctl.h>
 #include <termios.h>
@@ -439,6 +440,72 @@ struct lmux_workspace {
 };
 
 
+
+/* True when absolute path `abs` resolves inside directory `root`
+ * (ISS-0003: snapshot.load confinement). Uses realpath() when the file
+ * exists so a symlink pointing outside cannot smuggle a path in, and
+ * falls back to a lexical component walk otherwise. Comparison is
+ * component-wise, so a sibling directory that merely shares a name
+ * prefix ("lmux-evil" vs "lmux") is not accepted. */
+static bool path_inside_root(const char *abs, const char *root) {
+    if (!abs || abs[0] != '/' || !root || !root[0]) return false;
+    char canon[2048];
+    const char *check = abs;
+    /* NB: the realpath() buffer must be PATH_MAX; anything smaller
+     * aborts under _FORTIFY_SOURCE even for short paths. Automatic
+     * storage (not static): dispatch runs on server threads. */
+    char via_link[PATH_MAX];
+    if (realpath(abs, via_link)) {
+        check = via_link;
+    }
+    /* Lexically normalize `check` into `canon`, resolving "." and "..". */
+    const char *parts[512];
+    size_t np = 0;
+    char work[2048];
+    snprintf(work, sizeof work, "%s", check);
+    for (char *tok = strtok(work, "/"); tok; tok = strtok(NULL, "/")) {
+        if (strcmp(tok, ".") == 0 || tok[0] == '\0') continue;
+        if (strcmp(tok, "..") == 0) {
+            if (np == 0) return false; /* escapes the filesystem root */
+            np--;
+            continue;
+        }
+        if (np >= sizeof parts / sizeof parts[0]) return false;
+        parts[np++] = tok;
+    }
+    size_t ci = 0;
+    for (size_t i = 0; i < np; i++) {
+        if (ci >= sizeof canon) return false;
+        ci += (size_t)snprintf(canon + ci, sizeof canon - ci, "/%s", parts[i]);
+        if (ci >= sizeof canon) return false;
+    }
+    if (ci == 0) { canon[0] = '/'; canon[1] = 0; ci = 1; }
+    /* Normalize `root` the same way for a component-wise comparison. */
+    const char *rparts[512];
+    size_t nr = 0;
+    char rwork[1024];
+    snprintf(rwork, sizeof rwork, "%s", root);
+    for (char *tok = strtok(rwork, "/"); tok; tok = strtok(NULL, "/")) {
+        if (strcmp(tok, ".") == 0 || tok[0] == '\0') continue;
+        if (strcmp(tok, "..") == 0) {
+            if (nr == 0) return false;
+            nr--;
+            continue;
+        }
+        if (nr >= sizeof rparts / sizeof rparts[0]) return false;
+        rparts[nr++] = tok;
+    }
+    if (np <= nr) return false; /* must be strictly inside, not root itself */
+    char rcanon[1024];
+    size_t ri = 0;
+    for (size_t i = 0; i < nr; i++) {
+        if (ri >= sizeof rcanon) return false;
+        ri += (size_t)snprintf(rcanon + ri, sizeof rcanon - ri, "/%s", rparts[i]);
+        if (ri >= sizeof rcanon) return false;
+    }
+    if (strncmp(canon, rcanon, ri) != 0) return false;
+    return canon[ri] == '/';
+}
 
 /* Root directory snapshot.save is confined to (#12 step 4). Mirrors the
  * browser_screenshot_root() policy so there is exactly one shape for "a path a
@@ -3746,22 +3813,53 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
 
     /* --- snapshot.load [path] --- */
     if (strcmp(cmd, "snapshot.load") == 0) {
-        char path[1024] = {0};
-        json_extract_string(args_json, "path", path, sizeof path);
-        if (!path[0]) {
-            const char *home = getenv("HOME");
-            snprintf(path, sizeof path, "%s/.lmux_snapshot.json", home ? home : "/tmp");
-        }
-        /* Security: validate path to prevent traversal attacks */
-        if (!is_safe_path(path, NULL)) {
+        char req[1024] = {0};
+        char root[1024];
+        char resolved[2048];
+        char esc[2048];
+
+        /* ISS-0003: confine exactly like snapshot.save. The old
+         * is_safe_path(path, NULL) check rejected ".." but accepted any
+         * absolute path, so a socket client could make the daemon read
+         * arbitrary JSON files. Relative names resolve under the data
+         * root; absolute paths are accepted only when they resolve
+         * inside it (so the absolute path snapshot.save returns keeps
+         * working); the default matches the save default. */
+        lmux_data_root(root, sizeof root);
+
+        json_extract_string(args_json, "path", req, sizeof req);
+        if (!req[0]) {
+            snprintf(resolved, sizeof resolved, "%s/snapshot.json", root);
+        } else if (req[0] == '~') {
             written = snprintf(result, result_cap,
-                "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"path contains traversal sequences\"}}");
+                "{\"ok\":false,\"error\":{\"code\":\"invalid_params\","
+                "\"message\":\"snapshot path must be relative and inside %s\"}}",
+                root);
             goto done;
+        } else if (req[0] == '/') {
+            if (!path_inside_root(req, root)) {
+                written = snprintf(result, result_cap,
+                    "{\"ok\":false,\"error\":{\"code\":\"invalid_params\","
+                    "\"message\":\"snapshot path must be relative and inside %s\"}}",
+                    root);
+                goto done;
+            }
+            snprintf(resolved, sizeof resolved, "%s", req);
+        } else {
+            if (!is_safe_path(req, root)) {
+                written = snprintf(result, result_cap,
+                    "{\"ok\":false,\"error\":{\"code\":\"invalid_params\","
+                    "\"message\":\"snapshot path must be relative and inside %s\"}}",
+                    root);
+                goto done;
+            }
+            snprintf(resolved, sizeof resolved, "%s/%s", root, req);
         }
-        bool ok = lmux_snapshot_load(app, path);
+        bool ok = lmux_snapshot_load(app, resolved);
         if (ok) {
+            json_escape_str(esc, sizeof esc, resolved);
             written = snprintf(result, result_cap,
-                "{\"ok\":true,\"result\":{\"path\":\"%s\"}}", path);
+                "{\"ok\":true,\"result\":{\"path\":\"%s\"}}", esc);
         } else {
             written = snprintf(result, result_cap,
                 "{\"ok\":false,\"error\":{\"code\":\"load_failed\",\"message\":\"failed to load snapshot\"}}");

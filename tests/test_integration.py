@@ -910,7 +910,10 @@ class TestSnapshotTruncationDetection(unittest.TestCase):
     def test_oversized_snapshot_is_rejected_not_silently_truncated(self):
         client, daemon, home = _isolated_client()
         try:
-            snap = Path(tempfile.gettempdir(),
+            # ISS-0003: snapshot.load is confined to the data root, so the
+            # fixture lives there; without ids it is malformed content and
+            # must be refused loudly (load_failed), never half-applied.
+            snap = Path(home, ".local", "share", "lmux",
                         f"lmux-test-big-{os.getpid()}.json")
             # ~70 KB, comfortably past the 64 KB buffer.
             workspaces = "".join(
@@ -1006,7 +1009,9 @@ class TestPtyDeferralOnRestore(unittest.TestCase):
                     client = None
             self.assertIsNotNone(client, "daemon did not come up")
 
-            snap = home / "snap.json"
+            # ISS-0003: snapshot.load is confined to the data root, so the
+            # fixture must live there (home IS this daemon's $HOME).
+            snap = home / ".local" / "share" / "lmux" / "snap.json"
             n = 20
             ws = ",".join(
                 '{"id":%d,"title":"w%d","cwd":"/tmp","git_branch":"",'
@@ -2048,7 +2053,9 @@ class TestSnapshotParserCorrectness(unittest.TestCase):
         """T3: an unbalanced document must fail loudly."""
         client, daemon, home = _isolated_client()
         try:
-            snap = Path(tempfile.gettempdir(),
+            # ISS-0003: load is confined to the data root; the truncated
+            # document lives there so this still exercises the parser.
+            snap = Path(home, ".local", "share", "lmux",
                         f"lmux-test-trunc-{os.getpid()}.json")
             snap.write_text('{"version":1,"workspaces":[{"id":1,"title":"a",'
                             '"cwd":"/tmp","surfaces":[{"id":1,"title":"b"')
@@ -2071,7 +2078,9 @@ class TestSnapshotParserCorrectness(unittest.TestCase):
         """
         client, daemon, home = _isolated_client()
         try:
-            snap = Path(tempfile.gettempdir(),
+            # ISS-0003: load is confined to the data root; the large
+            # fixture lives there so this still exercises the loader.
+            snap = Path(home, ".local", "share", "lmux",
                         f"lmux-test-large-{os.getpid()}.json")
             n = 40
             pad = "/x" * 1700
@@ -2221,6 +2230,70 @@ class TestSnapshotSaveRoot(unittest.TestCase):
                 pass
             Path(sock).unlink(missing_ok=True)
             shutil.rmtree(bare, ignore_errors=True)
+
+
+class TestSnapshotLoadConfinement(unittest.TestCase):
+    """ISS-0003: snapshot.load called is_safe_path(path, NULL), which rejects
+    ".." but places no containment, so any absolute path was accepted and
+    the daemon read it. Confine it to the data root, mirroring the
+    snapshot.save fix (#12 step 4)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.client, cls.daemon, cls.home = _isolated_client()
+        cls.root = Path(cls.home, ".local", "share", "lmux")
+
+    @classmethod
+    def tearDownClass(cls):
+        _shutdown_isolated(cls.daemon, cls.home)
+
+    def _load(self, path=None):
+        args = {"path": path} if path else {}
+        return self.client.send("snapshot.load", args)
+
+    def test_absolute_path_outside_root_is_rejected(self):
+        resp = self._load("/etc/hosts")
+        self.assertFalse(resp.get("ok"), f"must be rejected: {resp}")
+        self.assertEqual(resp.get("error", {}).get("code"), "invalid_params")
+
+    def test_home_relative_escape_is_rejected(self):
+        resp = self._load("~/.ssh/id_rsa")
+        self.assertFalse(resp.get("ok"), f"must be rejected: {resp}")
+        self.assertEqual(resp.get("error", {}).get("code"), "invalid_params")
+
+    def test_dotdot_is_rejected(self):
+        resp = self._load("../outside.json")
+        self.assertFalse(resp.get("ok"), f"must be rejected: {resp}")
+        self.assertEqual(resp.get("error", {}).get("code"), "invalid_params")
+
+    def test_sibling_prefix_escape_is_rejected(self):
+        # <root>-evil shares a name prefix with <root> but is outside it;
+        # a startswith() containment check would wrongly accept it.
+        evil = self.root.parent / (self.root.name + "-evil") / "snap.json"
+        resp = self._load(str(evil))
+        self.assertFalse(resp.get("ok"), f"must be rejected: {resp}")
+        self.assertEqual(resp.get("error", {}).get("code"), "invalid_params")
+
+    def test_relative_name_inside_root_loads(self):
+        self.client.workspace_create(_unique("load-confine"))
+        saved = self.client.snapshot_save("confine-rt.json")["path"]
+        resp = self._load("confine-rt.json")
+        self.assertTrue(resp.get("ok"), f"relative load must work: {resp}")
+        self.assertEqual(resp["result"]["path"], saved)
+
+    def test_absolute_path_inside_root_loads(self):
+        # The absolute path snapshot.save returns must keep working.
+        saved = self.client.snapshot_save("confine-abs.json")["path"]
+        self.assertTrue(Path(saved).exists())
+        resp = self._load(saved)
+        self.assertTrue(resp.get("ok"), f"in-root absolute load: {resp}")
+
+    def test_default_path_matches_save_default(self):
+        self.client.workspace_create(_unique("load-default"))
+        saved = self.client.snapshot_save()["path"]
+        resp = self._load()
+        self.assertTrue(resp.get("ok"), f"default load must work: {resp}")
+        self.assertEqual(resp["result"]["path"], saved)
 
 
 class TestDependencyGateTargetsMaster(unittest.TestCase):
