@@ -6,6 +6,7 @@
  *   src/core/model.c    — Workspace/surface/pane model, JSON dispatch, snapshot
  *   src/core/osc.c      — OSC 9/99/777 terminal notification parser
  *   src/core/server.c   — Unix domain socket JSON protocol server
+ *   src/core/control.c  — Control-mode framing + event fan-out (ISS-0029)
  *
  * Output: build/liblmux_core.a (static library)
  *
@@ -45,6 +46,7 @@ const sources = [
     join(ROOT, "src", "core", "http_server.c"),
     join(ROOT, "src", "core", "osc.c"),
     join(ROOT, "src", "core", "server.c"),
+    join(ROOT, "src", "core", "control.c"),
     join(ROOT, "src", "core", "config.c"),
     join(ROOT, "src", "browser.c"),
 ];

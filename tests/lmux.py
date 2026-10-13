@@ -72,7 +72,12 @@ class LmuxClient:
             raw = b"".join(chunks)
         if not raw:
             return {"ok": False, "error": "empty response"}
-        return json.loads(raw.decode().strip())
+        text = raw.decode().strip()
+        try:
+            return json.loads(text)
+        except ValueError:
+            # ISS-0029: control-framed (%begin/%end) replies are not JSON.
+            return {"ok": False, "error": f"non-json reply: {text[:128]}"}
 
     def assert_ok(self, cmd: str, args: Optional[dict] = None) -> dict:
         """Send command and assert success. Returns the result."""

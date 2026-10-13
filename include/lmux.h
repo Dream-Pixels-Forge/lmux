@@ -593,6 +593,43 @@ void lmux_http_server_stop(void);
 /* Accessor for app config */
 const char *lmux_app_get_log_file(const lmux_app *app);
 
+/* ------------------------------------------------------------------ */
+/* Control mode (tmux -C compatible subset, ISS-0029)                   */
+/*                                                                     */
+/* Framing + event fan-out only. Commands are dispatched through       */
+/* lmux_dispatch_json(); this layer never interprets them. See        */
+/* src/core/control.c for the wire protocol and backpressure notes.   */
+/* ------------------------------------------------------------------ */
+
+/* Register/deregister a control client. Returns a slot id (>=0) or -1. */
+int  lmux_control_register(void);
+void lmux_control_unregister(int slot);
+
+/* Thread-local slot of the connection currently dispatching (-1 if none). */
+int  lmux_control_current_slot(void);
+void lmux_control_set_thread_slot(int slot);
+
+/* Guard-block tracking: async lines arriving mid-block are deferred. */
+void lmux_control_begin_block(int slot);
+void lmux_control_end_block(int slot);
+
+/* refresh-client -B subscriptions. Returns 0 on success, -1 on error. */
+int lmux_control_subscribe(int slot, const char *name,
+                           const char *what, const char *format);
+int lmux_control_unsubscribe(int slot, const char *name);
+
+/* Broadcast one pre-formatted `%`-line to interested control clients.
+ * `cls` is one of "layout", "session", "pane", "output". Never blocks. */
+void lmux_control_notify(const char *cls, const char *line);
+
+/* Pop pending async lines for `slot` (caller frees each). */
+size_t lmux_control_pop_pending(int slot, char **out, size_t cap);
+
+/* Format a %begin/%end/%error guard line. */
+void lmux_control_format_guard(char *out, size_t cap,
+                               const char *kind, long epoch,
+                               unsigned seq);
+
 
 #ifdef __cplusplus
 }
