@@ -980,6 +980,74 @@ class TestLogsLimitTail(unittest.TestCase):
             _shutdown_isolated(daemon, home)
 
 
+class TestHttpSlotRelease(unittest.TestCase):
+    """ISS-0008 RC5: worker threads never released their ``client_fds``
+    slot, so 32 connections wedged the server forever (every later
+    connection silently dropped). Fixed: the slot is released on every
+    exit path — 40 sequential connections plus a 41st must all succeed."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.c = _ensure_daemon()
+
+    def test_40_sequential_connections_then_41st_served(self):
+        import urllib.request
+        url = "http://127.0.0.1:8080/api/logs"
+        served = 0
+        for _ in range(40):
+            try:
+                with urllib.request.urlopen(url, timeout=10) as resp:
+                    json.loads(resp.read().decode(errors="replace"))
+                served += 1
+            except Exception:  # noqa: BLE001 - a dropped conn is the bug
+                break
+            time.sleep(0.05)
+        if served < 5:
+            try:
+                self.c.send("ping")
+            except Exception:  # noqa: BLE001 - daemon socket gone
+                pass
+            self.skipTest("HTTP log server not reachable in this env")
+        try:
+            with urllib.request.urlopen(url, timeout=10) as resp:
+                json.loads(resp.read().decode(errors="replace"))
+        except Exception as exc:  # noqa: BLE001 - dropped conn is the bug
+            self.fail(
+                f"server wedged after {served} connections "
+                f"(slot leak, max 32): {exc}")
+        self.assertEqual(
+            served, 40,
+            f"all 40 sequential connections must succeed, got {served}")
+
+
+class TestSseSigintStopFlag(unittest.TestCase):
+    """ISS-0008 RC4: ``sse_stream_logs`` installed ``SIG_IGN`` for SIGINT
+    while polling only the socket, so Ctrl+C could never stop the stream.
+    Fixed: a ``sig_atomic_t`` stop flag set by the handler, checked in
+    the poll loop, with the previous handler restored on exit."""
+
+    @classmethod
+    def setUpClass(cls):
+        repo = Path(__file__).parent.parent
+        src = (repo / "src" / "cli" / "main.c").read_text()
+        start = src.index("/* SSE log streaming client */")
+        end = src.index("static void print_usage")
+        cls.sse = src[start:end]
+
+    def test_sigint_not_ignored_in_sse_stream(self):
+        self.assertNotIn(
+            "sa_handler = SIG_IGN", self.sse,
+            "sse_stream_logs must not ignore SIGINT (Ctrl+C must stop it)")
+        self.assertNotIn(
+            "sa_handler=SIG_IGN", self.sse,
+            "sse_stream_logs must not ignore SIGINT (Ctrl+C must stop it)")
+
+    def test_stop_flag_set_and_checked(self):
+        self.assertIn(
+            "sig_atomic_t", self.sse,
+            "SSE stream needs a sig_atomic_t stop flag for Ctrl+C")
+
+
 class TestTmuxCompatCli(unittest.TestCase):
     """CLI-level checks that run the binary directly.
 

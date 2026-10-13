@@ -1226,6 +1226,14 @@ static void print_response(const char *response, bool raw_json) {
 }
 
 /* SSE log streaming client */
+/* ISS-0008 RC4: Ctrl+C must stop the stream. The old code installed
+ * SIG_IGN while polling only the socket, so SIGINT could never break
+ * the loop. Now the handler sets a stop flag the poll loop checks. */
+static volatile sig_atomic_t sse_stream_stop = 0;
+static void sse_sigint_handler(int sig) {
+    (void)sig;
+    sse_stream_stop = 1;
+}
 static int sse_stream_logs(const char *socket_path) {
     (void)socket_path; /* unused, but kept for future use */
 
@@ -1268,20 +1276,22 @@ static int sse_stream_logs(const char *socket_path) {
     bool in_headers = true;
     bool headers_done = false;
 
-    /* Set up signal handler for Ctrl+C */
-    struct sigaction sa;
+    /* Set up signal handler for Ctrl+C (stop flag, never ignore) */
+    sse_stream_stop = 0;
+    struct sigaction sa, old_sa;
     memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = SIG_IGN;  /* We'll handle SIGINT manually via poll */
-    sigaction(SIGINT, &sa, NULL);
+    sa.sa_handler = sse_sigint_handler;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, &old_sa);
 
     struct pollfd pfd;
     pfd.fd = sock;
     pfd.events = POLLIN | POLLHUP | POLLERR;
 
-    while (true) {
+    while (!sse_stream_stop) {
         int poll_rc = poll(&pfd, 1, 1000);
         if (poll_rc < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR) continue; /* loop re-checks sse_stream_stop */
             break;
         }
         if (poll_rc == 0) continue;  /* Timeout, check again */
@@ -1325,6 +1335,8 @@ static int sse_stream_logs(const char *socket_path) {
         }
     }
 
+    /* Restore the previous SIGINT handler before leaving. */
+    sigaction(SIGINT, &old_sa, NULL);
     close(sock);
     return 0;
 }

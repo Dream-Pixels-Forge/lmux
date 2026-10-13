@@ -28,6 +28,15 @@ typedef struct {
 
 static http_server_t *g_http_server = NULL;
 
+/* ISS-0008 RC5: the worker must know its slot so it can release it on
+ * exit — without this every connection leaked a client_fds slot and the
+ * 33rd connection wedged the server forever. */
+typedef struct {
+    http_server_t *server;
+    int fd;
+    int slot;
+} http_client_arg_t;
+
 static const char *http_get_mime_type(const char *path) {
     if (strstr(path, ".html")) return "text/html";
     if (strstr(path, ".css")) return "text/css";
@@ -96,14 +105,16 @@ static void http_send_sse_event(int client_fd, const char *data) {
 }
 
 static void *http_client_thread(void *arg) {
-    int client_fd = *(int *)arg;
-    free(arg);
+    http_client_arg_t *carg = (http_client_arg_t *)arg;
+    http_server_t *server = carg->server;
+    int client_fd = carg->fd;
+    int slot = carg->slot;
+    free(carg);
 
     char buffer[HTTP_BUFFER_SIZE];
     ssize_t bytes_read = read(client_fd, buffer, sizeof(buffer) - 1);
     if (bytes_read <= 0) {
-        close(client_fd);
-        return NULL;
+        goto done;
     }
     buffer[bytes_read] = '\0';
 
@@ -111,8 +122,7 @@ static void *http_client_thread(void *arg) {
     char method[16], path[256], version[16];
     if (sscanf(buffer, "%15s %255s %15s", method, path, version) != 3) {
         http_send_response(client_fd, 400, "text/plain", "Bad Request");
-        close(client_fd);
-        return NULL;
+        goto done;
     }
 
     /* Handle /api/logs/stream endpoint */
@@ -120,8 +130,7 @@ static void *http_client_thread(void *arg) {
     if (strcmp(path, "/api/logs/stream") == 0 || strncmp(path, "/api/logs/stream?", 17) == 0) {
         if (!g_http_server || !g_http_server->app) {
             http_send_response(client_fd, 500, "text/plain", "Server not initialized");
-            close(client_fd);
-            return NULL;
+            goto done;
         }
 
         lmux_app *app = g_http_server->app;
@@ -204,8 +213,7 @@ static void *http_client_thread(void *arg) {
             }
         }
 
-        close(client_fd);
-        return NULL;
+        goto done; /* done: closes fd + releases slot */
     }
     /* Handle other endpoints */
     else if (strcmp(path, "/") == 0 || strcmp(path, "/index.html") == 0) {
@@ -230,8 +238,7 @@ static void *http_client_thread(void *arg) {
                     if (!json) {
                         fclose(fp);
                         http_send_response(client_fd, 500, "text/plain", "Out of memory");
-                        close(client_fd);
-                        return NULL;
+                        goto done;
                     }
                     size_t json_len = snprintf(json, 65536, "{\"lines\":[");
                     int count = 0;
@@ -267,9 +274,19 @@ static void *http_client_thread(void *arg) {
             http_send_response(client_fd, 404, "text/plain", "Not Found");
         }
 
-        close(client_fd);
-        return NULL;
+done:
+    /* ISS-0008 RC5: release the slot on EVERY exit path so the server
+     * never wedges. Close first, then free the slot under the lock. */
+    close(client_fd);
+    if (server && slot >= 0 && slot < HTTP_MAX_CLIENTS) {
+        pthread_mutex_lock(&server->clients_lock);
+        if (server->client_fds[slot] == client_fd) {
+            server->client_fds[slot] = -1;
+        }
+        pthread_mutex_unlock(&server->clients_lock);
     }
+    return NULL;
+}
 
     static void *http_server_thread(void *arg)
     {
@@ -300,10 +317,19 @@ static void *http_client_thread(void *arg) {
                 continue;
             }
 
-            int *client_fd_ptr = malloc(sizeof(int));
-            *client_fd_ptr = client_fd;
+            http_client_arg_t *carg = malloc(sizeof(http_client_arg_t));
+            if (!carg) {
+                pthread_mutex_lock(&server->clients_lock);
+                server->client_fds[slot] = -1;
+                pthread_mutex_unlock(&server->clients_lock);
+                close(client_fd);
+                continue;
+            }
+            carg->server = server;
+            carg->fd = client_fd;
+            carg->slot = slot;
             pthread_t tid;
-            pthread_create(&tid, NULL, http_client_thread, client_fd_ptr);
+            pthread_create(&tid, NULL, http_client_thread, carg);
             pthread_detach(tid);
         }
         return NULL;
