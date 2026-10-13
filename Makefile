@@ -19,7 +19,7 @@ CC          ?= gcc
 # ── Phony declarations ───────────────────────────────────────────────────────
 .PHONY: all build test test-unit test-integration test-fuzz clean \
         dev dev-cli lint format typecheck \
-        deb appimage flatpak rpm all-packages install install-deb uninstall \
+        deb appimage flatpak all-packages install install-deb uninstall \
         dist release version man help
 
 # =============================================================================
@@ -97,14 +97,8 @@ flatpak: build
 	@# test_flatpak_wrapper_runtime_matches_manifest et al. in tests/).
 	flatpak-builder --force-clean dist/flatpak/build packaging/io.github.lmux.lmux.yml
 
-rpm: build
-	@command -v rpmbuild >/dev/null 2>&1 || { echo "Error: rpmbuild not found (install rpm-build)"; exit 1; }
-	@echo "==> Building RPM for lmux v$(VERSION)"
-	@mkdir -p dist/rpm/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
-	rpmbuild -bb packaging/lmux.spec \
-		--define "_topdir $(CURDIR)/dist/rpm" \
-		--define "version $(VERSION)" \
-		--define "prefix $(PREFIX)"
+# RPM: not supported in v1.2.0 (no packaging/lmux.spec) — use deb, AppImage, or
+# `make flatpak` (packaging/io.github.lmux.lmux.yml).
 
 all-packages: deb appimage flatpak
 	@echo "✓ All packages built"
@@ -196,7 +190,6 @@ help:
 	@echo "  deb               Build .deb package"
 	@echo "  appimage          Build AppImage"
 	@echo "  flatpak           Build Flatpak"
-	@echo "  rpm               Build .rpm (requires rpmbuild)"
 	@echo "  all-packages      Build deb + appimage + flatpak"
 	@echo "  install           Install to $(PREFIX) (may need sudo)"
 	@echo "  uninstall         Remove from $(PREFIX)"

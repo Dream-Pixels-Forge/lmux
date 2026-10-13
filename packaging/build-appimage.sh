@@ -31,12 +31,15 @@ err()   { printf "\033[1;31mERROR:\033[0m %s\n" "$*" >&2; }
 # ── Check prerequisites ───────────────────────────────────────
 check_prereqs() {
     local missing=()
-    command -v python3 >/dev/null 2>&1 || missing+=("python3")
-    command -v gcc     >/dev/null 2>&1 || missing+=("gcc (for C core)")
-    command -v node    >/dev/null 2>&1 || missing+=("node (for build scripts)")
+    command -v python3   >/dev/null 2>&1 || missing+=("python3")
+    command -v gcc       >/dev/null 2>&1 || missing+=("gcc")
+    command -v node      >/dev/null 2>&1 || missing+=("node")
+    command -v curl      >/dev/null 2>&1 || missing+=("curl")
+    command -v rsync     >/dev/null 2>&1 || missing+=("rsync")
 
     if [ ${#missing[@]} -gt 0 ]; then
         err "Missing required tools: ${missing[*]}"
+        echo "  Install with: sudo apt-get install ${missing[*]}"
         exit 1
     fi
 }

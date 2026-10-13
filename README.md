@@ -77,7 +77,11 @@ lmuxd
 
 ```bash
 # Install dependencies (Debian/Ubuntu)
-sudo apt install build-essential python3 python3-gi gir1.2-vte-2.91 nodejs
+sudo apt install build-essential gcc pkg-config \
+  libgtk-3-dev libvte-2.91-dev \
+  python3 python3-gi python3-gi-cairo \
+  gir1.2-vte-2.91 gir1.2-gtk-3.0 gir1.2-glib-2.0 \
+  nodejs
 
 # Build everything
 node scripts/run.mjs
@@ -115,6 +119,8 @@ make install-deb
 # Or build AppImage
 ./packaging/build-appimage.sh
 ```
+
+> RPM: build the Flatpak (`make flatpak`) or use the deb / binary — `make rpm` is not available in v1.2.0 (no `packaging/lmux.spec`).
 
 ---
 

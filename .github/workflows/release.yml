@@ -37,6 +37,16 @@ jobs:
         id: version
         run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
 
+      - name: Verify tag matches package.json
+        run: |
+          TAG_VERSION="$(git describe --tags --exact-match | sed 's/^v//')"
+          PKG_VERSION="$(python3 -c 'import json;print(json.load(open("package.json"))["version"])')"
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "::error::Release tag ${TAG_VERSION} does not match package.json version ${PKG_VERSION}."
+            exit 1
+          fi
+          echo "✓ tag ${TAG_VERSION} matches package.json"
+
       - name: Build release binaries
         run: node scripts/build-core.mjs && node scripts/build-cli.mjs
 
@@ -53,6 +63,16 @@ jobs:
       - name: Build Debian package
         run: bash packaging/build-deb.sh
 
+      - name: Run Python integration suite
+        run: python3 tests/test_integration.py
+
+      - name: Generate checksums
+        run: |
+          # Relative paths match the release asset layout so users can
+          # verify each uploaded artifact.
+          sha256sum $(ls dist/deb/*.deb) build/lmux > sha256sums.txt
+          cat sha256sums.txt
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -61,5 +81,6 @@ jobs:
           files: |
             dist/deb/*.deb
             build/lmux
+            sha256sums.txt
           draft: false
           prerelease: ${{ contains(steps.version.outputs.VERSION, '-') }}

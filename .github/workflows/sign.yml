@@ -1,4 +1,13 @@
-name: Container Signing
+name: Sign Release Assets
+
+# Signs the published release artifacts (deb + binary + sha256sums.txt) with
+# cosign. There is no container image to sign — the old ghcr.io path was dead
+# (ISS-0044). Two key paths:
+#   1. GitHub OIDC keyless signing (id-token: write) — default
+#   2. COSIGN_KEY secret — if configured, used instead (key-based)
+# If key material is unusable, we print a loud "artifacts unsigned" warning
+# rather than silently no-op'ing (release is not blocked; artifacts are
+# explicitly marked unsigned).
 
 on:
   workflow_run:
@@ -7,8 +16,7 @@ on:
 
 permissions:
   contents: read
-  packages: write
-  id-token: write  # for keyless OIDC signing
+  id-token: write  # GitHub OIDC keyless cosign
 
 jobs:
   sign:
@@ -20,14 +28,50 @@ jobs:
       - name: Install Cosign
         uses: sigstore/cosign-installer@v3
 
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Sign container image (keyless)
+      # The Release job publishes assets directly to a GitHub release
+      # (softprops/action-gh-release), so download them by tag.
+      - name: Download release assets
         run: |
-          IMAGE="ghcr.io/${{ github.repository }}:${{ github.event.workflow_run.head_branch }}"
-          cosign sign --yes "$IMAGE" || echo "Image not found — skipping sign"
+          TAG="${GITHUB_REF_NAME}"
+          [ -z "$TAG" ] && TAG="$(gh release list --limit 1 --json tagName --jq '.[0].tagName')"
+          mkdir -p release-assets
+          gh release download "$TAG" -D release-assets --clobber
+          ls -la release-assets/
+
+      - name: Sign release assets
+        env:
+          COSIGN_KEY: ${{ secrets.COSIGN_KEY }}
+        run: |
+          set -e
+          # The Release job publishes assets directly to a GitHub release
+          # (softprops/action-gh-release); there is no container to sign.
+          ASSETS=()
+          for f in release-assets/*.deb release-assets/lmux release-assets/sha256sums.txt; do
+            [ -f "$f" ] && ASSETS+=("$f")
+          done
+          if [ ${#ASSETS[@]} -eq 0 ]; then
+            echo "::error::No release assets found to sign (deb/binary/sha256sums.txt)."
+            echo "::warning::artifacts unsigned — nothing downloadable from the release."
+            exit 0
+          fi
+
+          if [ -n "$COSIGN_KEY" ]; then
+            # Key-based signing via the COSIGN_KEY secret.
+            echo "Signing with COSIGN_KEY secret..."
+            for asset in "${ASSETS[@]}"; do
+              cosign sign --key cosign.key --yes "$asset"
+            done
+            echo "✓ Signed (key-based): ${ASSETS[*]}"
+          else
+            # GitHub OIDC keyless signing.
+            echo "Signing keylessly via GitHub OIDC..."
+            for asset in "${ASSETS[@]}"; do
+              cosign sign --yes "$asset"
+            done
+            echo "✓ Signed (keyless): ${ASSETS[*]}"
+          fi
+
+      - name: Unsigned artifact alarm
+        if: failure()
+        run: |
+          echo "::error::SIGNING FAILED — artifacts unsigned. The release was published without valid cosign signatures."
