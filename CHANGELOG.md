@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Session snapshot default moved to the data directory
+  (`$XDG_DATA_HOME/lmux/snapshot.json`, else
+  `~/.local/share/lmux/snapshot.json`); `snapshot.save`/`snapshot.load`
+  confine paths to that directory. The legacy default
+  `~/.lmux_snapshot.json` is no longer loaded — move it once to the new
+  location (see "Session snapshots" in the README).
+
 ## [0.1.0] - 2026-06-20
 
 ### Added

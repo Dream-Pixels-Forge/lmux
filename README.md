@@ -221,6 +221,31 @@ lmux reads configuration from `~/.config/lmux/config.json`:
 | `default_shell` | string | system `$SHELL` | Shell for new panes |
 | `auto_save_session` | bool | `true` | Auto-save/restore sessions |
 
+### Session snapshots
+
+`snapshot.save [path]` and `snapshot.load [path]` persist the workspace
+model. With no explicit path both default to `snapshot.json` inside the
+data directory:
+
+- `$XDG_DATA_HOME/lmux/snapshot.json` when `XDG_DATA_HOME` is set,
+- otherwise `~/.local/share/lmux/snapshot.json` (`/tmp/lmux/snapshot.json`
+  as a last resort when `HOME` is unset).
+
+A relative `path` resolves under that data directory; an absolute `path`
+is accepted only when it points inside it, otherwise the command fails
+with `invalid_params`.
+
+> **Migration note:** older releases defaulted to `~/.lmux_snapshot.json`.
+> That file is no longer loaded automatically. To keep it, move it once:
+>
+> ```sh
+> mkdir -p ~/.local/share/lmux
+> mv ~/.lmux_snapshot.json ~/.local/share/lmux/snapshot.json
+> ```
+>
+> (Use `$XDG_DATA_HOME/lmux/snapshot.json` as the destination when
+> `XDG_DATA_HOME` is set.)
+
 ---
 
 ## CLI Commands
