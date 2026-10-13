@@ -388,8 +388,10 @@ static char *translate_tmux_command(int argc, char **argv) {
             args_len = snprintf(args_buf, sizeof args_buf,
                 "\"key\":\"%s\"", (json_escape(x_key, _esc, sizeof _esc), _esc));
             if (target) {
+                /* target format: workspace_id:pane_id or just pane_id */
+                /* For now, assume target is pane_id and use focused workspace */
                 args_len += snprintf(args_buf + args_len, sizeof args_buf - args_len,
-                    ",\"surface_id\":\"%s\"", (json_escape(target, _esc, sizeof _esc), _esc));
+                    ",\"pane_id\":\"%s\"", (json_escape(target, _esc, sizeof _esc), _esc));
             }
             snprintf(json, 8192, "{\"cmd\":\"pane.copy_mode.move\",\"args\":{%s}}", args_buf);
         } else if (text) {

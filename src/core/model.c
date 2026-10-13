@@ -7822,8 +7822,30 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         json_extract_string(args_json, "key", key, sizeof key);
         json_extract_string(args_json, "workspace_id", ws_id, sizeof ws_id);
         json_extract_string(args_json, "pane_id", p_id, sizeof p_id);
-        lmux_workspace *ws = ws_id[0] ? lmux_workspace_by_id(app, (lmux_id)atol(ws_id))
-                                      : lmux_workspace_focused(app);
+        lmux_workspace *ws = NULL;
+        if (ws_id[0]) {
+            ws = lmux_workspace_by_id(app, (lmux_id)atol(ws_id));
+        } else if (p_id[0]) {
+            /* If pane_id provided but no workspace_id, search all workspaces */
+            lmux_id pid = (lmux_id)atol(p_id);
+            for (size_t i = 0; i < app->workspaces.len; i++) {
+                lmux_workspace *cws = app->workspaces.items[i];
+                for (size_t j = 0; j < cws->surfaces.len; j++) {
+                    lmux_surface *s = cws->surfaces.items[j];
+                    for (size_t k = 0; k < s->panes.len; k++) {
+                        lmux_pane *cp = s->panes.items[k];
+                        if (cp->id == pid) {
+                            ws = cws;
+                            break;
+                        }
+                    }
+                    if (ws) break;
+                }
+                if (ws) break;
+            }
+        } else {
+            ws = lmux_workspace_focused(app);
+        }
         if (!ws) {
             written = snprintf(result, result_cap,
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no workspaces\"}}");
