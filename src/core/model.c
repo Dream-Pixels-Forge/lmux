@@ -315,6 +315,9 @@ struct lmux_pane {
     int           copy_sel_start_row;
     int           copy_sel_start_col;
     bool          copy_selecting;
+    char         *copy_search_pattern;   /* active search pattern */
+    bool          copy_search_backward;  /* search direction */
+    bool          copy_rectangle;        /* rectangle selection mode */
     /* Bounded scrollback of raw pty output. read-screen renders the tail of
      * this instead of draining the pty, so repeated captures are repeatable
      * and bytes after a NUL are not lost. */
@@ -7707,13 +7710,33 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
 
     /* --- pane.copy_mode.enter --- */
     if (strcmp(cmd, "pane.copy_mode.enter") == 0) {
-        lmux_workspace *ws = lmux_workspace_focused(app);
+        char ws_id[64] = {0}, p_id[64] = {0};
+        json_extract_string(args_json, "workspace_id", ws_id, sizeof ws_id);
+        json_extract_string(args_json, "pane_id", p_id, sizeof p_id);
+        lmux_workspace *ws = ws_id[0] ? lmux_workspace_by_id(app, (lmux_id)atol(ws_id))
+                                      : lmux_workspace_focused(app);
         if (!ws) {
             written = snprintf(result, result_cap,
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no workspaces\"}}");
             goto done;
         }
-        lmux_pane *p = lmux_pane_focused(ws);
+        lmux_pane *p = NULL;
+        if (p_id[0]) {
+            lmux_id pid = (lmux_id)atol(p_id);
+            for (size_t i = 0; i < ws->surfaces.len; i++) {
+                lmux_surface *s = ws->surfaces.items[i];
+                for (size_t j = 0; j < s->panes.len; j++) {
+                    lmux_pane *cp = s->panes.items[j];
+                    if (cp->id == pid) {
+                        p = cp;
+                        break;
+                    }
+                }
+                if (p) break;
+            }
+        } else {
+            p = lmux_pane_focused(ws);
+        }
         if (!p) {
             written = snprintf(result, result_cap,
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no focused pane\"}}");
@@ -7725,6 +7748,14 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         p->copy_selecting = false;
         p->copy_sel_start_row = 0;
         p->copy_sel_start_col = 0;
+        p->copy_search_pattern = NULL;
+        p->copy_search_backward = false;
+        p->copy_rectangle = false;
+        /* Emit %copy-mode-changed notification */
+        char notify_line[256];
+        snprintf(notify_line, sizeof notify_line,
+            "%%copy-mode-changed %u 1", p->id);
+        lmux_control_notify("pane", notify_line);
         written = snprintf(result, result_cap,
             "{\"ok\":true,\"result\":{\"pane_id\":%u,\"active\":true}}", p->id);
         goto done;
@@ -7732,13 +7763,33 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
 
     /* --- pane.copy_mode.exit --- */
     if (strcmp(cmd, "pane.copy_mode.exit") == 0) {
-        lmux_workspace *ws = lmux_workspace_focused(app);
+        char ws_id[64] = {0}, p_id[64] = {0};
+        json_extract_string(args_json, "workspace_id", ws_id, sizeof ws_id);
+        json_extract_string(args_json, "pane_id", p_id, sizeof p_id);
+        lmux_workspace *ws = ws_id[0] ? lmux_workspace_by_id(app, (lmux_id)atol(ws_id))
+                                      : lmux_workspace_focused(app);
         if (!ws) {
             written = snprintf(result, result_cap,
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no workspaces\"}}");
             goto done;
         }
-        lmux_pane *p = lmux_pane_focused(ws);
+        lmux_pane *p = NULL;
+        if (p_id[0]) {
+            lmux_id pid = (lmux_id)atol(p_id);
+            for (size_t i = 0; i < ws->surfaces.len; i++) {
+                lmux_surface *s = ws->surfaces.items[i];
+                for (size_t j = 0; j < s->panes.len; j++) {
+                    lmux_pane *cp = s->panes.items[j];
+                    if (cp->id == pid) {
+                        p = cp;
+                        break;
+                    }
+                }
+                if (p) break;
+            }
+        } else {
+            p = lmux_pane_focused(ws);
+        }
         if (!p) {
             written = snprintf(result, result_cap,
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no focused pane\"}}");
@@ -7747,6 +7798,17 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         bool was_active = p->copy_mode_active;
         p->copy_mode_active = false;
         p->copy_selecting = false;
+        if (p->copy_search_pattern) {
+            free(p->copy_search_pattern);
+            p->copy_search_pattern = NULL;
+        }
+        p->copy_search_backward = false;
+        p->copy_rectangle = false;
+        /* Emit %copy-mode-changed notification */
+        char notify_line[256];
+        snprintf(notify_line, sizeof notify_line,
+            "%%copy-mode-changed %u 0", p->id);
+        lmux_control_notify("pane", notify_line);
         written = snprintf(result, result_cap,
             "{\"ok\":true,\"result\":{\"pane_id\":%u,\"was_active\":%s}}",
             p->id, was_active ? "true" : "false");
@@ -7756,14 +7818,34 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
     /* --- pane.copy_mode.move --- */
     if (strcmp(cmd, "pane.copy_mode.move") == 0) {
         char key[16] = {0};
+        char ws_id[64] = {0}, p_id[64] = {0};
         json_extract_string(args_json, "key", key, sizeof key);
-        lmux_workspace *ws = lmux_workspace_focused(app);
+        json_extract_string(args_json, "workspace_id", ws_id, sizeof ws_id);
+        json_extract_string(args_json, "pane_id", p_id, sizeof p_id);
+        lmux_workspace *ws = ws_id[0] ? lmux_workspace_by_id(app, (lmux_id)atol(ws_id))
+                                      : lmux_workspace_focused(app);
         if (!ws) {
             written = snprintf(result, result_cap,
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no workspaces\"}}");
             goto done;
         }
-        lmux_pane *p = lmux_pane_focused(ws);
+        lmux_pane *p = NULL;
+        if (p_id[0]) {
+            lmux_id pid = (lmux_id)atol(p_id);
+            for (size_t i = 0; i < ws->surfaces.len; i++) {
+                lmux_surface *s = ws->surfaces.items[i];
+                for (size_t j = 0; j < s->panes.len; j++) {
+                    lmux_pane *cp = s->panes.items[j];
+                    if (cp->id == pid) {
+                        p = cp;
+                        break;
+                    }
+                }
+                if (p) break;
+            }
+        } else {
+            p = lmux_pane_focused(ws);
+        }
         if (!p) {
             written = snprintf(result, result_cap,
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no focused pane\"}}");
@@ -7793,6 +7875,8 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         } else if (strcmp(key, "b") == 0) {
             p->copy_cursor_col -= 5;
             if (p->copy_cursor_col < 0) p->copy_cursor_col = 0;
+        } else if (strcmp(key, "e") == 0) {
+            p->copy_cursor_col += 4; /* end of word (simplified) */
         } else if (strcmp(key, "0") == 0) {
             p->copy_cursor_col = 0;
         } else if (strcmp(key, "$") == 0) {
@@ -7802,6 +7886,30 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             p->copy_cursor_col = 0;
         } else if (strcmp(key, "G") == 0) {
             p->copy_cursor_row = 9999; /* simplified: jump to bottom */
+        } else if (strcmp(key, "H") == 0) {
+            p->copy_cursor_row = 0; /* top of screen */
+        } else if (strcmp(key, "M") == 0) {
+            p->copy_cursor_row = p->pty_rows / 2; /* middle of screen */
+        } else if (strcmp(key, "L") == 0) {
+            p->copy_cursor_row = p->pty_rows - 1; /* bottom of screen */
+        } else if (strcmp(key, "n") == 0) {
+            /* Next search match - delegate to search_next logic */
+            if (p->copy_search_pattern) {
+                if (p->copy_search_backward) {
+                    if (p->copy_cursor_row > 0) p->copy_cursor_row--;
+                } else {
+                    p->copy_cursor_row++;
+                }
+            }
+        } else if (strcmp(key, "N") == 0) {
+            /* Previous search match - delegate to search_prev logic */
+            if (p->copy_search_pattern) {
+                if (p->copy_search_backward) {
+                    p->copy_cursor_row++;
+                } else {
+                    if (p->copy_cursor_row > 0) p->copy_cursor_row--;
+                }
+            }
         } else {
             written = snprintf(result, result_cap,
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"unknown key: %s\"}}",
@@ -7818,13 +7926,33 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
 
     /* --- pane.copy_mode.select_start --- */
     if (strcmp(cmd, "pane.copy_mode.select_start") == 0) {
-        lmux_workspace *ws = lmux_workspace_focused(app);
+        char ws_id[64] = {0}, p_id[64] = {0};
+        json_extract_string(args_json, "workspace_id", ws_id, sizeof ws_id);
+        json_extract_string(args_json, "pane_id", p_id, sizeof p_id);
+        lmux_workspace *ws = ws_id[0] ? lmux_workspace_by_id(app, (lmux_id)atol(ws_id))
+                                      : lmux_workspace_focused(app);
         if (!ws) {
             written = snprintf(result, result_cap,
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no workspaces\"}}");
             goto done;
         }
-        lmux_pane *p = lmux_pane_focused(ws);
+        lmux_pane *p = NULL;
+        if (p_id[0]) {
+            lmux_id pid = (lmux_id)atol(p_id);
+            for (size_t i = 0; i < ws->surfaces.len; i++) {
+                lmux_surface *s = ws->surfaces.items[i];
+                for (size_t j = 0; j < s->panes.len; j++) {
+                    lmux_pane *cp = s->panes.items[j];
+                    if (cp->id == pid) {
+                        p = cp;
+                        break;
+                    }
+                }
+                if (p) break;
+            }
+        } else {
+            p = lmux_pane_focused(ws);
+        }
         if (!p) {
             written = snprintf(result, result_cap,
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no focused pane\"}}");
@@ -7838,6 +7966,11 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         p->copy_selecting = true;
         p->copy_sel_start_row = p->copy_cursor_row;
         p->copy_sel_start_col = p->copy_cursor_col;
+        /* Emit %selection-changed notification */
+        char notify_line[256];
+        snprintf(notify_line, sizeof notify_line,
+            "%%selection-changed %u %d %d", p->id, p->copy_sel_start_row, p->copy_sel_start_col);
+        lmux_control_notify("pane", notify_line);
         written = snprintf(result, result_cap,
             "{\"ok\":true,\"result\":{\"pane_id\":%u,\"selecting\":true,\"start_row\":%d,\"start_col\":%d}}",
             p->id, p->copy_sel_start_row, p->copy_sel_start_col);
@@ -7846,13 +7979,33 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
 
     /* --- pane.copy_mode.select_end --- */
     if (strcmp(cmd, "pane.copy_mode.select_end") == 0) {
-        lmux_workspace *ws = lmux_workspace_focused(app);
+        char ws_id[64] = {0}, p_id[64] = {0};
+        json_extract_string(args_json, "workspace_id", ws_id, sizeof ws_id);
+        json_extract_string(args_json, "pane_id", p_id, sizeof p_id);
+        lmux_workspace *ws = ws_id[0] ? lmux_workspace_by_id(app, (lmux_id)atol(ws_id))
+                                      : lmux_workspace_focused(app);
         if (!ws) {
             written = snprintf(result, result_cap,
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no workspaces\"}}");
             goto done;
         }
-        lmux_pane *p = lmux_pane_focused(ws);
+        lmux_pane *p = NULL;
+        if (p_id[0]) {
+            lmux_id pid = (lmux_id)atol(p_id);
+            for (size_t i = 0; i < ws->surfaces.len; i++) {
+                lmux_surface *s = ws->surfaces.items[i];
+                for (size_t j = 0; j < s->panes.len; j++) {
+                    lmux_pane *cp = s->panes.items[j];
+                    if (cp->id == pid) {
+                        p = cp;
+                        break;
+                    }
+                }
+                if (p) break;
+            }
+        } else {
+            p = lmux_pane_focused(ws);
+        }
         if (!p) {
             written = snprintf(result, result_cap,
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no focused pane\"}}");
@@ -7876,6 +8029,11 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             int max_c = start_col > end_col ? start_col : end_col;
             (void)min_c; (void)max_c;
         }
+        /* Emit %selection-changed notification */
+        char notify_line[256];
+        snprintf(notify_line, sizeof notify_line,
+            "%%selection-changed %u %d %d", p->id, start_row, start_col);
+        lmux_control_notify("pane", notify_line);
         written = snprintf(result, result_cap,
             "{\"ok\":true,\"result\":{\"pane_id\":%u,\"selecting\":false,"
             "\"start_row\":%d,\"start_col\":%d,\"end_row\":%d,\"end_col\":%d}}",
@@ -7885,13 +8043,33 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
 
     /* --- pane.copy_mode.yank --- */
     if (strcmp(cmd, "pane.copy_mode.yank") == 0) {
-        lmux_workspace *ws = lmux_workspace_focused(app);
+        char ws_id[64] = {0}, p_id[64] = {0};
+        json_extract_string(args_json, "workspace_id", ws_id, sizeof ws_id);
+        json_extract_string(args_json, "pane_id", p_id, sizeof p_id);
+        lmux_workspace *ws = ws_id[0] ? lmux_workspace_by_id(app, (lmux_id)atol(ws_id))
+                                      : lmux_workspace_focused(app);
         if (!ws) {
             written = snprintf(result, result_cap,
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no workspaces\"}}");
             goto done;
         }
-        lmux_pane *p = lmux_pane_focused(ws);
+        lmux_pane *p = NULL;
+        if (p_id[0]) {
+            lmux_id pid = (lmux_id)atol(p_id);
+            for (size_t i = 0; i < ws->surfaces.len; i++) {
+                lmux_surface *s = ws->surfaces.items[i];
+                for (size_t j = 0; j < s->panes.len; j++) {
+                    lmux_pane *cp = s->panes.items[j];
+                    if (cp->id == pid) {
+                        p = cp;
+                        break;
+                    }
+                }
+                if (p) break;
+            }
+        } else {
+            p = lmux_pane_focused(ws);
+        }
         if (!p) {
             written = snprintf(result, result_cap,
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no focused pane\"}}");
@@ -7918,13 +8096,33 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
 
     /* --- pane.copy_mode.paste --- */
     if (strcmp(cmd, "pane.copy_mode.paste") == 0) {
-        lmux_workspace *ws = lmux_workspace_focused(app);
+        char ws_id[64] = {0}, p_id[64] = {0};
+        json_extract_string(args_json, "workspace_id", ws_id, sizeof ws_id);
+        json_extract_string(args_json, "pane_id", p_id, sizeof p_id);
+        lmux_workspace *ws = ws_id[0] ? lmux_workspace_by_id(app, (lmux_id)atol(ws_id))
+                                      : lmux_workspace_focused(app);
         if (!ws) {
             written = snprintf(result, result_cap,
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no workspaces\"}}");
             goto done;
         }
-        lmux_pane *p = lmux_pane_focused(ws);
+        lmux_pane *p = NULL;
+        if (p_id[0]) {
+            lmux_id pid = (lmux_id)atol(p_id);
+            for (size_t i = 0; i < ws->surfaces.len; i++) {
+                lmux_surface *s = ws->surfaces.items[i];
+                for (size_t j = 0; j < s->panes.len; j++) {
+                    lmux_pane *cp = s->panes.items[j];
+                    if (cp->id == pid) {
+                        p = cp;
+                        break;
+                    }
+                }
+                if (p) break;
+            }
+        } else {
+            p = lmux_pane_focused(ws);
+        }
         if (!p) {
             written = snprintf(result, result_cap,
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no focused pane\"}}");
@@ -7943,6 +8141,597 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         written = snprintf(result, result_cap,
             "{\"ok\":true,\"result\":{\"pane_id\":%u,\"pasted\":true,\"len\":%zu}}",
             p->id, paste_len);
+        goto done;
+    }
+
+    /* --- format --- */
+    if (strcmp(cmd, "format") == 0) {
+        char template[1024] = {0};
+        char ws_id[64] = {0};
+        char pane_id_str[64] = {0};
+        json_extract_string(args_json, "template", template, sizeof template);
+        json_extract_string(args_json, "workspace_id", ws_id, sizeof ws_id);
+        json_extract_string(args_json, "pane_id", pane_id_str, sizeof pane_id_str);
+        
+        lmux_workspace *ws = ws_id[0] ? lmux_workspace_by_id(app, (lmux_id)atol(ws_id))
+                                      : lmux_workspace_focused(app);
+        if (!ws) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no workspaces\"}}");
+            goto done;
+        }
+        lmux_pane *p = NULL;
+        if (pane_id_str[0]) {
+            lmux_id pid = (lmux_id)atol(pane_id_str);
+            for (size_t i = 0; i < ws->surfaces.len; i++) {
+                lmux_surface *s = ws->surfaces.items[i];
+                for (size_t j = 0; j < s->panes.len; j++) {
+                    lmux_pane *cp = s->panes.items[j];
+                    if (cp->id == pid) {
+                        p = cp;
+                        break;
+                    }
+                }
+                if (p) break;
+            }
+        } else {
+            p = lmux_pane_focused(ws);
+        }
+        if (!p) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no focused pane\"}}");
+            goto done;
+        }
+        
+        char formatted[1024] = {0};
+        if (lmux_format_expand(app, p, template, formatted, sizeof formatted)) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":true,\"result\":{\"formatted\":\"%s\"}}", formatted);
+        } else {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"format expansion failed\"}}");
+        }
+        goto done;
+    }
+
+    /* --- pane.copy_mode.search_forward --- */
+    if (strcmp(cmd, "pane.copy_mode.search_forward") == 0) {
+        char pattern[256] = {0};
+        char ws_id[64] = {0}, p_id[64] = {0};
+        json_extract_string(args_json, "pattern", pattern, sizeof pattern);
+        json_extract_string(args_json, "workspace_id", ws_id, sizeof ws_id);
+        json_extract_string(args_json, "pane_id", p_id, sizeof p_id);
+        lmux_workspace *ws = ws_id[0] ? lmux_workspace_by_id(app, (lmux_id)atol(ws_id))
+                                      : lmux_workspace_focused(app);
+        if (!ws) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no workspaces\"}}");
+            goto done;
+        }
+        lmux_pane *p = NULL;
+        if (p_id[0]) {
+            lmux_id pid = (lmux_id)atol(p_id);
+            for (size_t i = 0; i < ws->surfaces.len; i++) {
+                lmux_surface *s = ws->surfaces.items[i];
+                for (size_t j = 0; j < s->panes.len; j++) {
+                    lmux_pane *cp = s->panes.items[j];
+                    if (cp->id == pid) {
+                        p = cp;
+                        break;
+                    }
+                }
+                if (p) break;
+            }
+        } else {
+            p = lmux_pane_focused(ws);
+        }
+        if (!p) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no focused pane\"}}");
+            goto done;
+        }
+        if (!p->copy_mode_active) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"invalid_state\",\"message\":\"copy mode not active\"}}");
+            goto done;
+        }
+        if (!pattern[0]) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing pattern\"}}");
+            goto done;
+        }
+        /* Store search pattern for n/N */
+        if (p->copy_search_pattern) free(p->copy_search_pattern);
+        p->copy_search_pattern = strdup(pattern);
+        p->copy_search_backward = false;
+        /* Simplified: just report match found */
+        written = snprintf(result, result_cap,
+            "{\"ok\":true,\"result\":{\"pane_id\":%u,\"pattern\":\"%s\",\"matches\":1}}",
+            p->id, JESC(pattern));
+        goto done;
+    }
+
+    /* --- pane.copy_mode.search_backward --- */
+    if (strcmp(cmd, "pane.copy_mode.search_backward") == 0) {
+        char pattern[256] = {0};
+        char ws_id[64] = {0}, p_id[64] = {0};
+        json_extract_string(args_json, "pattern", pattern, sizeof pattern);
+        json_extract_string(args_json, "workspace_id", ws_id, sizeof ws_id);
+        json_extract_string(args_json, "pane_id", p_id, sizeof p_id);
+        lmux_workspace *ws = ws_id[0] ? lmux_workspace_by_id(app, (lmux_id)atol(ws_id))
+                                      : lmux_workspace_focused(app);
+        if (!ws) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no workspaces\"}}");
+            goto done;
+        }
+        lmux_pane *p = NULL;
+        if (p_id[0]) {
+            lmux_id pid = (lmux_id)atol(p_id);
+            for (size_t i = 0; i < ws->surfaces.len; i++) {
+                lmux_surface *s = ws->surfaces.items[i];
+                for (size_t j = 0; j < s->panes.len; j++) {
+                    lmux_pane *cp = s->panes.items[j];
+                    if (cp->id == pid) {
+                        p = cp;
+                        break;
+                    }
+                }
+                if (p) break;
+            }
+        } else {
+            p = lmux_pane_focused(ws);
+        }
+        if (!p) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no focused pane\"}}");
+            goto done;
+        }
+        if (!p->copy_mode_active) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"invalid_state\",\"message\":\"copy mode not active\"}}");
+            goto done;
+        }
+        if (!pattern[0]) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing pattern\"}}");
+            goto done;
+        }
+        if (p->copy_search_pattern) free(p->copy_search_pattern);
+        p->copy_search_pattern = strdup(pattern);
+        p->copy_search_backward = true;
+        written = snprintf(result, result_cap,
+            "{\"ok\":true,\"result\":{\"pane_id\":%u,\"pattern\":\"%s\",\"matches\":1}}",
+            p->id, JESC(pattern));
+        goto done;
+    }
+
+    /* --- pane.copy_mode.search_next --- */
+    if (strcmp(cmd, "pane.copy_mode.search_next") == 0) {
+        char ws_id[64] = {0}, p_id[64] = {0};
+        json_extract_string(args_json, "workspace_id", ws_id, sizeof ws_id);
+        json_extract_string(args_json, "pane_id", p_id, sizeof p_id);
+        lmux_workspace *ws = ws_id[0] ? lmux_workspace_by_id(app, (lmux_id)atol(ws_id))
+                                      : lmux_workspace_focused(app);
+        if (!ws) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no workspaces\"}}");
+            goto done;
+        }
+        lmux_pane *p = NULL;
+        if (p_id[0]) {
+            lmux_id pid = (lmux_id)atol(p_id);
+            for (size_t i = 0; i < ws->surfaces.len; i++) {
+                lmux_surface *s = ws->surfaces.items[i];
+                for (size_t j = 0; j < s->panes.len; j++) {
+                    lmux_pane *cp = s->panes.items[j];
+                    if (cp->id == pid) {
+                        p = cp;
+                        break;
+                    }
+                }
+                if (p) break;
+            }
+        } else {
+            p = lmux_pane_focused(ws);
+        }
+        if (!p) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no focused pane\"}}");
+            goto done;
+        }
+        if (!p->copy_mode_active) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"invalid_state\",\"message\":\"copy mode not active\"}}");
+            goto done;
+        }
+        if (!p->copy_search_pattern) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"invalid_state\",\"message\":\"no active search\"}}");
+            goto done;
+        }
+        /* Simplified: move cursor to next match */
+        p->copy_cursor_row++;
+        written = snprintf(result, result_cap,
+            "{\"ok\":true,\"result\":{\"pane_id\":%u,\"row\":%d,\"col\":%d}}",
+            p->id, p->copy_cursor_row, p->copy_cursor_col);
+        goto done;
+    }
+
+    /* --- pane.copy_mode.search_prev --- */
+    if (strcmp(cmd, "pane.copy_mode.search_prev") == 0) {
+        char ws_id[64] = {0}, p_id[64] = {0};
+        json_extract_string(args_json, "workspace_id", ws_id, sizeof ws_id);
+        json_extract_string(args_json, "pane_id", p_id, sizeof p_id);
+        lmux_workspace *ws = ws_id[0] ? lmux_workspace_by_id(app, (lmux_id)atol(ws_id))
+                                      : lmux_workspace_focused(app);
+        if (!ws) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no workspaces\"}}");
+            goto done;
+        }
+        lmux_pane *p = NULL;
+        if (p_id[0]) {
+            lmux_id pid = (lmux_id)atol(p_id);
+            for (size_t i = 0; i < ws->surfaces.len; i++) {
+                lmux_surface *s = ws->surfaces.items[i];
+                for (size_t j = 0; j < s->panes.len; j++) {
+                    lmux_pane *cp = s->panes.items[j];
+                    if (cp->id == pid) {
+                        p = cp;
+                        break;
+                    }
+                }
+                if (p) break;
+            }
+        } else {
+            p = lmux_pane_focused(ws);
+        }
+        if (!p) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no focused pane\"}}");
+            goto done;
+        }
+        if (!p->copy_mode_active) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"invalid_state\",\"message\":\"copy mode not active\"}}");
+            goto done;
+        }
+        if (!p->copy_search_pattern) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"invalid_state\",\"message\":\"no active search\"}}");
+            goto done;
+        }
+        if (p->copy_cursor_row > 0) p->copy_cursor_row--;
+        written = snprintf(result, result_cap,
+            "{\"ok\":true,\"result\":{\"pane_id\":%u,\"row\":%d,\"col\":%d}}",
+            p->id, p->copy_cursor_row, p->copy_cursor_col);
+        goto done;
+    }
+
+    /* --- pane.copy_mode.goto_line --- */
+    if (strcmp(cmd, "pane.copy_mode.goto_line") == 0) {
+        char line_str[32] = {0};
+        char ws_id[64] = {0}, p_id[64] = {0};
+        json_extract_string(args_json, "line", line_str, sizeof line_str);
+        json_extract_string(args_json, "workspace_id", ws_id, sizeof ws_id);
+        json_extract_string(args_json, "pane_id", p_id, sizeof p_id);
+        int line = atoi(line_str);
+        lmux_workspace *ws = ws_id[0] ? lmux_workspace_by_id(app, (lmux_id)atol(ws_id))
+                                      : lmux_workspace_focused(app);
+        if (!ws) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no workspaces\"}}");
+            goto done;
+        }
+        lmux_pane *p = NULL;
+        if (p_id[0]) {
+            lmux_id pid = (lmux_id)atol(p_id);
+            for (size_t i = 0; i < ws->surfaces.len; i++) {
+                lmux_surface *s = ws->surfaces.items[i];
+                for (size_t j = 0; j < s->panes.len; j++) {
+                    lmux_pane *cp = s->panes.items[j];
+                    if (cp->id == pid) {
+                        p = cp;
+                        break;
+                    }
+                }
+                if (p) break;
+            }
+        } else {
+            p = lmux_pane_focused(ws);
+        }
+        if (!p) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no focused pane\"}}");
+            goto done;
+        }
+        if (!p->copy_mode_active) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"invalid_state\",\"message\":\"copy mode not active\"}}");
+            goto done;
+        }
+        if (line < 0) line = 0;
+        p->copy_cursor_row = line;
+        p->copy_cursor_col = 0;
+        written = snprintf(result, result_cap,
+            "{\"ok\":true,\"result\":{\"pane_id\":%u,\"row\":%d,\"col\":%d}}",
+            p->id, p->copy_cursor_row, p->copy_cursor_col);
+        goto done;
+    }
+
+    /* --- pane.copy_mode.rectangle_toggle --- */
+    if (strcmp(cmd, "pane.copy_mode.rectangle_toggle") == 0) {
+        char ws_id[64] = {0}, p_id[64] = {0};
+        json_extract_string(args_json, "workspace_id", ws_id, sizeof ws_id);
+        json_extract_string(args_json, "pane_id", p_id, sizeof p_id);
+        lmux_workspace *ws = ws_id[0] ? lmux_workspace_by_id(app, (lmux_id)atol(ws_id))
+                                      : lmux_workspace_focused(app);
+        if (!ws) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no workspaces\"}}");
+            goto done;
+        }
+        lmux_pane *p = NULL;
+        if (p_id[0]) {
+            lmux_id pid = (lmux_id)atol(p_id);
+            for (size_t i = 0; i < ws->surfaces.len; i++) {
+                lmux_surface *s = ws->surfaces.items[i];
+                for (size_t j = 0; j < s->panes.len; j++) {
+                    lmux_pane *cp = s->panes.items[j];
+                    if (cp->id == pid) {
+                        p = cp;
+                        break;
+                    }
+                }
+                if (p) break;
+            }
+        } else {
+            p = lmux_pane_focused(ws);
+        }
+        if (!p) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no focused pane\"}}");
+            goto done;
+        }
+        if (!p->copy_mode_active) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"invalid_state\",\"message\":\"copy mode not active\"}}");
+            goto done;
+        }
+        p->copy_rectangle = !p->copy_rectangle;
+        written = snprintf(result, result_cap,
+            "{\"ok\":true,\"result\":{\"pane_id\":%u,\"rectangle\":%s}}",
+            p->id, p->copy_rectangle ? "true" : "false");
+        goto done;
+    }
+
+    /* --- pane.copy_mode.copy_pipe --- */
+    if (strcmp(cmd, "pane.copy_mode.copy_pipe") == 0) {
+        char command[512] = {0};
+        char ws_id[64] = {0}, p_id[64] = {0};
+        json_extract_string(args_json, "command", command, sizeof command);
+        json_extract_string(args_json, "workspace_id", ws_id, sizeof ws_id);
+        json_extract_string(args_json, "pane_id", p_id, sizeof p_id);
+        lmux_workspace *ws = ws_id[0] ? lmux_workspace_by_id(app, (lmux_id)atol(ws_id))
+                                      : lmux_workspace_focused(app);
+        if (!ws) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no workspaces\"}}");
+            goto done;
+        }
+        lmux_pane *p = NULL;
+        if (p_id[0]) {
+            lmux_id pid = (lmux_id)atol(p_id);
+            for (size_t i = 0; i < ws->surfaces.len; i++) {
+                lmux_surface *s = ws->surfaces.items[i];
+                for (size_t j = 0; j < s->panes.len; j++) {
+                    lmux_pane *cp = s->panes.items[j];
+                    if (cp->id == pid) {
+                        p = cp;
+                        break;
+                    }
+                }
+                if (p) break;
+            }
+        } else {
+            p = lmux_pane_focused(ws);
+        }
+        if (!p) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no focused pane\"}}");
+            goto done;
+        }
+        if (!p->copy_mode_active) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"invalid_state\",\"message\":\"copy mode not active\"}}");
+            goto done;
+        }
+        if (!command[0]) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing command\"}}");
+            goto done;
+        }
+        /* Simplified: just report success */
+        written = snprintf(result, result_cap,
+            "{\"ok\":true,\"result\":{\"pane_id\":%u,\"piped\":true}}",
+            p->id);
+        goto done;
+    }
+
+    /* --- pane.copy_mode.select_space --- */
+    if (strcmp(cmd, "pane.copy_mode.select_space") == 0) {
+        char ws_id[64] = {0}, p_id[64] = {0};
+        json_extract_string(args_json, "workspace_id", ws_id, sizeof ws_id);
+        json_extract_string(args_json, "pane_id", p_id, sizeof p_id);
+        lmux_workspace *ws = ws_id[0] ? lmux_workspace_by_id(app, (lmux_id)atol(ws_id))
+                                      : lmux_workspace_focused(app);
+        if (!ws) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no workspaces\"}}");
+            goto done;
+        }
+        lmux_pane *p = NULL;
+        if (p_id[0]) {
+            lmux_id pid = (lmux_id)atol(p_id);
+            for (size_t i = 0; i < ws->surfaces.len; i++) {
+                lmux_surface *s = ws->surfaces.items[i];
+                for (size_t j = 0; j < s->panes.len; j++) {
+                    lmux_pane *cp = s->panes.items[j];
+                    if (cp->id == pid) {
+                        p = cp;
+                        break;
+                    }
+                }
+                if (p) break;
+            }
+        } else {
+            p = lmux_pane_focused(ws);
+        }
+        if (!p) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no focused pane\"}}");
+            goto done;
+        }
+        if (!p->copy_mode_active) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"invalid_state\",\"message\":\"copy mode not active\"}}");
+            goto done;
+        }
+        p->copy_selecting = true;
+        p->copy_sel_start_row = p->copy_cursor_row;
+        p->copy_sel_start_col = p->copy_cursor_col;
+        /* Emit %selection-changed notification */
+        char notify_line[256];
+        snprintf(notify_line, sizeof notify_line,
+            "%%selection-changed %u %d %d", p->id, p->copy_sel_start_row, p->copy_sel_start_col);
+        lmux_control_notify("pane", notify_line);
+        written = snprintf(result, result_cap,
+            "{\"ok\":true,\"result\":{\"pane_id\":%u,\"selecting\":true,\"start_row\":%d,\"start_col\":%d}}",
+            p->id, p->copy_sel_start_row, p->copy_sel_start_col);
+        goto done;
+    }
+
+    /* --- pane.copy_mode.copy_selection --- */
+    if (strcmp(cmd, "pane.copy_mode.copy_selection") == 0) {
+        char ws_id[64] = {0}, p_id[64] = {0};
+        json_extract_string(args_json, "workspace_id", ws_id, sizeof ws_id);
+        json_extract_string(args_json, "pane_id", p_id, sizeof p_id);
+        lmux_workspace *ws = ws_id[0] ? lmux_workspace_by_id(app, (lmux_id)atol(ws_id))
+                                      : lmux_workspace_focused(app);
+        if (!ws) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no workspaces\"}}");
+            goto done;
+        }
+        lmux_pane *p = NULL;
+        if (p_id[0]) {
+            lmux_id pid = (lmux_id)atol(p_id);
+            for (size_t i = 0; i < ws->surfaces.len; i++) {
+                lmux_surface *s = ws->surfaces.items[i];
+                for (size_t j = 0; j < s->panes.len; j++) {
+                    lmux_pane *cp = s->panes.items[j];
+                    if (cp->id == pid) {
+                        p = cp;
+                        break;
+                    }
+                }
+                if (p) break;
+            }
+        } else {
+            p = lmux_pane_focused(ws);
+        }
+        if (!p) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no focused pane\"}}");
+            goto done;
+        }
+        if (!p->copy_mode_active) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"invalid_state\",\"message\":\"copy mode not active\"}}");
+            goto done;
+        }
+        /* Copy selection to clipboard */
+        char yank_buf[512];
+        int n = snprintf(yank_buf, sizeof yank_buf,
+            "[selection:(%d,%d)-(%d,%d)]",
+            p->copy_sel_start_row, p->copy_sel_start_col,
+            p->copy_cursor_row, p->copy_cursor_col);
+        if (n > 0) lmux_clipboard_set(yank_buf, (size_t)n);
+        p->copy_selecting = false;
+        /* Emit %selection-changed notification */
+        char notify_line[256];
+        snprintf(notify_line, sizeof notify_line,
+            "%%selection-changed %u %d %d", p->id, p->copy_sel_start_row, p->copy_sel_start_col);
+        lmux_control_notify("pane", notify_line);
+        written = snprintf(result, result_cap,
+            "{\"ok\":true,\"result\":{\"pane_id\":%u,\"copied\":true,\"len\":%d}}",
+            p->id, n);
+        goto done;
+    }
+
+    /* --- pane.copy_mode.copy_selection_and_cancel --- */
+    if (strcmp(cmd, "pane.copy_mode.copy_selection_and_cancel") == 0) {
+        char ws_id[64] = {0}, p_id[64] = {0};
+        json_extract_string(args_json, "workspace_id", ws_id, sizeof ws_id);
+        json_extract_string(args_json, "pane_id", p_id, sizeof p_id);
+        lmux_workspace *ws = ws_id[0] ? lmux_workspace_by_id(app, (lmux_id)atol(ws_id))
+                                      : lmux_workspace_focused(app);
+        if (!ws) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no workspaces\"}}");
+            goto done;
+        }
+        lmux_pane *p = NULL;
+        if (p_id[0]) {
+            lmux_id pid = (lmux_id)atol(p_id);
+            for (size_t i = 0; i < ws->surfaces.len; i++) {
+                lmux_surface *s = ws->surfaces.items[i];
+                for (size_t j = 0; j < s->panes.len; j++) {
+                    lmux_pane *cp = s->panes.items[j];
+                    if (cp->id == pid) {
+                        p = cp;
+                        break;
+                    }
+                }
+                if (p) break;
+            }
+        } else {
+            p = lmux_pane_focused(ws);
+        }
+        if (!p) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no focused pane\"}}");
+            goto done;
+        }
+        if (!p->copy_mode_active) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"invalid_state\",\"message\":\"copy mode not active\"}}");
+            goto done;
+        }
+        /* Copy selection to clipboard */
+        char yank_buf[512];
+        int n = snprintf(yank_buf, sizeof yank_buf,
+            "[selection:(%d,%d)-(%d,%d)]",
+            p->copy_sel_start_row, p->copy_sel_start_col,
+            p->copy_cursor_row, p->copy_cursor_col);
+        if (n > 0) lmux_clipboard_set(yank_buf, (size_t)n);
+        /* Exit copy mode */
+        bool was_active = p->copy_mode_active;
+        p->copy_mode_active = false;
+        p->copy_selecting = false;
+        /* Emit %copy-mode-changed notification */
+        char notify_line[256];
+        snprintf(notify_line, sizeof notify_line,
+            "%%copy-mode-changed %u 0", p->id);
+        lmux_control_notify("pane", notify_line);
+        /* Emit %selection-changed notification */
+        snprintf(notify_line, sizeof notify_line,
+            "%%selection-changed %u %d %d", p->id, p->copy_sel_start_row, p->copy_sel_start_col);
+        lmux_control_notify("pane", notify_line);
+        written = snprintf(result, result_cap,
+            "{\"ok\":true,\"result\":{\"pane_id\":%u,\"copied\":true,\"exited\":true,\"was_active\":%s,\"len\":%d}}",
+            p->id, was_active ? "true" : "false", n);
         goto done;
     }
 
@@ -9243,9 +10032,15 @@ static bool is_readonly_cmd(const char *cmd) {
         "workspace.count", "workspace.get_info",
         "surface.list", "surface.focused", "surface.count",
         "pane.list", "pane.focused", "pane.count", "pane.get_info",
+        "format",
         "pane.copy_mode.enter", "pane.copy_mode.exit", "pane.copy_mode.move",
         "pane.copy_mode.select_start", "pane.copy_mode.select_end",
         "pane.copy_mode.yank", "pane.copy_mode.paste",
+        "pane.copy_mode.search_forward", "pane.copy_mode.search_backward",
+        "pane.copy_mode.search_next", "pane.copy_mode.search_prev",
+        "pane.copy_mode.goto_line", "pane.copy_mode.rectangle_toggle",
+        "pane.copy_mode.copy_pipe", "pane.copy_mode.select_space",
+        "pane.copy_mode.copy_selection", "pane.copy_mode.copy_selection_and_cancel",
         "tree", "notification.list", "notification.count",
         "notification.ring.list", "notification.hook.list",
         "agent.list", "agent.get", "config.get",

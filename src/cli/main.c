@@ -361,15 +361,20 @@ static char *translate_tmux_command(int argc, char **argv) {
         return json;
     }
 
-    /* send-keys [-t target] text
-     * → pane.send_text {"id": target, "text": text} */
+    /* send-keys [-t target] [-X key] text
+     * → pane.send_text {"id": target, "text": text}
+     * → pane.copy_mode.move {"key": key} (when -X is used) */
     if (strcmp(tmux_cmd, "send-keys") == 0 || strcmp(tmux_cmd, "send") == 0) {
         const char *target = NULL;
         const char *text = NULL;
+        const char *x_key = NULL;
         int i = 2;
         while (i < argc) {
             if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
                 target = argv[i + 1];
+                i += 2;
+            } else if (strcmp(argv[i], "-X") == 0 && i + 1 < argc) {
+                x_key = argv[i + 1];
                 i += 2;
             } else if (argv[i][0] != '-') {
                 text = argv[i];
@@ -378,7 +383,16 @@ static char *translate_tmux_command(int argc, char **argv) {
                 i++;
             }
         }
-        if (text) {
+        if (x_key) {
+            /* -X flag: dispatch copy mode command */
+            args_len = snprintf(args_buf, sizeof args_buf,
+                "\"key\":\"%s\"", (json_escape(x_key, _esc, sizeof _esc), _esc));
+            if (target) {
+                args_len += snprintf(args_buf + args_len, sizeof args_buf - args_len,
+                    ",\"surface_id\":\"%s\"", (json_escape(target, _esc, sizeof _esc), _esc));
+            }
+            snprintf(json, 8192, "{\"cmd\":\"pane.copy_mode.move\",\"args\":{%s}}", args_buf);
+        } else if (text) {
             args_len = snprintf(args_buf, sizeof args_buf,
                 "\"text\":\"%s\"", (json_escape(text, _esc, sizeof _esc), _esc));
             if (target) {
