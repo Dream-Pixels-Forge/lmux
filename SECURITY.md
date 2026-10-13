@@ -92,6 +92,17 @@ lmux applies the following hardening practices:
     without a packaged key may install `~/.lmux/update.pub` manually.
     Until a key exists, the updater checks feeds but refuses to
     install — the offline/no-update path is unaffected.
+- **Extension trust (TOFU + allowlist)** — Sidebar extensions
+  (`gui/extensions.py`) are arbitrary Python in the GUI process, so the
+  extension directory is trusted-only: bundled extensions load
+  directly; any other directory is scanned only when listed in the
+  `extensions.allowlist` config key (secure default: skipped with a
+  stderr note); each allowlisted extension needs trust-on-first-use
+  approval ("Enable X?" once/always/never) with its SHA-256 pinned in
+  `~/.config/lmux/extension_trust.json`. A hash mismatch re-prompts
+  and refuses when no prompt is wired (fail closed). Per-extension
+  exception isolation in event fan-out is preserved. No sandbox: treat
+  an approved extension as fully privileged.
 
 ## Scope
 
