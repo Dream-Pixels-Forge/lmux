@@ -1190,6 +1190,16 @@ void lmux_log(lmux_log_level level, const char *fmt, ...) {
     vsnprintf(msg_buf, sizeof msg_buf, fmt, ap);
     va_end(ap);
 
+    /* ISS-0023/N2: client-controlled strings (titles, paths,
+     * notification text) reach this sink via %s.  Fold CR/LF so one
+     * log call always emits one line — otherwise a hostile title
+     * forges extra lines (authorized_keys-style injection into
+     * anything tailing the file).  Central fold covers every call
+     * site at once; the JSON sink escapes independently. */
+    for (char *s = msg_buf; *s; s++) {
+        if (*s == '\n' || *s == '\r') *s = ' ';
+    }
+
     time_t now = time(NULL);
     struct tm tm_buf;
     struct tm *tm = localtime_r(&now, &tm_buf);
@@ -1226,6 +1236,18 @@ void lmux_log(lmux_log_level level, const char *fmt, ...) {
  */
 void lmux_log_request(const char *request_id, const char *cmd, bool ok, const char *detail) {
     if (g_log_level > LMUX_LOG_INFO) return;
+
+    /* ISS-0023/N2: detail may carry client text — fold CR/LF into a
+     * scratch copy so the emitted line stays single even in the legacy
+     * plain-text branch (the JSON branch escapes independently). */
+    char detail_flat[1024] = {0};
+    if (detail && detail[0]) {
+        snprintf(detail_flat, sizeof detail_flat, "%s", detail);
+        for (char *s = detail_flat; *s; s++) {
+            if (*s == '\n' || *s == '\r') *s = ' ';
+        }
+        detail = detail_flat;
+    }
 
     /* Build the line once; stderr and the log file share it so `logs`
      * and /api/logs can serve request history (ISS-0002). */
@@ -4764,6 +4786,23 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         else if (strcmp(key, "agent_aider") == 0) snprintf(app->config->agent_paths[3], 512, "%s", value);
         else if (strcmp(key, "agent_goose") == 0) snprintf(app->config->agent_paths[4], 512, "%s", value);
         else if (strcmp(key, "log_file") == 0) {
+            /* ISS-0023/N2: confine exactly like snapshot.load's absolute
+             * branch — absolute-only inside the data root, reject ~ and
+             * relative paths.  An unconstrained log_file lets a socket
+             * client append daemon log lines to an arbitrary path
+             * (authorized_keys-style target + newline injection, folded
+             * above — defense in depth).  Startup-from-config-file keeps
+             * the old behavior (operator-owned file); the socket boundary
+             * is what must not choose paths. */
+            char logroot[1024];
+            lmux_data_root(logroot, sizeof logroot);
+            if (value[0] == '~' || value[0] != '/' ||
+                !path_inside_root(value, logroot)) {
+                written = snprintf(result, result_cap,
+                    "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"log_file must be absolute and inside %s\"}}",
+                    logroot);
+                goto done;
+            }
             snprintf(app->config->log_file, sizeof app->config->log_file, "%s", value);
             lmux_log_set_file(app->config->log_file);
         }

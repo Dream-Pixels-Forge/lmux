@@ -691,10 +691,14 @@ class TestHttpLogServerSecurity(unittest.TestCase):
         cls.http_c = (cls.repo / "src" / "core" / "http_server.c").read_text()
         # Point the shared daemon's log file at a scratch file so the
         # HTTP tests exercise the file-backed branch deterministically.
+        # N2: must live inside the throwaway data root (config.set
+        # log_file is confined there).
+        log_root = Path(_test_home) / ".local" / "share" / "lmux"
         cls.log_file = str(
-            Path(tempfile.gettempdir()) / f"lmux-http-test-{os.getpid()}.log")
+            log_root / f"lmux-http-test-{os.getpid()}.log")
         Path(cls.log_file).write_text("")
-        cls.c.send("config.set", {"key": "log_file", "value": cls.log_file})
+        resp = cls.c.send("config.set", {"key": "log_file", "value": cls.log_file})
+        assert resp.get("ok"), f"test setup: data-root log_file rejected: {resp}"
         cls.c.send("ping")
 
     def test_does_not_bind_all_interfaces(self):
@@ -895,6 +899,97 @@ class TestLogsLargeOutput(unittest.TestCase):
             _shutdown_isolated(daemon, home)
 
 
+class TestLogFileConfinement(unittest.TestCase):
+    """ISS-0023/N2: ``config.set log_file`` is confined to the data root.
+
+    An unconstrained log_file lets a socket client append daemon log
+    lines to an arbitrary path (e.g. ``~/.ssh/authorized_keys`` when
+    combined with newline injection — folded separately, defense in
+    depth).  Like ``snapshot.load``: absolute-only inside the data
+    root, ``~`` rejected, default unchanged.
+    """
+
+    def test_absolute_outside_root_rejected(self):
+        client, daemon, home = _isolated_client()
+        try:
+            resp = client.send(
+                "config.set", {"key": "log_file", "value": "/tmp/evil.log"})
+            self.assertFalse(
+                resp.get("ok"),
+                f"absolute path outside data root must be rejected: {resp}")
+        finally:
+            _shutdown_isolated(daemon, home)
+
+    def test_tilde_rejected(self):
+        client, daemon, home = _isolated_client()
+        try:
+            resp = client.send(
+                "config.set",
+                {"key": "log_file", "value": "~/.local/share/lmux/x.log"})
+            self.assertFalse(
+                resp.get("ok"), f"~ path must be rejected: {resp}")
+        finally:
+            _shutdown_isolated(daemon, home)
+
+    def test_relative_rejected(self):
+        client, daemon, home = _isolated_client()
+        try:
+            resp = client.send(
+                "config.set", {"key": "log_file", "value": "evil.log"})
+            self.assertFalse(
+                resp.get("ok"), f"relative path must be rejected: {resp}")
+        finally:
+            _shutdown_isolated(daemon, home)
+
+    def test_inside_root_accepted(self):
+        client, daemon, home = _isolated_client()
+        try:
+            data = home / ".local" / "share" / "lmux"
+            log_file = str(data / "confined.log")
+            Path(log_file).write_text("")
+            resp = client.send(
+                "config.set", {"key": "log_file", "value": log_file})
+            self.assertTrue(
+                resp.get("ok"),
+                f"log_file inside data root must be accepted: {resp}")
+            client.send("ping")
+            self.assertIn("ping", Path(log_file).read_text())
+        finally:
+            _shutdown_isolated(daemon, home)
+
+
+class TestLogNewlineStripping(unittest.TestCase):
+    """ISS-0023/N2: client-controlled strings must not inject extra log
+    lines (authorized_keys-style forgery via notification text)."""
+
+    def test_newline_in_notification_text_stays_on_one_line(self):
+        client, daemon, home = _isolated_client()
+        try:
+            data = home / ".local" / "share" / "lmux"
+            log_file = str(data / "newline.log")
+            Path(log_file).write_text("")
+            resp = client.send(
+                "config.set", {"key": "log_file", "value": log_file})
+            self.assertTrue(resp.get("ok"), f"log_file setup failed: {resp}")
+            client.send("notification.create", {
+                "text": "hello\nINJECTED forged line\nssh-rsa AAAA hostile",
+            })
+            content = Path(log_file).read_text()
+            forged = [l for l in content.splitlines() if "INJECTED" in l]
+            self.assertEqual(
+                len(forged), 1,
+                f"injection must fold to one line, got: {forged}")
+            self.assertIn(
+                "hello", forged[0],
+                "folded line must keep the original text")
+            self.assertFalse(
+                any(l.startswith("INJECTED") or l.startswith("ssh-rsa")
+                    for l in content.splitlines()),
+                "no forged line may start at column 0")
+        finally:
+            _shutdown_isolated(daemon, home)
+
+
 class TestHttpLogsMallocCheck(unittest.TestCase):
     """ISS-0005: the /api/logs handler malloc()s a 64KB response buffer;
     a NULL return must be handled (500) instead of snprintf() into NULL."""
@@ -963,8 +1058,9 @@ class TestHttpLogsLargeOutput(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.c = _ensure_daemon()
+        # N2: scratch file must live inside the throwaway data root.
         cls.log_file = str(
-            Path(tempfile.gettempdir()) / f"lmux-http-big-{os.getpid()}.log")
+            Path(_test_home) / ".local" / "share" / "lmux" / f"lmux-http-big-{os.getpid()}.log")
         Path(cls.log_file).write_text("")
         cls.c.send("config.set", {"key": "log_file", "value": cls.log_file})
         with open(cls.log_file, "a") as fh:
@@ -1012,8 +1108,9 @@ class TestHttpLogsLimitTail(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.c = _ensure_daemon()
+        # N2: scratch file must live inside the throwaway data root.
         cls.log_file = str(
-            Path(tempfile.gettempdir()) / f"lmux-http-tail-{os.getpid()}.log")
+            Path(_test_home) / ".local" / "share" / "lmux" / f"lmux-http-tail-{os.getpid()}.log")
         Path(cls.log_file).write_text("")
         cls.c.send("config.set", {"key": "log_file", "value": cls.log_file})
         cls.markers = [f"{i:04d}-" + "T" * 4000 for i in range(100)]

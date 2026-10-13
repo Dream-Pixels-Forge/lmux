@@ -1,12 +1,21 @@
 """Custom commands in config for lmux."""
 import json
 import logging
+import shlex
 import subprocess
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Callable
 from dataclasses import dataclass, field
 
 logger = logging.getLogger("lmux.custom_commands")
+
+# ISS-0016: env keys that must never reach a child process.  They alter
+# dynamic linking / interpreter startup (LD_PRELOAD, LD_LIBRARY_PATH,
+# PYTHONPATH) or inject shell init (BASH_ENV, ENV).  Stripped from the
+# ambient base AND blocked from the per-command overlay.
+_STRIPPED_ENV_KEYS = frozenset({
+    "LD_PRELOAD", "LD_LIBRARY_PATH", "PYTHONPATH", "BASH_ENV", "ENV",
+})
 
 
 @dataclass
@@ -19,6 +28,7 @@ class CustomCommand:
     category: str = "general"
     confirm: bool = False
     env: Dict[str, str] = field(default_factory=dict)
+    shell: bool = False
 
 
 class CustomCommandsManager:
@@ -45,7 +55,8 @@ class CustomCommandsManager:
                             shortcut=cmd_data.get("shortcut"),
                             category=cmd_data.get("category", "general"),
                             confirm=cmd_data.get("confirm", False),
-                            env=cmd_data.get("env", {})
+                            env=cmd_data.get("env", {}),
+                            shell=cmd_data.get("shell", False)
                         )
             except Exception as e:
                 logger.error(f"Error loading custom commands: {e}")
@@ -70,7 +81,8 @@ class CustomCommandsManager:
                 "shortcut": cmd.shortcut,
                 "category": cmd.category,
                 "confirm": cmd.confirm,
-                "env": cmd.env
+                "env": cmd.env,
+                "shell": cmd.shell
             }
 
         config["custom_commands"] = commands_data
@@ -100,31 +112,83 @@ class CustomCommandsManager:
             commands = [c for c in commands if c.category == category]
         return commands
 
-    def execute_command(self, name: str, cwd: Optional[str] = None) -> bool:
-        """Execute a custom command."""
+    def execute_command(self, name: str, cwd: Optional[str] = None,
+                        confirm_callback: Optional[Callable[[CustomCommand], bool]] = None) -> bool:
+        """Execute a custom command.
+
+        ISS-0016: config-supplied strings are untrusted input.  Default
+        is ``shlex.split`` + ``shell=False`` so shell metacharacters
+        (``;``, ``&&``, backticks, ``$()``) are inert argv text.  A
+        command opts into a real shell ONLY with
+        ``{"shell": true, "confirm": true}`` in config AND a live
+        approval from ``confirm_callback`` (the GUI wires a GTK dialog;
+        ``None`` or a refusal fails closed).  ``confirm=true`` on a
+        non-shell command keeps the legacy log-only behavior.
+        ``confirm_callback`` receives the CustomCommand for review.
+        """
         command = self._commands.get(name)
         if not command:
             logger.error(f"Custom command not found: {name}")
             return False
 
-        # Check if confirmation is required
-        if command.confirm:
-            # In a real implementation, show a confirmation dialog
+        use_shell = False
+        if command.shell:
+            # Opt-in path: requires confirm=true in config AND a real
+            # approval.  shell=true without confirm=true refuses —
+            # a compound string must never run on config alone.
+            if not command.confirm:
+                logger.warning(
+                    f"Refusing shell command '{name}': "
+                    f"shell=true requires confirm=true")
+                return False
+            if confirm_callback is None:
+                logger.warning(
+                    f"Refusing shell command '{name}': "
+                    f"no confirmation prompt wired")
+                return False
+            try:
+                approved = confirm_callback(command)
+            except Exception as exc:
+                logger.warning(
+                    f"Confirmation for '{name}' failed ({exc}); refusing")
+                return False
+            if not approved:
+                logger.info(f"Shell command '{name}' declined by user")
+                return False
+            use_shell = True
+        elif command.confirm:
+            # Legacy behavior for non-shell commands: note it, run split.
             logger.info(f"Confirmation required for command: {name}")
 
         try:
-            # Build environment
+            # Build environment: ambient minus dangerous keys, plus the
+            # per-command overlay minus dangerous keys (the overlay must
+            # not reintroduce what the base strips).
             import os
-            env = os.environ.copy()
-            env.update(command.env)
+            env = {k: v for k, v in os.environ.items()
+                   if k not in _STRIPPED_ENV_KEYS}
+            for k, v in (command.env or {}).items():
+                if k in _STRIPPED_ENV_KEYS:
+                    logger.warning(
+                        f"Ignoring stripped env key '{k}' in command '{name}'")
+                    continue
+                env[k] = v
 
             # Execute command
-            subprocess.Popen(
-                command.command,
-                shell=True,
-                cwd=cwd,
-                env=env
-            )
+            if use_shell:
+                subprocess.Popen(
+                    command.command,
+                    shell=True,
+                    cwd=cwd,
+                    env=env
+                )
+            else:
+                subprocess.Popen(
+                    shlex.split(command.command),
+                    shell=False,
+                    cwd=cwd,
+                    env=env
+                )
             return True
         except Exception as e:
             logger.error(f"Error executing command {name}: {e}")

@@ -167,12 +167,13 @@ class TestUnsignedUpdatesRejected(unittest.TestCase):
         self.assertFalse(verify_signature(b"payload bytes", "00" * 32, None))
 
     def test_correct_sha256_still_accepted(self):
-        """Fail-closed must not break the SHA-256 fallback for good sigs."""
+        """Fail-closed must not break the SHA-256 fallback for good sigs
+        when a key context exists (N9 compat path)."""
         import hashlib
         from updater import verify_signature
         data = b"legit payload"
         sig = hashlib.sha256(data).hexdigest()
-        self.assertTrue(verify_signature(data, sig, None))
+        self.assertTrue(verify_signature(data, sig, b"0" * 32))
 
 
 class TestInstallScriptNotAutoExecuted(unittest.TestCase):
@@ -239,6 +240,130 @@ class TestInstallScriptNotAutoExecuted(unittest.TestCase):
         self.assertTrue(
             self.marker.exists(),
             "allow_exec=True should still run install.sh",
+        )
+
+
+class TestUpdaterTrustN9(unittest.TestCase):
+    """ISS-0024 (N9): updater trust gaps — fail closed without a key,
+    loud warning on feed-URL override, data-filter on extraction."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        # Isolate the updater's config dir away from the real ~/.lmux.
+        import updater as updater_mod
+        self.updater_mod = updater_mod
+        self._orig_config_dir = updater_mod._CONFIG_DIR
+        self._orig_feed_path = updater_mod._FEED_URL_PATH
+        fake_config = self.root / "config"
+        fake_config.mkdir()
+        updater_mod._CONFIG_DIR = fake_config
+        updater_mod._FEED_URL_PATH = fake_config / "update_feed_url"
+        self.addCleanup(self._restore_config)
+
+    def _restore_config(self):
+        self.updater_mod._CONFIG_DIR = self._orig_config_dir
+        self.updater_mod._FEED_URL_PATH = self._orig_feed_path
+
+    # -- fail closed without a key ----------------------------------
+    def test_correct_sha256_without_key_is_rejected(self):
+        """N9: a correct SHA-256 with no trusted key must be refused.
+
+        The feed supplies both payload and hash, so SHA-256 alone is
+        self-attestation, not trust.  Previously accepted (ISS-0001 left
+        the fallback open); now fail closed.
+        """
+        import hashlib
+        from updater import verify_signature
+        data = b"legit payload"
+        sig = hashlib.sha256(data).hexdigest()
+        self.assertFalse(
+            verify_signature(data, sig, None),
+            "SHA-256 self-attestation without a key must be refused",
+        )
+
+    def test_sha256_with_key_still_accepted_compat(self):
+        """The SHA-256 fallback survives only as compat when a key context
+        exists; Ed25519 remains the preferred path."""
+        import hashlib
+        from updater import verify_signature
+        data = b"legit payload"
+        sig = hashlib.sha256(data).hexdigest()
+        self.assertTrue(
+            verify_signature(data, sig, b"0" * 32),
+            "SHA-256 with a key context must still verify (compat)",
+        )
+
+    # -- feed-URL override -------------------------------------------
+    def test_feed_override_logs_loud_warning(self):
+        """An override file retargeting the feed must warn loudly and be
+        detectable, so an evil-feed retarget cannot happen silently."""
+        from updater import SparkleUpdater
+        evil = "https://evil.example.com/updates.atom"
+        self.updater_mod._FEED_URL_PATH.write_text(evil + "\n")
+        with self.assertLogs("updater", level="WARNING") as cm:
+            url = SparkleUpdater._feed_url()
+        self.assertEqual(url, evil)
+        self.assertTrue(
+            any("feed" in msg.lower() and "overrid" in msg.lower()
+                for msg in cm.output),
+            f"override must log a loud warning, got: {cm.output}",
+        )
+
+    def test_default_feed_is_not_flagged_as_override(self):
+        from updater import SparkleUpdater, is_feed_overridden
+        self.assertFalse(is_feed_overridden())
+        self.assertEqual(
+            SparkleUpdater._feed_url(), self.updater_mod._DEFAULT_FEED)
+
+    def test_evil_feed_payload_refused_without_key(self):
+        """End-to-end N9: payload from a retargeted feed is refused when
+        no trusted key is configured (fail closed at verify time)."""
+        from updater import verify_signature
+        evil_payload = b"evil binary"
+        import hashlib
+        evil_sig = hashlib.sha256(evil_payload).hexdigest()
+        # Attacker controls feed AND hash (self-attestation) — no key on
+        # disk, so verification must fail.
+        self.assertIsNone(self.updater_mod._load_public_key())
+        self.assertFalse(verify_signature(evil_payload, evil_sig, None))
+
+    # -- extraction filter --------------------------------------------
+    def test_extractall_uses_data_filter(self):
+        """extractall must pass filter='data' (defense in depth on top of
+        the member validation)."""
+        import tarfile as tarfile_mod
+        from updater import SparkleUpdater
+        updater = SparkleUpdater()
+        archive = _make_tar(self.root / "update.tar", [("app", "binary")])
+        install = self.root / "install"
+        install.mkdir()
+        captured = {}
+        real_open = tarfile_mod.open
+
+        def spy_open(*args, **kwargs):
+            tf = real_open(*args, **kwargs)
+            real_extractall = tf.extractall
+
+            def spy_extractall(path=".", members=None, *a, **k):
+                captured.update(k)
+                captured["positional_filter"] = (
+                    a[0] if a else None)
+                return real_extractall(path, members, *a, **k)
+
+            tf.extractall = spy_extractall
+            return tf
+
+        tarfile_mod.open = spy_open
+        try:
+            result = updater.apply_update(str(archive), str(install))
+        finally:
+            tarfile_mod.open = real_open
+        self.assertTrue(result, "benign archive must still install")
+        self.assertEqual(
+            captured.get("filter"), "data",
+            "extractall must be called with filter='data'",
         )
 
 
