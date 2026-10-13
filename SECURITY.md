@@ -71,6 +71,27 @@ lmux applies the following hardening practices:
   source. Auth fields are reserved for future use only.
 - **Atomic config writes** — Config files are written to a temporary file
   then renamed, preventing corruption on crash. (`src/core/config.c`)
+- **Update trust (fail-closed)** — The auto-updater (`gui/updater.py`)
+  refuses network payloads unless they verify against a trusted Ed25519
+  key, and extraction uses `filter="data"` on top of member validation:
+  - No trusted key on disk → the update is **refused**, even when the
+    feed-supplied SHA-256 matches (SHA-256 alone is self-attestation:
+    the feed provides both payload and hash). The SHA-256 comparison
+    survives only as a compat path when a key context exists.
+  - The default feed URL is pinned at build time (`_DEFAULT_FEED`);
+    a `~/.lmux/update_feed_url` override is honoured for development
+    but logs a loud `SECURITY` warning on every use.
+  - `install.sh` inside an update archive never auto-runs; execution
+    requires explicit `allow_exec=True`.
+  - **Key deployment (packagers):** generate an Ed25519 keypair at
+    build time (`python3 -c "from nacl.signing import SigningKey; ..."`),
+    keep the signing key offline, and ship the 32-byte public half as
+    `gui/updates/update.pub` (preferred, takes precedence) or
+    `/usr/share/lmux/update.pub` (`/app/share/lmux/update.pub` for
+    Flatpak). Raw 32 bytes or 64 hex chars are accepted. Operators
+    without a packaged key may install `~/.lmux/update.pub` manually.
+    Until a key exists, the updater checks feeds but refuses to
+    install — the offline/no-update path is unaffected.
 
 ## Scope
 

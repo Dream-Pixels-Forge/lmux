@@ -151,20 +151,28 @@ def verify_signature(
 ) -> bool:
     """Verify *download_data* against *signature*.
 
-    If *public_key* is supplied, try Ed25519 first.  Fall back to a
-    SHA-256 hex comparison when Ed25519 is unavailable.
-
-    Fail-closed (ISS-0001): when there is no signature to check against,
-    return ``False``.  Previously this path logged a warning and returned
-    ``True``, so a compromised feed could push unsigned payloads.
+    If *public_key* is supplied, try Ed25519 first, then the SHA-256
+    compat fallback.  Fail-closed twice over (ISS-0001, ISS-0024/N9):
+    when there is no signature to check against, return ``False``; and
+    when there is **no trusted key** configured, return ``False`` even
+    for a matching SHA-256 — the feed supplies both payload and hash,
+    so SHA-256 alone is self-attestation, not trust.  A network payload
+    must never be accepted on its own word.
     """
     try:
         from gui.updates.verify import verify_ed25519, verify_sha256
     except ImportError:  # imported as top-level ``updater`` (tests/standalone)
         from updates.verify import verify_ed25519, verify_sha256
 
+    if public_key is None:
+        # N9: no trusted key — refuse.  Do NOT fall through to the
+        # SHA-256 comparison below; without a key it proves nothing.
+        log.warning(
+            "No trusted update key configured; update refused (fail-closed)")
+        return False
+
     # Try Ed25519 first when a public key is available
-    if public_key and signature:
+    if signature:
         try:
             raw_sig = bytes.fromhex(signature)
         except ValueError:
@@ -172,7 +180,9 @@ def verify_signature(
         if raw_sig and verify_ed25519(download_data, raw_sig, public_key):
             return True
 
-    # SHA-256 fallback
+    # SHA-256 compat fallback (key context exists, e.g. feeds that only
+    # carry a hash, or hosts without PyNaCl).  Ed25519 stays the trust
+    # path; this branch is compatibility, not authentication.
     if signature and len(signature) == 64:
         return verify_sha256(download_data, signature)
 
@@ -183,16 +193,67 @@ def verify_signature(
 
 # ── Public key loading ───────────────────────────────────────
 
+def _packaged_key_paths() -> list[Path]:
+    """Build-time key locations, checked before the user config dir.
+
+    Packagers generate an Ed25519 keypair at build time (see SECURITY.md
+    "Update trust") and ship the public half as ``update.pub`` next to
+    this module or under the system data dir.  A packaged key takes
+    precedence over ``~/.lmux/update.pub`` so a compromised home dir
+    alone cannot swap the trust root silently.
+    """
+    here = Path(__file__).resolve().parent
+    return [
+        here / "updates" / "update.pub",
+        here / "update.pub",
+        Path("/usr/share/lmux/update.pub"),
+        Path("/app/share/lmux/update.pub"),  # Flatpak
+    ]
+
+
+def _decode_key_material(raw: bytes) -> Optional[bytes]:
+    """Normalise key file bytes to a 32-byte Ed25519 public key."""
+    text = raw.strip()
+    if not text:
+        return None
+    # Accept hex-encoded keys (64 hex chars) as well as raw 32 bytes.
+    if len(text) == 64:
+        try:
+            candidate = bytes.fromhex(text.decode("ascii"))
+        except (ValueError, UnicodeDecodeError):
+            candidate = b""
+        if len(candidate) == 32:
+            return candidate
+    if len(text) == 32:
+        return bytes(text)
+    return None
+
+
 def _load_public_key() -> Optional[bytes]:
-    """Load Ed25519 public key from ~/.lmux/update.pub if present."""
-    key_path = _CONFIG_DIR / "update.pub"
-    try:
-        return key_path.read_bytes().strip()
-    except FileNotFoundError:
-        return None
-    except OSError as exc:
-        log.debug("Cannot read public key: %s", exc)
-        return None
+    """Load the Ed25519 public key, or ``None`` when unconfigured.
+
+    Search order: packaged ``update.pub`` (build-time trust root), then
+    ``~/.lmux/update.pub`` (operator-installed).  Returns ``None`` when
+    no usable key exists — callers must fail closed (refuse the update),
+    never fall back to SHA-256 self-attestation.
+    """
+    candidates = _packaged_key_paths() + [_CONFIG_DIR / "update.pub"]
+    for key_path in candidates:
+        try:
+            raw = key_path.read_bytes()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            log.debug("Cannot read public key %s: %s", key_path, exc)
+            continue
+        key = _decode_key_material(raw)
+        if key is not None:
+            return key
+        log.warning(
+            "Ignoring malformed update key at %s (not 32-byte Ed25519)",
+            key_path,
+        )
+    return None
 
 
 # ── Core updater ─────────────────────────────────────────────
@@ -373,7 +434,13 @@ class SparkleUpdater:
                 # name or by link target.  This is the authoritative check.
                 if not self._validate_tar_members(tf, tmp_extract):
                     return False
-                tf.extractall(str(tmp_extract))
+                # N9 defense in depth: filter="data" makes tarfile itself
+                # refuse special files and absolute/link escapes, on top of
+                # the validation above.  Fall back for older Pythons.
+                try:
+                    tf.extractall(str(tmp_extract), filter="data")
+                except TypeError:
+                    tf.extractall(str(tmp_extract))
 
             # Check for install script (detect first, move second — the
             # script path must point at its post-move location, otherwise
@@ -454,14 +521,42 @@ class SparkleUpdater:
 
     @staticmethod
     def _feed_url() -> str:
-        """Read feed URL from config, falling back to default."""
+        """Read feed URL from config, falling back to default.
+
+        N9: the default feed is pinned at build time (``_DEFAULT_FEED`` —
+        packagers patch the constant).  A ``update_feed_url`` override
+        file is honoured for development, but its use logs a LOUD
+        warning: a silently retargeted feed is how evil-update attacks
+        start.  See ``is_feed_overridden``.
+        """
         try:
             url = _FEED_URL_PATH.read_text().strip()
             if url:
+                if url != _DEFAULT_FEED:
+                    log.warning(
+                        "SECURITY: update feed URL overridden by %s "
+                        "(default %s). Updates will be fetched from a "
+                        "non-default feed — verify this is intended.",
+                        _FEED_URL_PATH, _DEFAULT_FEED,
+                    )
                 return url
         except FileNotFoundError:
             pass
+        except OSError as exc:
+            log.debug("Cannot read feed override: %s", exc)
         return _DEFAULT_FEED
+
+
+def is_feed_overridden() -> bool:
+    """True when a ``update_feed_url`` override file is active.
+
+    Helper for tests and diagnostics — a retargeted feed deserves
+    scrutiny (N9).
+    """
+    try:
+        return bool(_FEED_URL_PATH.read_text().strip())
+    except OSError:
+        return False
 
 
 # ── GTK Update Dialog ────────────────────────────────────────
