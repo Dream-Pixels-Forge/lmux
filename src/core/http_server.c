@@ -1,4 +1,7 @@
 /* HTTP Server for SSE log streaming */
+#define _GNU_SOURCE
+#define _POSIX_C_SOURCE 200809L
+
 #include "lmux.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -68,6 +71,19 @@ static size_t http_json_escape(const char *in, char *out, size_t cap) {
     }
     out[j] = 0;
     return j;
+}
+
+/* Escaped length of a log line without materializing it — used to
+ * fit the /api/logs window into the byte budget before emitting. */
+static size_t http_json_escaped_len(const char *in) {
+    size_t n = 0;
+    for (const char *p = in; *p; p++) {
+        char c = *p;
+        if (c == '"' || c == '\\') n += 2;
+        else if ((unsigned char)c < 0x20) n += 6;
+        else n += 1;
+    }
+    return n;
 }
 
 static void http_send_response(int client_fd, int status, const char *content_type, const char *body) {
@@ -219,7 +235,7 @@ static void *http_client_thread(void *arg) {
     else if (strcmp(path, "/") == 0 || strcmp(path, "/index.html") == 0) {
         http_send_response(client_fd, 200, "text/html",
             "<html><body><h1>lmux HTTP Server</h1><p>Try <a href=\"/api/logs/stream\">/api/logs/stream</a> for SSE log streaming.</p></body></html>");
-    } else if (strcmp(path, "/api/logs") == 0) {
+    } else if (strncmp(path, "/api/logs", 9) == 0 && (path[9] == '\0' || path[9] == '?')) {
         extern http_server_t *g_http_server;
         if (!g_http_server || !g_http_server->app) {
             http_send_response(client_fd, 500, "text/plain", "Server not initialized");
@@ -229,41 +245,100 @@ static void *http_client_thread(void *arg) {
             if (!log_path || !log_path[0]) {
                 http_send_response(client_fd, 200, "application/json", "{\"lines\":[],\"message\":\"no log file configured\"}");
             } else {
+                /* ISS-0014: honor ?limit= like the socket `logs` command
+                 * (ISS-0007: default 200, clamp 1-1000 — non-positive
+                 * falls back to the default, mirroring model.c). */
+                int log_limit = 200;
+                const char *q = strchr(path, '?');
+                if (q) {
+                    const char *lp = strstr(q, "limit=");
+                    if (lp) {
+                        int v = atoi(lp + 6);
+                        if (v <= 0) v = 200;
+                        if (v > 1000) v = 1000;
+                        log_limit = v;
+                    }
+                }
                 FILE *fp = fopen(log_path, "r");
                 if (!fp) {
                     http_send_response(client_fd, 200, "application/json", "{\"lines\":[],\"message\":\"log file not found\"}");
                 } else {
                     char line_buf[4096];
-                    char *json = malloc(65536);
-                    if (!json) {
+                    /* Tail ring: keep only the newest log_limit lines —
+                     * the old code served the oldest 100. Bounded: at
+                     * most log_limit entries held. */
+                    char **ring = malloc(sizeof(char *) * (size_t)log_limit);
+                    if (!ring) {
                         fclose(fp);
                         http_send_response(client_fd, 500, "text/plain", "Out of memory");
                         goto done;
                     }
-                    size_t json_len = snprintf(json, 65536, "{\"lines\":[");
-                    int count = 0;
-                    bool truncated = false;
-                    while (fgets(line_buf, sizeof line_buf, fp) && count < 100) {
+                    int count = 0, start = 0;
+                    while (fgets(line_buf, sizeof line_buf, fp)) {
                         size_t len = strlen(line_buf);
                         if (len > 0 && line_buf[len - 1] == '\n') line_buf[len - 1] = '\0';
+                        char *dup = strdup(line_buf);
+                        if (!dup) break;
+                        if (count < log_limit) {
+                            ring[count++] = dup;
+                        } else {
+                            free(ring[start]);
+                            ring[start] = dup;
+                            start = (start + 1) % log_limit;
+                        }
+                    }
+                    fclose(fp);
+                    /* ISS-0014: bound total bytes. Walk from the newest
+                     * line backwards, accumulating escaped sizes (+3 for
+                     * quotes/comma) until the ~60KB budget is spent; the
+                     * oldest lines beyond it are dropped. The newest line
+                     * is always kept, so the window is never empty when
+                     * the file is not. fgets chunks cap lines at ~4KB, so
+                     * a single line can never bust the 64KB response
+                     * buffer on its own — response_too_large below is a
+                     * defensive net that should be unreachable. */
+                    int first = count > 0 ? count - 1 : 0;
+                    {
+                        size_t acc = 0;
+                        for (int k = count - 1; k >= 0; k--) {
+                            int ridx = (start + k) % log_limit;
+                            size_t need = http_json_escaped_len(ring[ridx]) + 3;
+                            if (k != count - 1 && acc + need > 60 * 1024) break;
+                            acc += need;
+                            first = k;
+                        }
+                    }
+                    int n = count - first;
+                    char *json = malloc(65536);
+                    if (!json) {
+                        for (int k = 0; k < count; k++) free(ring[(start + k) % log_limit]);
+                        free(ring);
+                        http_send_response(client_fd, 500, "text/plain", "Out of memory");
+                        goto done;
+                    }
+                    size_t json_len = snprintf(json, 65536, "{\"ok\":true,\"lines\":[");
+                    bool truncated = false;
+                    for (int k = first; k < count; k++) {
+                        int ridx = (start + k) % log_limit;
                         char escaped[8192];
-                        http_json_escape(line_buf, escaped, sizeof escaped);
-                        /* ISS-0005: never let json_len reach 65536 — once it
-                         * does, `65536 - json_len` wraps and snprintf writes
-                         * past the heap buffer. Stop and report instead. */
+                        http_json_escape(ring[ridx], escaped, sizeof escaped);
+                        /* ISS-0005: never let json_len reach 65536 — once
+                         * it does, `65536 - json_len` wraps and snprintf
+                         * writes past the heap buffer. Stop and report
+                         * instead. */
                         if (json_len + strlen(escaped) + 4 + 16 >= 65536) {
                             truncated = true;
                             break;
                         }
-                        if (count > 0) json_len += snprintf(json + json_len, 65536 - json_len, ",");
+                        if (k > first) json_len += snprintf(json + json_len, 65536 - json_len, ",");
                         json_len += snprintf(json + json_len, 65536 - json_len, "\"%s\"", escaped);
-                        count++;
                     }
-                    fclose(fp);
+                    for (int k = 0; k < count; k++) free(ring[(start + k) % log_limit]);
+                    free(ring);
                     if (truncated) {
                         http_send_response(client_fd, 200, "application/json", "{\"ok\":false,\"error\":{\"code\":\"response_too_large\"}}");
                     } else {
-                        json_len += snprintf(json + json_len, 65536 - json_len, "],\"count\":%d}", count);
+                        json_len += snprintf(json + json_len, 65536 - json_len, "],\"count\":%d}", n);
                         http_send_response(client_fd, 200, "application/json", json);
                     }
                     free(json);
@@ -411,12 +486,54 @@ done:
         g_http_server->running = false;
 
         if (g_http_server->listen_fd >= 0) {
+            /* ISS-0011/ISS-0012: shutdown() first — close() alone does
+             * not wake a thread blocked in accept(), so the join below
+             * would hang forever (daemon ignores SIGTERM). shutdown()
+             * forces the pending accept() to fail so the loop sees
+             * running == false and exits. */
+            shutdown(g_http_server->listen_fd, SHUT_RDWR);
             close(g_http_server->listen_fd);
             g_http_server->listen_fd = -1;
         }
 
         pthread_join(g_http_server->thread_id, NULL);
 
+        /* ISS-0011: wake workers WITHOUT closing their fds. Each
+         * worker owns close() of its fd at its `done:` label; closing
+         * here as well double-closes the fd number (which the kernel
+         * may already have recycled for another thread). shutdown()
+         * only unblocks the worker's read()/poll() — the fd number
+         * stays valid until the worker itself closes it. */
+        pthread_mutex_lock(&g_http_server->clients_lock);
+        for (int i = 0; i < HTTP_MAX_CLIENTS; i++) {
+            if (g_http_server->client_fds[i] >= 0) {
+                shutdown(g_http_server->client_fds[i], SHUT_RDWR);
+            }
+        }
+        pthread_mutex_unlock(&g_http_server->clients_lock);
+
+        /* Wait (bounded) for every worker to close its fd and release
+         * its slot. Only after all slots are clear is it safe to free
+         * the server: workers touch server->clients_lock on their way
+         * out, so freeing earlier is a use-after-free. */
+        for (int waited = 0; waited < 500; waited++) {
+            int busy = 0;
+            pthread_mutex_lock(&g_http_server->clients_lock);
+            for (int i = 0; i < HTTP_MAX_CLIENTS; i++) {
+                if (g_http_server->client_fds[i] >= 0) {
+                    busy = 1;
+                    break;
+                }
+            }
+            pthread_mutex_unlock(&g_http_server->clients_lock);
+            if (!busy) break;
+            struct timespec ts = {0, 10 * 1000 * 1000L};
+            nanosleep(&ts, NULL);
+        }
+
+        /* Stragglers that ignored shutdown (should be none): close
+         * here now that no new workers can appear (accept thread is
+         * joined) and remaining ones are being torn down anyway. */
         pthread_mutex_lock(&g_http_server->clients_lock);
         for (int i = 0; i < HTTP_MAX_CLIENTS; i++) {
             if (g_http_server->client_fds[i] >= 0) {

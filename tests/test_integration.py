@@ -935,6 +935,77 @@ class TestHttpLogsLargeOutput(unittest.TestCase):
         )
 
 
+class TestHttpLogsLimitTail(unittest.TestCase):
+    """ISS-0014: ``/api/logs`` served the OLDEST 100 lines and blew its
+    64KB heap buffer (``response_too_large``) once the shared daemon log
+    grew past 64KB — order-dependent failure in the full suite.
+    Fixed behavior (mirror socket ``logs`` ISS-0007): honor ``?limit=``
+    (default 200, clamp 1-1000), tail the NEWEST lines, and bound total
+    bytes (~60KB budget, drop oldest beyond it). ``count`` is the number
+    of lines returned."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.c = _ensure_daemon()
+        cls.log_file = str(
+            Path(tempfile.gettempdir()) / f"lmux-http-tail-{os.getpid()}.log")
+        Path(cls.log_file).write_text("")
+        cls.c.send("config.set", {"key": "log_file", "value": cls.log_file})
+        cls.markers = [f"{i:04d}-" + "T" * 4000 for i in range(100)]
+        with open(cls.log_file, "a") as fh:
+            for m in cls.markers:
+                fh.write(m + "\n")
+
+    def _get(self, query=""):
+        import urllib.request
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:8080/api/logs{query}", timeout=10
+        ) as resp:
+            return resp.read().decode(errors="replace")
+
+    def _file_lines(self):
+        with open(self.log_file) as fh:
+            return [ln.rstrip("\n") for ln in fh]
+
+    def test_bounded_log_returns_newest_window_with_count(self):
+        try:
+            body = self._get()
+        except Exception as exc:  # noqa: BLE001 - network faults
+            self.skipTest(f"HTTP log server not reachable: {exc}")
+        doc = json.loads(body)
+        self.assertIsInstance(
+            doc.get("lines"), list,
+            f"expected tailed lines, not the response_too_large envelope: {body[:200]!r}",
+        )
+        self.assertEqual(doc.get("count"), len(doc["lines"]))
+        self.assertLess(
+            len(body), 65536, "response must stay under the 64KB buffer")
+        self.assertNotIn(
+            self.markers[0], doc["lines"],
+            "oldest marker must be tailed/budgeted away",
+        )
+        self.assertEqual(
+            doc["lines"], self._file_lines()[-len(doc["lines"]):],
+            "returned window must be the newest file lines, oldest->newest",
+        )
+
+    def test_limit_param_returns_newest_n(self):
+        import urllib.error
+        try:
+            body = self._get("?limit=5")
+        except urllib.error.HTTPError as exc:
+            self.fail(f"?limit=5 must be routed, got HTTP {exc.code}")
+        except Exception as exc:  # noqa: BLE001 - network faults
+            self.skipTest(f"HTTP log server not reachable: {exc}")
+        doc = json.loads(body)
+        self.assertIsInstance(doc.get("lines"), list)
+        self.assertEqual(doc.get("count"), 5)
+        self.assertEqual(
+            doc["lines"], self._file_lines()[-5:],
+            f"?limit=5 must return the newest 5 lines: {body[:200]!r}",
+        )
+
+
 class TestLogsFollowSseEndpoint(unittest.TestCase):
     """ISS-0006: ``logs`` with ``follow:true`` must advertise the SSE
     endpoint — the CLI only streams (``sse_stream_logs``) when the
@@ -1056,6 +1127,71 @@ class TestHttpSlotRelease(unittest.TestCase):
         self.assertEqual(
             served, 40,
             f"all 40 sequential connections must succeed, got {served}")
+
+
+class TestDaemonSigterm(unittest.TestCase):
+    """ISS-0012: the daemon must exit gracefully on SIGTERM.
+
+    The daemon used to need ``kill -9`` in cleanup: the SIGTERM/SIGINT
+    handler set the exit flag, but shutdown wedged joining the HTTP
+    accept thread (``close()`` does not wake a thread blocked in
+    ``accept()``), so SIGTERM never took effect. Fixed: the accept loop
+    is woken via ``shutdown()`` and workers are drained, so the daemon
+    exits 0 within seconds — no SIGKILL needed."""
+
+    def test_sigterm_exits_zero_without_sigkill(self):
+        repo = Path(__file__).parent.parent
+        cli = repo / "build" / "lmux"
+        self.assertTrue(cli.exists(), "build/lmux must exist (run make build)")
+        home = Path(tempfile.mkdtemp(prefix="lmux-term-home-"))
+        (home / ".local" / "share" / "lmux").mkdir(parents=True, exist_ok=True)
+        (home / ".config").mkdir(parents=True, exist_ok=True)
+        env = dict(os.environ)
+        env["HOME"] = str(home)
+        env["XDG_DATA_HOME"] = str(home / ".local" / "share")
+        env["XDG_CONFIG_HOME"] = str(home / ".config")
+        sock = f"/tmp/lmux-term-{os.getpid()}.sock"
+        Path(sock).unlink(missing_ok=True)
+        proc = subprocess.Popen(
+            [str(cli), "--socket", sock, "daemon"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=env,
+        )
+        try:
+            # Wait until the daemon answers ping (it restores the
+            # snapshot before listening, so the socket alone is not
+            # enough to call it ready).
+            ready = False
+            deadline = time.time() + 60
+            while time.time() < deadline:
+                if proc.poll() is not None:
+                    self.fail(
+                        f"daemon exited early with {proc.returncode}")
+                try:
+                    probe = LmuxClient(sock, timeout=5.0)
+                    if probe.send("ping", {}).get("ok"):
+                        ready = True
+                        break
+                except Exception:  # noqa: BLE001 - not ready yet
+                    pass
+                time.sleep(0.2)
+            self.assertTrue(ready, "daemon did not become ready in 60s")
+            proc.send_signal(signal.SIGTERM)
+            try:
+                rc = proc.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+                self.fail("daemon ignored SIGTERM (SIGKILL was needed)")
+            self.assertEqual(
+                rc, 0, f"daemon must exit 0 on SIGTERM, got {rc}")
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            Path(sock).unlink(missing_ok=True)
+            shutil.rmtree(home, ignore_errors=True)
 
 
 class TestSseSigintStopFlag(unittest.TestCase):
