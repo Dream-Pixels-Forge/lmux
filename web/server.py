@@ -15,6 +15,7 @@ Endpoints:
 import http.server
 import json
 import os
+import secrets
 import sys
 import socketserver
 import threading
@@ -31,7 +32,15 @@ from daemon_client import DaemonClient
 
 DEFAULT_PORT = 8080
 DEFAULT_HOST = "127.0.0.1"
-WEB_DIR = os.path.dirname(os.path.abspath(__file__))
+WEB_DIR = os.path.realpath(os.path.dirname(os.path.abspath(__file__)))
+
+# ISS-0018: per-boot token authorizing POST /api/command (loopback-CSRF
+# defense once ACAO:* is dropped). Dashboard JS learns it same-origin via
+# the meta tag injected into index.html at serve time; cross-origin pages
+# cannot read it (no ACAO header). Accepted via header or JSON body only —
+# never via query string (URLs leak to logs/history, N6 lesson).
+WEB_TOKEN = secrets.token_hex(32)
+WEB_TOKEN_HEADER = "X-Lmux-Token"
 
 
 # ── API handler ─────────────────────────────────────────────
@@ -40,6 +49,7 @@ class LmuxAPIHandler(http.server.SimpleHTTPRequestHandler):
     """HTTP handler that serves API endpoints and static files."""
 
     client = None  # Set by main()
+    web_token = WEB_TOKEN  # Per-boot POST auth token (ISS-0018)
     eventslients = []  # SSE client connections
 
     def do_GET(self):
@@ -59,7 +69,7 @@ class LmuxAPIHandler(http.server.SimpleHTTPRequestHandler):
         elif path == "/api/ping":
             self._json_response({"ok": True, "version": "1.0.0"})
         elif path == "/" or path == "/index.html":
-            self._serve_file("index.html", "text/html")
+            self._serve_index()
         elif path.endswith(".css"):
             self._serve_file(path.lstrip("/"), "text/css")
         elif path.endswith(".js"):
@@ -76,35 +86,77 @@ class LmuxAPIHandler(http.server.SimpleHTTPRequestHandler):
             body = self.rfile.read(content_length)
             try:
                 data = json.loads(body)
+            except json.JSONDecodeError:
+                self._json_response({"ok": False, "error": "Invalid JSON"}, 400)
+                return
+            if not isinstance(data, dict):
+                self._json_response({"ok": False, "error": "Invalid JSON"}, 400)
+                return
+            if not self._check_post_token(data):
+                self._json_response({"ok": False, "error": "unauthorized"}, 401)
+                return
+            try:
                 command = data.get("command", "")
                 args = data.get("args", {})
                 result = self.client.send(command, args)
                 self._json_response(result)
-            except json.JSONDecodeError:
-                self._json_response({"ok": False, "error": "Invalid JSON"}, 400)
             except Exception as e:
                 self._json_response({"ok": False, "error": str(e)}, 500)
         else:
             self.send_error(404)
 
+    def _check_post_token(self, data):
+        """ISS-0018: require the per-boot token via header or JSON body.
+
+        Query-string tokens are never accepted (URLs leak). Uses
+        compare_digest against timing attacks.
+        """
+        presented = self.headers.get(WEB_TOKEN_HEADER) or data.get("token", "")
+        if not presented:
+            return False
+        return secrets.compare_digest(str(presented), self.web_token)
+
     def _json_response(self, data, status=200):
-        """Send JSON response with CORS headers."""
+        """Send JSON response (same-origin only — no CORS headers, ISS-0018)."""
         body = json.dumps(data).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
         self.wfile.write(body)
 
-    def _serve_file(self, filename, content_type):
-        """Serve a static file from the web directory."""
-        filepath = os.path.join(WEB_DIR, filename)
+    def _serve_index(self):
+        """Serve the dashboard with the per-boot token injected same-origin."""
+        filepath = os.path.join(WEB_DIR, "index.html")
         if not os.path.isfile(filepath):
             self.send_error(404)
             return
         with open(filepath, "rb") as f:
+            body = f.read().replace(b"__LMUX_WEB_TOKEN__",
+                                    self.web_token.encode())
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_file(self, filename, content_type):
+        """Serve a static file from the web directory.
+
+        ISS-0018: unquote first (so %2e%2e is caught too), then resolve
+        and contain within WEB_DIR — plain or encoded .. escapes 404.
+        """
+        raw = urllib.parse.unquote(filename)
+        target = os.path.realpath(os.path.join(WEB_DIR, raw))
+        try:
+            inside = os.path.commonpath([WEB_DIR, target]) == WEB_DIR
+        except ValueError:
+            inside = False
+        if not inside or not os.path.isfile(target):
+            self.send_error(404)
+            return
+        with open(target, "rb") as f:
             body = f.read()
         self.send_response(200)
         self.send_header("Content-Type", content_type)
@@ -118,7 +170,6 @@ class LmuxAPIHandler(http.server.SimpleHTTPRequestHandler):
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "keep-alive")
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
 
         # Send initial keepalive
@@ -195,8 +246,16 @@ def main():
     LmuxAPIHandler.client = client
 
     server = ThreadedHTTPServer((args.host, args.port), LmuxAPIHandler)
-    print(f"lmux web dashboard running at http://{args.host}:{args.port}")
-    print("Press Ctrl+C to stop")
+    print(f"lmux web dashboard running at http://{args.host}:{args.port}",
+          flush=True)
+    print("POST /api/command requires header "
+          f"{WEB_TOKEN_HEADER}: {WEB_TOKEN}", flush=True)
+    if args.host not in ("127.0.0.1", "::1", "localhost"):
+        print(f"WARNING: web dashboard bound to non-loopback host "
+              f"{args.host!r} — the dashboard has no TLS and the POST "
+              f"token is bearer-only. Prefer --host 127.0.0.1.",
+              file=sys.stderr)
+    print("Press Ctrl+C to stop", flush=True)
 
     try:
         server.serve_forever()

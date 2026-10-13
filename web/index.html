@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>lmux dashboard</title>
+    <meta name="lmux-token" content="__LMUX_WEB_TOKEN__">
     <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -57,7 +58,23 @@
     <script>
     // ── API helpers ──────────────────────────────────────
 
+    // ISS-0021: escape daemon-controlled strings before innerHTML.
+    // Daemon strings derive from terminal output (OSC titles, branch
+    // names), so they must never hit the DOM raw (stored-XSS).
+    function esc(s) {
+        return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    }
+
+    function webToken() {
+        const m = document.querySelector('meta[name="lmux-token"]');
+        return m ? m.content : '';
+    }
+
     async function api(path, options = {}) {
+        // ISS-0018: per-boot POST token, injected same-origin by the
+        // server (meta tag). Cross-origin pages cannot read it (no ACAO).
+        options.headers = Object.assign(
+            { 'X-Lmux-Token': webToken() }, options.headers || {});
         try {
             const resp = await fetch(path, options);
             return await resp.json();
@@ -72,7 +89,7 @@
         const data = await api('/api/tree');
         const el = document.getElementById('tree-content');
         if (!data.ok) {
-            el.innerHTML = `<span class="error">${data.error || 'Failed to load'}</span>`;
+            el.innerHTML = `<span class="error">${esc(data.error || 'Failed to load')}</span>`;
             return;
         }
         const tree = data.result || data;
@@ -86,13 +103,13 @@
 
         if (node.workspaces) {
             for (const ws of node.workspaces) {
-                html += `<div class="tree-node workspace">${indent}<span class="icon">📁</span> ${ws.title || 'WS-' + ws.id}</div>`;
+                html += `<div class="tree-node workspace">${indent}<span class="icon">📁</span> ${esc(ws.title || 'WS-' + ws.id)}</div>`;
                 if (ws.surfaces) {
                     for (const sf of ws.surfaces) {
-                        html += `<div class="tree-node surface">${indent}  <span class="icon">📄</span> ${sf.title || 'Surface ' + sf.id}</div>`;
+                        html += `<div class="tree-node surface">${indent}  <span class="icon">📄</span> ${esc(sf.title || 'Surface ' + sf.id)}</div>`;
                         if (sf.panes) {
                             for (const pane of sf.panes) {
-                                html += `<div class="tree-node pane">${indent}    <span class="icon">💻</span> Pane ${pane.id}</div>`;
+                                html += `<div class="tree-node pane">${indent}    <span class="icon">💻</span> Pane ${esc(pane.id)}</div>`;
                             }
                         }
                     }
@@ -108,7 +125,7 @@
         const data = await api('/api/workspaces');
         const el = document.getElementById('ws-list');
         if (!data.ok) {
-            el.innerHTML = `<span class="error">${data.error || 'Failed to load'}</span>`;
+            el.innerHTML = `<span class="error">${esc(data.error || 'Failed to load')}</span>`;
             return;
         }
         const ws = data.result || data;
@@ -119,9 +136,9 @@
         }
         el.innerHTML = list.map(w =>
             `<div class="ws-item">
-                <span class="ws-title">${w.title || 'WS-' + w.id}</span>
-                <span class="ws-id">#${w.id}</span>
-                ${w.git_branch ? `<span class="ws-branch">${w.git_branch}</span>` : ''}
+                <span class="ws-title">${esc(w.title || 'WS-' + w.id)}</span>
+                <span class="ws-id">#${esc(w.id)}</span>
+                ${w.git_branch ? `<span class="ws-branch">${esc(w.git_branch)}</span>` : ''}
             </div>`
         ).join('');
     }
@@ -132,7 +149,7 @@
         const data = await api('/api/agents');
         const el = document.getElementById('agents-list');
         if (!data.ok) {
-            el.innerHTML = `<span class="error">${data.error || 'Failed to load'}</span>`;
+            el.innerHTML = `<span class="error">${esc(data.error || 'Failed to load')}</span>`;
             return;
         }
         const result = data.result || data;
@@ -143,8 +160,8 @@
         }
         el.innerHTML = agents.map(a =>
             `<div class="agent-item">
-                <span class="agent-name">${a.name || a.id}</span>
-                <span class="agent-status">${a.status || 'unknown'}</span>
+                <span class="agent-name">${esc(a.name || a.id)}</span>
+                <span class="agent-status">${esc(a.status || 'unknown')}</span>
             </div>`
         ).join('');
     }
@@ -155,7 +172,7 @@
         const data = await api('/api/notifications');
         const el = document.getElementById('notif-list');
         if (!data.ok) {
-            el.innerHTML = `<span class="error">${data.error || 'Failed to load'}</span>`;
+            el.innerHTML = `<span class="error">${esc(data.error || 'Failed to load')}</span>`;
             return;
         }
         const result = data.result || data;
@@ -166,8 +183,8 @@
         }
         el.innerHTML = notifs.slice(0, 20).map(n =>
             `<div class="notif-item ${n.read ? 'read' : 'unread'}">
-                <span class="notif-text">${n.text || n.message || ''}</span>
-                <span class="notif-ws">WS-${n.workspace_id || '?'}</span>
+                <span class="notif-text">${esc(n.text || n.message || '')}</span>
+                <span class="notif-ws">WS-${esc(n.workspace_id || '?')}</span>
             </div>`
         ).join('');
     }
