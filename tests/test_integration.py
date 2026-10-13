@@ -848,6 +848,44 @@ class TestHttpLogsMallocCheck(unittest.TestCase):
         )
 
 
+class TestLogsEmitNoMidLoopGrowth(unittest.TestCase):
+    """ISS-0010: the ``logs`` emit loop grew the heap result buffer
+    mid-loop while freeing each emitted line, so a realloc failure at
+    iteration k>=1 ran the OOM cleanup over slots already freed for
+    j<k (double-free on the already-OOM path). Fixed behavior: buffer
+    growth is hoisted before the emit loop (worst-case upper bound),
+    so the emit loop contains no realloc and no OOM cleanup."""
+
+    def test_emit_loop_has_no_realloc_or_oom_cleanup(self):
+        repo = Path(__file__).parent.parent
+        model_c = (repo / "src" / "core" / "model.c").read_text()
+        emit_pos = model_c.find("for (int k = 0; k < count; k++)")
+        self.assertNotEqual(emit_pos, -1, "expected the logs emit loop")
+        emit_end = model_c.find("free(lines);", emit_pos)
+        self.assertNotEqual(emit_end, -1, "expected end of emit loop")
+        emit_body = model_c[emit_pos:emit_end]
+        self.assertNotIn(
+            "realloc", emit_body,
+            "emit loop must not grow the buffer (hoist growth before emit)",
+        )
+        self.assertNotIn(
+            "for (int f = 0; f < count; f++)", emit_body,
+            "emit loop must not carry an OOM cleanup loop (double-free)",
+        )
+
+    def test_lines_malloc_oom_frees_result(self):
+        repo = Path(__file__).parent.parent
+        model_c = (repo / "src" / "core" / "model.c").read_text()
+        malloc_pos = model_c.find(
+            "char **lines = malloc(sizeof(char *) * (size_t)log_limit)")
+        self.assertNotEqual(malloc_pos, -1, "expected the lines malloc")
+        tail = model_c[malloc_pos:malloc_pos + 300]
+        self.assertIn(
+            "free(result)", tail,
+            "lines-malloc OOM path must free the 16KB result buffer",
+        )
+
+
 class TestHttpLogsLargeOutput(unittest.TestCase):
     """ISS-0005: ``/api/logs`` must not overflow its 64KB heap response
     buffer when the log file holds more than fits (here 100 x ~4KB lines

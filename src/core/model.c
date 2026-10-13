@@ -4228,6 +4228,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         char line_buf[4096];
         char **lines = malloc(sizeof(char *) * (size_t)log_limit);
         if (!lines) {
+            free(result);
             return strdup("{\"ok\":false,\"error\":{\"code\":\"oom\",\"message\":\"out of memory\"}}");
         }
 
@@ -4280,17 +4281,19 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         /* Build JSON response with lines (proper JSON strings, escaped). */
         written = snprintf(result, result_cap,
             "{\"ok\":true,\"result\":{\"lines\":[");
-        for (int k = 0; k < count; k++) {
-            /* ISS-0005: grow the heap result buffer before appending. An
-             * escaped line can approach 8KB and count can reach 200, far
-             * beyond the initial 16KB buffer; without this
-             * `result_cap - written` wraps and snprintf writes past the
-             * heap allocation. NOTE: RESULT_GROW only guarantees room for
-             * ~1KB, which a single escaped line can exceed, so double
-             * directly until the worst-case line fits. */
-            while ((size_t)written + 8192 + 4 >= result_cap) {
-                result_cap = result_cap * 2 + 4096;
-                char *_grow = realloc(result, result_cap);
+        /* ISS-0010: grow the heap result buffer up front to the worst
+         * case (each escaped line can approach 8KB plus quote/comma
+         * bytes; +64 covers the trailing "]", sse_endpoint and "}}")
+         * BEFORE emitting. Growing mid-loop while freeing each emitted
+         * line meant a realloc failure at iteration k>=1 re-freed
+         * slots already freed for j<k (double-free on the OOM path).
+         * count<=1000 so the bound is ~8MB max — no size_t overflow
+         * at these magnitudes. No lines are freed yet here, so the
+         * OOM cleanup below cannot double-free. */
+        {
+            size_t need = (size_t)written + (size_t)count * (8192 + 4) + 64;
+            if (need > result_cap) {
+                char *_grow = realloc(result, need);
                 if (!_grow) {
                     for (int f = 0; f < count; f++) free(lines[f]);
                     free(lines);
@@ -4298,7 +4301,10 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                     return strdup("{\"ok\":false,\"error\":{\"code\":\"oom\",\"message\":\"out of memory\"}}");
                 }
                 result = _grow;
+                result_cap = need;
             }
+        }
+        for (int k = 0; k < count; k++) {
             if (k > 0) written += snprintf(result + written, result_cap - written, ",");
             /* Escape the line for JSON */
             char escaped[8192] = {0};
