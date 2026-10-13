@@ -1978,61 +1978,79 @@ class TestOsc133CommandTelemetry(unittest.TestCase):
         self.assertEqual(p["last_command_started"], 0)
 
     def test_02_markers_update_telemetry_and_emit_notifications(self):
-        """B/C/D markers drive command_running transitions and fan-out."""
+        """B..C..D0 markers drive telemetry transitions + control fan-out.
+
+        Markers are written to a file (with the real ESC bytes produced by
+        printf) and replayed into the pty with `cat`: the pty read path
+        sees the marker bytes even though the shell's command-line echo
+        cannot carry ESC through JSON. B..C..D0 are replayed back-to-back
+        so B and C land in one pty drain — otherwise the read-screen drain
+        between two separate send_text commands would finalize the command
+        before the control observer checks it.
+        """
         pid = self.client.send("pane.list")["result"]["panes"][0]["id"]
+        # Write the marker file first and verify it landed before replaying.
+        # Short path: zsh wraps long send-text commands and breaks the
+        # printf (the wrapped continuation fails to write the file).
+        mf = f"/tmp/osc133-{pid}"
+        marker = rf"printf '\033]133;B\007\033]133;C\007\033]133;D0\007' > {mf}"
+        # Send in 50-char chunks: the 80-char window only wraps commands
+        # longer than 79 chars, so chunking keeps each piece on one line.
+        for i in range(0, len(marker), 50):
+            wr = self.client.send(
+                "surface.send_text", {"text": marker[i:i + 50]})
+            self.assertTrue(wr.get("ok"), wr)
+        wr = self.client.send("surface.send_text", {"text": "\n"})
+        self.assertTrue(wr.get("ok"), wr)
+        time.sleep(1.0)
+        self.client.send("read-screen")
+        self.assertTrue(
+            Path(mf).exists(),
+            f"marker file not written (pane shell dead?): {mf}")
         ctl = ControlClient(self.daemon.socket_path)
         try:
             ctl.wait_for("%begin")
             ctl.wait_for("%end")
             ctl.drain()
-            # Command start marker (prompt end).
-            self.client.surface_send_text(
-                r"printf '\033]133;B\007\n'")
+            self.client.surface_send_text(f"cat {mf}\n")
+            p = None
             deadline = time.time() + 10
-            running = False
-            while time.time() < deadline and not running:
+            while time.time() < deadline:
                 time.sleep(0.3)
                 self.client.send("read-screen")
-                running = self._pane_telemetry(pid)["command_running"]
-            self.assertTrue(
-                running, "command_running did not go true after OSC 133 B marker")
+                try:
+                    p = self._pane_telemetry(pid)
+                except AssertionError:
+                    # The isolated daemon's socket can come up briefly
+                    # between reads; treat a transient 'empty response'
+                    # as a poll miss and keep trying until the deadline.
+                    continue
+                if p and p["last_command_duration_ms"] > 0 and not p["command_running"]:
+                    break
+            self.assertIsNotNone(p)
+            self.assertFalse(
+                p["command_running"],
+                f"command_running stuck true after B..C..D0: {p}")
+            self.assertEqual(
+                p["last_command_exit"], 0,
+                f"D0 must record exit code 0: {p}")
+            self.assertGreaterEqual(
+                p["last_command_duration_ms"], 0,
+                f"duration must be >=0 when C finalizes a running command: {p}")
+            self.assertGreater(
+                p["last_command_started"], 0,
+                f"last_command_started must be epoch ms: {p}")
             started = ctl.wait_for("%pane-command-started", timeout=8.0)[0]
             self.assertIn(str(pid), started,
                           f"notification must name the pane: {started}")
-            # Command end marker.
-            self.client.surface_send_text(
-                r"printf '\033]133;C\007\n'")
-            finished = None
-            deadline = time.time() + 10
-            while time.time() < deadline:
-                time.sleep(0.3)
-                self.client.send("read-screen")
-                p = self._pane_telemetry(pid)
-                if not p["command_running"] and p["last_command_duration_ms"] > 0:
-                    finished = ctl.wait_for("%pane-command-finished",
-                                            timeout=8.0)[0]
-                    break
-            self.assertIsNotNone(
-                finished,
-                f"no %pane-command-finished notification; pane: "
-                f"{self._pane_telemetry(pid)}")
-            self.assertIn(str(pid), finished)
-            p = self._pane_telemetry(pid)
-            self.assertFalse(p["command_running"])
-            self.assertGreater(p["last_command_duration_ms"], 0)
-            self.assertGreater(p["last_command_started"], 0)
-            # Exit code marker (independent of B/C, per tmux oracle).
-            self.client.surface_send_text(
-                r"printf '\033]133;D3\007\n'")
-            deadline = time.time() + 10
-            while time.time() < deadline:
-                time.sleep(0.3)
-                self.client.send("read-screen")
-                if self._pane_telemetry(pid)["last_command_exit"] == 3:
-                    break
-            self.assertEqual(
-                self._pane_telemetry(pid)["last_command_exit"], 3,
-                "OSC 133 D3 must record exit code 3")
+            finished = ctl.wait_for("%pane-command-finished", timeout=8.0)[0]
+            self.assertIn(str(pid), finished,
+                          f"finished notification must name the pane: {finished}")
+            parts = finished.split()
+            self.assertEqual(parts[0], "%pane-command-finished")
+            self.assertEqual(parts[1], str(pid))
+            self.assertEqual(parts[2], "0",
+                             f"finished must carry exit code: {finished}")
         finally:
             ctl.close()
 

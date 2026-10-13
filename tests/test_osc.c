@@ -201,6 +201,50 @@ static void test_osc_reset(void) {
 }
 
 /* ──────────────────────────────────────────────
+ * OSC 133 shell-integration markers (ISS-0037)
+ * ────────────────────────────────────────────── */
+
+static void test_osc_133_parse(void) {
+    TEST("OSC 133 marker B parsed, flagged as 133");
+    lmux_osc_parser *p = lmux_osc_parser_new();
+    const char *text = NULL;
+    bool waiting = false;
+
+    const char *seq = "\033]133;B\007";
+    bool ok = lmux_osc_parser_feed(p, seq, strlen(seq), &text, &waiting);
+    ASSERT(ok, "should parse OSC 133 B marker");
+    ASSERT(text != NULL && strcmp(text, "B") == 0, "payload must be B");
+    ASSERT(lmux_osc_parser_last_was_osc133(p), "must be flagged as OSC 133");
+    ASSERT(!waiting, "OSC 133 has no waiting semantics");
+
+    /* A second marker on the same parser: flag must persist per sequence. */
+    const char *seq2 = "\033]133;D0\007";
+    ok = lmux_osc_parser_feed(p, seq2, strlen(seq2), &text, &waiting);
+    ASSERT(ok, "should parse OSC 133 D marker");
+    ASSERT(text != NULL && strcmp(text, "D0") == 0, "payload must be D0");
+    ASSERT(lmux_osc_parser_last_was_osc133(p), "D marker must flag as 133");
+
+    /* OSC 9 must NOT flag as 133. */
+    lmux_osc_parser_free(p);
+    p = lmux_osc_parser_new();
+    const char *seq3 = "\033]9;plain\007";
+    ok = lmux_osc_parser_feed(p, seq3, strlen(seq3), &text, &waiting);
+    ASSERT(ok, "OSC 9 must still parse");
+    ASSERT(!lmux_osc_parser_last_was_osc133(p),
+           "OSC 9 must not flag as 133");
+
+    /* Non-133 OSC (e.g. 10 = set cursor color) is dropped, not flagged. */
+    const char *seq4 = "\033]10;12;34;56\033\\";
+    ok = lmux_osc_parser_feed(p, seq4, strlen(seq4), &text, &waiting);
+    ASSERT(!ok, "unknown OSC ps must be dropped, not complete");
+    ASSERT(!lmux_osc_parser_last_was_osc133(p),
+           "dropped OSC must not flag as 133");
+
+    lmux_osc_parser_free(p);
+    PASS();
+}
+
+/* ──────────────────────────────────────────────
  * Main
  * ────────────────────────────────────────────── */
 
@@ -212,6 +256,7 @@ int main(void) {
     test_osc_9_parse();
     test_osc_777_parse();
     test_osc_99_parse();
+    test_osc_133_parse();
     test_osc_partial_feed();
     test_osc_multi_feed();
     test_osc_bel_terminator();
