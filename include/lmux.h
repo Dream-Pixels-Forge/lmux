@@ -56,6 +56,9 @@ typedef enum {
 } lmux_log_level;
 
 void lmux_log_set_level(lmux_log_level level);
+void lmux_log_set_file(const char *path);
+void lmux_log_set_json(bool enabled);
+void lmux_log_set_rotation(int max_size_mb, int max_files);
 void lmux_log(lmux_log_level level, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));
 void lmux_log_request(const char *request_id, const char *cmd, bool ok, const char *detail);
@@ -460,6 +463,13 @@ typedef struct {
     lmux_config_vec workspace_groups;  /* lmux_workspace_group* items */
     char default_shell[256];
     char agent_paths[5][512];  /* claude-code, opencode, codex, aider, goose */
+
+    /* Logging configuration */
+    char log_file[512];          /* Path to log file */
+    int  log_level;              /* 0=debug, 1=info, 2=warn, 3=error */
+    bool log_json;               /* JSON format logs */
+    int  log_max_size_mb;        /* Max log file size in MB before rotation */
+    int  log_max_files;          /* Max number of rotated log files to keep */
 } lmux_config;
 
 lmux_config *lmux_config_new(void);
@@ -572,6 +582,16 @@ int  lmux_focus_history_recent(struct lmux_focus_history *h,
                                 int n,
                                 struct lmux_focus_entry *out);
 void lmux_focus_history_clear(struct lmux_focus_history *h);
+
+/* ------------------------------------------------------------------ */
+/* HTTP Server for SSE log streaming                                  */
+/* ------------------------------------------------------------------ */
+
+int lmux_http_server_start(lmux_app *app, int port);
+void lmux_http_server_stop(void);
+
+/* Accessor for app config */
+const char *lmux_app_get_log_file(const lmux_app *app);
 
 
 #ifdef __cplusplus

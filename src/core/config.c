@@ -197,6 +197,11 @@ lmux_config *lmux_config_new(void) {
     c->auto_save_session = true;
     c->auto_save_interval_sec = 30;
     snprintf(c->default_shell, sizeof c->default_shell, "/bin/bash");
+    /* Logging defaults: INFO level, text format, 10 MB cap, 5 files kept. */
+    c->log_level = 1;
+    c->log_json = false;
+    c->log_max_size_mb = 10;
+    c->log_max_files = 5;
     /* Agent paths — empty means use PATH */
     c->keybindings = (lmux_config_vec){0};
     c->themes = (lmux_config_vec){0};
@@ -300,6 +305,19 @@ bool lmux_config_load_buf(lmux_config *cfg, const char *buf, size_t len) {
     cfg_json_extract_string(buf, "agent_codex", cfg->agent_paths[2], 512);
     cfg_json_extract_string(buf, "agent_aider", cfg->agent_paths[3], 512);
     cfg_json_extract_string(buf, "agent_goose", cfg->agent_paths[4], 512);
+
+    /* Logging configuration */
+    cfg_json_extract_string(buf, "log_file", cfg->log_file, sizeof cfg->log_file);
+    cfg_json_extract_int(buf, "log_level", &cfg->log_level);
+    cfg_json_extract_bool(buf, "log_json", &cfg->log_json);
+    cfg_json_extract_int(buf, "log_max_size_mb", &cfg->log_max_size_mb);
+    cfg_json_extract_int(buf, "log_max_files", &cfg->log_max_files);
+    /* Clamp to sane ranges (a corrupt config must not disable logging
+     * into a negative level or an unbounded file). */
+    if (cfg->log_level < 0) cfg->log_level = 0;
+    if (cfg->log_level > 3) cfg->log_level = 3;
+    if (cfg->log_max_size_mb < 0) cfg->log_max_size_mb = 0;
+    if (cfg->log_max_files < 0) cfg->log_max_files = 0;
 
     /* Parse keybindings. save() emits an array of {key, action} objects; the
      * legacy object-keyed-by-name form is still accepted. */
@@ -559,6 +577,13 @@ bool lmux_config_save(const lmux_config *cfg, const char *path) {
     fprintf(f, "  \"agent_codex\": \"%s\",\n", cfg_json_escape(cfg->agent_paths[2], esc_buf, sizeof esc_buf));
     fprintf(f, "  \"agent_aider\": \"%s\",\n", cfg_json_escape(cfg->agent_paths[3], esc_buf, sizeof esc_buf));
     fprintf(f, "  \"agent_goose\": \"%s\",\n", cfg_json_escape(cfg->agent_paths[4], esc_buf, sizeof esc_buf));
+
+    /* Logging configuration */
+    fprintf(f, "  \"log_file\": \"%s\",\n", cfg_json_escape(cfg->log_file, esc_buf, sizeof esc_buf));
+    fprintf(f, "  \"log_level\": %d,\n", cfg->log_level);
+    fprintf(f, "  \"log_json\": %s,\n", cfg->log_json ? "true" : "false");
+    fprintf(f, "  \"log_max_size_mb\": %d,\n", cfg->log_max_size_mb);
+    fprintf(f, "  \"log_max_files\": %d,\n", cfg->log_max_files);
 
     /* Keybindings */
     fprintf(f, "  \"keybindings\": [\n");

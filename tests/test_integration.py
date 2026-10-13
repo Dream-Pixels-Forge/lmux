@@ -512,6 +512,580 @@ class TestConfig(unittest.TestCase):
             self.assertIn(key, cfg, f"missing config key: {key}")
 
 
+class TestLogLevelFiltering(unittest.TestCase):
+    """Test log level filtering in the logs command."""
+
+    @classmethod
+    def setUpClass(cls):
+        # Use an isolated daemon with a dedicated log file for clean test state
+        cls.home = tempfile.mkdtemp(prefix="lmux-log-test-")
+        data = Path(cls.home) / ".local" / "share"
+        (data / "lmux").mkdir(parents=True, exist_ok=True)
+        config_dir = Path(cls.home) / ".config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        env = dict(os.environ)
+        env["HOME"] = cls.home
+        env["XDG_DATA_HOME"] = str(data)
+        env["XDG_CONFIG_HOME"] = str(config_dir)
+
+        cls.log_file = str(data / "lmux" / "test-logs.log")
+        sock = f"/tmp/lmux-log-test-{os.getpid()}.sock"
+
+        # Write config file with logging enabled
+        config_content = json.dumps({
+            "log_file": cls.log_file,
+            "log_level": 0,  # DEBUG - capture all levels
+            "log_json": True,
+            "log_max_size_mb": 10,
+            "log_max_files": 5,
+        }, indent=2)
+        config_path = config_dir / "lmux" / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(config_content)
+
+        cls.daemon = LmuxDaemon(sock, env=env)
+        cls.c = cls.daemon.start(timeout=60)
+
+        # Give daemon time to initialize logging
+        time.sleep(0.5)
+
+        # Write test log entries at different levels using the daemon's logger
+        cls.c.send("ping")  # generates INFO log
+        cls.c.send("ping")  # generates INFO log
+
+        # Use config.set to generate WARN level log (invalid config key might warn)
+        cls.c.send("config.set", {"invalid_key_that_should_not_exist": "value"})
+
+        # Generate ERROR by sending malformed command
+        cls.c.send("nonexistent.command")
+
+        # Give time for logs to be written
+        time.sleep(0.5)
+
+    @classmethod
+    def tearDownClass(cls):
+        try:
+            cls.daemon.stop()
+        except Exception:
+            pass
+        try:
+            shutil.rmtree(cls.home, ignore_errors=True)
+        except Exception:
+            pass
+
+    def _get_log_lines(self, level=None):
+        """Helper to get log lines with optional level filter."""
+        # logs() uses assert_ok which returns the result dict directly
+        result = self.c.logs(level=level)
+        return result.get("lines", [])
+
+    def _count_levels(self, lines):
+        """Count log lines by level from JSON log entries."""
+        counts = {"debug": 0, "info": 0, "warn": 0, "error": 0}
+        for line in lines:
+            try:
+                entry = json.loads(line)
+                lvl = entry.get("level", "").lower()
+                if lvl in counts:
+                    counts[lvl] += 1
+            except json.JSONDecodeError:
+                # Legacy format: [lmux LEVEL] message
+                if "[lmux DEBUG]" in line:
+                    counts["debug"] += 1
+                elif "[lmux INFO ]" in line:
+                    counts["info"] += 1
+                elif "[lmux WARN ]" in line:
+                    counts["warn"] += 1
+                elif "[lmux ERROR]" in line:
+                    counts["error"] += 1
+        return counts
+
+    def test_logs_without_filter_returns_all_levels(self):
+        """No level filter should return all log lines."""
+        lines = self._get_log_lines()
+        self.assertGreater(len(lines), 0, "Should have log lines")
+        counts = self._count_levels(lines)
+        # We expect at least some info and error logs from our setup
+        self.assertGreater(counts["info"] + counts["warn"] + counts["error"], 0)
+
+    def test_logs_level_debug_returns_all(self):
+        """Level debug should return all log lines (debug < info < warn < error)."""
+        lines = self._get_log_lines(level="debug")
+        self.assertGreater(len(lines), 0)
+        counts = self._count_levels(lines)
+        total_debug = counts["debug"] + counts["info"] + counts["warn"] + counts["error"]
+        self.assertEqual(len(lines), total_debug)
+
+    def test_logs_level_info_excludes_debug(self):
+        """Level info should return info, warn, error but NOT debug."""
+        lines = self._get_log_lines(level="info")
+        counts = self._count_levels(lines)
+        # Debug lines should be filtered out
+        self.assertEqual(counts["debug"], 0, "Debug lines should be filtered out at info level")
+        # But info, warn, error should be present
+        self.assertGreater(counts["info"] + counts["warn"] + counts["error"], 0)
+
+    def test_logs_level_warn_excludes_debug_and_info(self):
+        """Level warn should return warn, error but NOT debug or info."""
+        lines = self._get_log_lines(level="warn")
+        counts = self._count_levels(lines)
+        self.assertEqual(counts["debug"], 0, "Debug lines should be filtered out at warn level")
+        self.assertEqual(counts["info"], 0, "Info lines should be filtered out at warn level")
+        # Note: test setup may not generate warn/error logs, so we only verify
+        # that debug/info are filtered. If any lines returned, they must be warn/error.
+        for line in lines:
+            try:
+                entry = json.loads(line)
+                self.assertIn(entry.get("level", "").lower(), ["warn", "error"])
+            except json.JSONDecodeError:
+                self.assertTrue("[lmux WARN ]" in line or "[lmux ERROR]" in line)
+
+    def test_logs_level_error_returns_only_error(self):
+        """Level error should return only error lines."""
+        lines = self._get_log_lines(level="error")
+        counts = self._count_levels(lines)
+        self.assertEqual(counts["debug"], 0)
+        self.assertEqual(counts["info"], 0)
+        self.assertEqual(counts["warn"], 0)
+        # Error lines may or may not be present depending on test setup
+        # but if any lines returned, they must all be error level
+        for line in lines:
+            try:
+                entry = json.loads(line)
+                self.assertEqual(entry.get("level", "").lower(), "error")
+            except json.JSONDecodeError:
+                self.assertIn("[lmux ERROR]", line)
+
+    def test_logs_level_case_insensitive(self):
+        """Level filter should be case-insensitive: INFO == info == Info."""
+        lines_lower = self._get_log_lines(level="info")
+        lines_upper = self._get_log_lines(level="INFO")
+        lines_mixed = self._get_log_lines(level="Info")
+
+        counts_lower = self._count_levels(lines_lower)
+        counts_upper = self._count_levels(lines_upper)
+        counts_mixed = self._count_levels(lines_mixed)
+
+        # All three should have same counts (no debug lines)
+        self.assertEqual(counts_lower["debug"], counts_upper["debug"])
+        self.assertEqual(counts_lower["debug"], counts_mixed["debug"])
+        self.assertEqual(counts_lower["info"], counts_upper["info"])
+        self.assertEqual(counts_lower["info"], counts_mixed["info"])
+
+
+class TestHttpLogServerSecurity(unittest.TestCase):
+    """ISS-0002: the C HTTP log server must bind loopback only and serve
+    valid, escaped JSON.
+
+    Background: ``http_server.c`` bound ``INADDR_ANY`` with no auth (any
+    host on the network could read daemon logs) and interpolated raw log
+    lines into a JSON array (a quote/backslash/control char in any line
+    breaks the response, and the ``count`` field was malformed JSON).
+    The ``logs`` socket command had the same escaping/shape defect.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.c = _ensure_daemon()
+        cls.repo = Path(__file__).parent.parent
+        cls.http_c = (cls.repo / "src" / "core" / "http_server.c").read_text()
+        # Point the shared daemon's log file at a scratch file so the
+        # HTTP tests exercise the file-backed branch deterministically.
+        cls.log_file = str(
+            Path(tempfile.gettempdir()) / f"lmux-http-test-{os.getpid()}.log")
+        Path(cls.log_file).write_text("")
+        cls.c.send("config.set", {"key": "log_file", "value": cls.log_file})
+        cls.c.send("ping")
+
+    def test_does_not_bind_all_interfaces(self):
+        self.assertNotIn(
+            "INADDR_ANY", self.http_c,
+            "log server must not listen on all interfaces (no auth)",
+        )
+
+    def test_binds_loopback(self):
+        self.assertIn(
+            "127.0.0.1", self.http_c,
+            "log server must bind the loopback interface explicitly",
+        )
+
+    def _api_logs_body(self):
+        import urllib.request
+        try:
+            with urllib.request.urlopen(
+                "http://127.0.0.1:8080/api/logs", timeout=10
+            ) as resp:
+                return resp.read().decode(errors="replace")
+        except Exception as exc:  # noqa: BLE001 - optional service
+            self.skipTest(f"HTTP log server not reachable: {exc}")
+
+    def _proc_listener_ip(self):
+        """Hex IP the process listens on for port 8080, or None."""
+        try:
+            text = Path("/proc/net/tcp").read_text()
+        except OSError:
+            return None
+        for line in text.splitlines()[1:]:
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            ip_hex, port_hex = parts[1].rsplit(":", 1)
+            if port_hex.upper() == "1F90" and parts[3] == "0A":
+                return ip_hex.upper()
+        return None
+
+    def test_listener_is_loopback_only(self):
+        ip = self._proc_listener_ip()
+        if ip is None:
+            self.skipTest("no TCP listener on 8080 (HTTP server not running)")
+        self.assertEqual(
+            ip, "0100007F",
+            f"port 8080 must listen on 127.0.0.1, not {ip}",
+        )
+
+    def test_api_logs_returns_valid_json(self):
+        body = self._api_logs_body()
+        doc = json.loads(body)  # malformed JSON fails here
+        self.assertIn("lines", doc)
+        self.assertIn("count", doc)
+        self.assertIsInstance(doc["lines"], list)
+        self.assertEqual(doc["count"], len(doc["lines"]))
+
+    def test_api_logs_escapes_hostile_content(self):
+        hostile = 'quote" backslash\\ ctrl\x01 tab\t end'
+        with open(self.log_file, "a") as fh:
+            fh.write(hostile + "\n")
+        body = self._api_logs_body()
+        doc = json.loads(body)  # unescaped content breaks parsing here
+        self.assertIn(
+            hostile, doc["lines"],
+            f"hostile log line must round-trip exactly: {doc['lines']!r}",
+        )
+
+    def test_logs_command_returns_string_lines(self):
+        result = self.c.logs()
+        lines = result.get("lines", [])
+        self.assertGreater(len(lines), 0, "expected log lines from ping")
+        for line in lines:
+            self.assertIsInstance(
+                line, str, f"log line must be a JSON string: {line!r}")
+
+
+class TestLogsHostileRoundTrip(unittest.TestCase):
+    """The ``logs`` socket command must return hostile file content
+    verbatim (escaped in transit, exact after parsing)."""
+
+    def test_hostile_lines_round_trip_exactly(self):
+        client, daemon, home = _isolated_client()
+        try:
+            data = home / ".local" / "share" / "lmux"
+            log_file = str(data / "hostile.log")
+            Path(log_file).write_text("")
+            client.send("config.set", {"key": "log_file", "value": log_file})
+            client.send("ping")
+            hostile = [
+                'quote"inside',
+                'backslash\\inside',
+                'ctrl\x01char',
+                'tab\there',
+                '{"looks": "like json"}',
+            ]
+            with open(log_file, "a") as fh:
+                for line in hostile:
+                    fh.write(line + "\n")
+            result = client.logs()
+            lines = result.get("lines", [])
+            for want in hostile:
+                self.assertIn(
+                    want, lines, f"hostile line must round-trip: {want!r}")
+        finally:
+            _shutdown_isolated(daemon, home)
+
+
+class TestLogsLargeOutput(unittest.TestCase):
+    """ISS-0005: ``logs`` must not overflow its heap response buffer when
+    the log file holds more output than the initial 16KB result buffer
+    (here 30 x ~4KB lines ~= 120KB). Before the fix the handler appended
+    with unbounded ``written += snprintf(...)`` so ``result_cap - written``
+    wrapped and ``snprintf`` wrote past the heap allocation."""
+
+    def test_many_long_lines_return_complete_valid_json(self):
+        client, daemon, home = _isolated_client()
+        try:
+            data = home / ".local" / "share" / "lmux"
+            log_file = str(data / "big.log")
+            Path(log_file).write_text("")
+            client.send("config.set", {"key": "log_file", "value": log_file})
+            markers = [f"{i:04d}-" + "L" * 4000 for i in range(30)]
+            with open(log_file, "a") as fh:
+                for m in markers:
+                    fh.write(m + "\n")
+            resp = client.send("logs")
+            self.assertTrue(resp.get("ok"), f"logs failed: {str(resp)[:300]}")
+            lines = resp.get("result", {}).get("lines", [])
+            for m in markers:
+                self.assertIn(
+                    m, lines, f"long log line missing/truncated ({m[:9]}...)")
+        finally:
+            _shutdown_isolated(daemon, home)
+
+
+class TestHttpLogsMallocCheck(unittest.TestCase):
+    """ISS-0005: the /api/logs handler malloc()s a 64KB response buffer;
+    a NULL return must be handled (500) instead of snprintf() into NULL."""
+
+    def test_api_logs_response_buffer_null_checked(self):
+        repo = Path(__file__).parent.parent
+        http_c = (repo / "src" / "core" / "http_server.c").read_text()
+        malloc_pos = http_c.find("malloc(65536)")
+        self.assertNotEqual(
+            malloc_pos, -1, "expected the 64KB /api/logs response malloc")
+        tail = http_c[malloc_pos:malloc_pos + 600]
+        self.assertTrue(
+            "!json" in tail or "json == NULL" in tail
+            or "json==NULL" in tail or "NULL ==" in tail,
+            "malloc(65536) result must be NULL-checked before use",
+        )
+
+
+class TestLogsEmitNoMidLoopGrowth(unittest.TestCase):
+    """ISS-0010: the ``logs`` emit loop grew the heap result buffer
+    mid-loop while freeing each emitted line, so a realloc failure at
+    iteration k>=1 ran the OOM cleanup over slots already freed for
+    j<k (double-free on the already-OOM path). Fixed behavior: buffer
+    growth is hoisted before the emit loop (worst-case upper bound),
+    so the emit loop contains no realloc and no OOM cleanup."""
+
+    def test_emit_loop_has_no_realloc_or_oom_cleanup(self):
+        repo = Path(__file__).parent.parent
+        model_c = (repo / "src" / "core" / "model.c").read_text()
+        emit_pos = model_c.find("for (int k = 0; k < count; k++)")
+        self.assertNotEqual(emit_pos, -1, "expected the logs emit loop")
+        emit_end = model_c.find("free(lines);", emit_pos)
+        self.assertNotEqual(emit_end, -1, "expected end of emit loop")
+        emit_body = model_c[emit_pos:emit_end]
+        self.assertNotIn(
+            "realloc", emit_body,
+            "emit loop must not grow the buffer (hoist growth before emit)",
+        )
+        self.assertNotIn(
+            "for (int f = 0; f < count; f++)", emit_body,
+            "emit loop must not carry an OOM cleanup loop (double-free)",
+        )
+
+    def test_lines_malloc_oom_frees_result(self):
+        repo = Path(__file__).parent.parent
+        model_c = (repo / "src" / "core" / "model.c").read_text()
+        malloc_pos = model_c.find(
+            "char **lines = malloc(sizeof(char *) * (size_t)log_limit)")
+        self.assertNotEqual(malloc_pos, -1, "expected the lines malloc")
+        tail = model_c[malloc_pos:malloc_pos + 300]
+        self.assertIn(
+            "free(result)", tail,
+            "lines-malloc OOM path must free the 16KB result buffer",
+        )
+
+
+class TestHttpLogsLargeOutput(unittest.TestCase):
+    """ISS-0005: ``/api/logs`` must not overflow its 64KB heap response
+    buffer when the log file holds more than fits (here 100 x ~4KB lines
+    ~= 400KB, and the handler reads up to 100 lines). Before the fix the
+    handler accumulated ``json_len += snprintf(...)`` unboundedly, so
+    ``65536 - json_len`` wrapped and ``snprintf`` wrote past the heap
+    allocation. Fixed behavior: stay alive and answer valid JSON (the
+    ``response_too_large`` envelope)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.c = _ensure_daemon()
+        cls.log_file = str(
+            Path(tempfile.gettempdir()) / f"lmux-http-big-{os.getpid()}.log")
+        Path(cls.log_file).write_text("")
+        cls.c.send("config.set", {"key": "log_file", "value": cls.log_file})
+        with open(cls.log_file, "a") as fh:
+            for i in range(100):
+                fh.write(f"{i:04d}-" + "H" * 4000 + "\n")
+
+    def test_large_output_returns_valid_json_and_daemon_survives(self):
+        import urllib.request
+        try:
+            with urllib.request.urlopen(
+                "http://127.0.0.1:8080/api/logs", timeout=10
+            ) as resp:
+                body = resp.read().decode(errors="replace")
+        except Exception as exc:  # noqa: BLE001 - network faults
+            # A reset/dead server is the bug (heap overflow kills the
+            # daemon); only skip when the daemon is alive but HTTP is
+            # simply not enabled in this environment.
+            try:
+                alive = bool(self.c.send("ping").get("ok"))
+            except Exception:  # noqa: BLE001 - daemon socket is gone
+                alive = False
+            self.assertTrue(
+                alive, f"daemon died serving large /api/logs output: {exc}")
+            self.skipTest(f"HTTP log server not reachable: {exc}")
+        doc = json.loads(body)  # truncated/overflowed JSON fails here
+        self.assertTrue(
+            isinstance(doc.get("lines"), list) or doc.get("ok") is False,
+            f"expected capped lines or the response_too_large envelope: {body[:200]!r}",
+        )
+        self.assertTrue(
+            self.c.send("ping").get("ok"),
+            "daemon died while serving large /api/logs output",
+        )
+
+
+class TestLogsFollowSseEndpoint(unittest.TestCase):
+    """ISS-0006: ``logs`` with ``follow:true`` must advertise the SSE
+    endpoint — the CLI only streams (``sse_stream_logs``) when the
+    response contains ``"sse_endpoint":"/api/logs/stream"``. Before the
+    fix the handler never emitted it, so ``lmux logs --follow`` silently
+    fell through to a one-shot print."""
+
+    def test_follow_true_includes_sse_endpoint(self):
+        client, daemon, home = _isolated_client()
+        try:
+            resp = client.send("logs", {"follow": True})
+            self.assertTrue(resp.get("ok"), f"logs failed: {str(resp)[:200]}")
+            self.assertEqual(
+                resp.get("result", {}).get("sse_endpoint"),
+                "/api/logs/stream",
+                "follow:true must advertise the SSE endpoint",
+            )
+        finally:
+            _shutdown_isolated(daemon, home)
+
+    def test_without_follow_response_shape_unchanged(self):
+        client, daemon, home = _isolated_client()
+        try:
+            result = client.logs()
+            self.assertIn("lines", result)
+            self.assertNotIn(
+                "sse_endpoint", result,
+                "plain logs must not advertise the SSE endpoint",
+            )
+        finally:
+            _shutdown_isolated(daemon, home)
+
+
+class TestLogsLimitTail(unittest.TestCase):
+    """ISS-0007: ``logs`` served the oldest 200 lines and ignored the
+    ``limit`` arg the CLI already sends (main.c builds ``"limit":N``).
+    Fixed behavior: honor ``limit`` (default 200, clamp 1000) and tail
+    the file — return the NEWEST N lines."""
+
+    def test_limit_returns_newest_n_lines(self):
+        client, daemon, home = _isolated_client()
+        try:
+            data = home / ".local" / "share" / "lmux"
+            log_file = str(data / "tail.log")
+            Path(log_file).write_text("")
+            client.send("config.set", {"key": "log_file", "value": log_file})
+            with open(log_file, "a") as fh:
+                for i in range(10):
+                    fh.write(f"line-{i:02d}\n")
+            resp = client.send("logs", {"limit": 5})
+            self.assertTrue(resp.get("ok"), f"logs failed: {str(resp)[:200]}")
+            lines = resp.get("result", {}).get("lines", [])
+            self.assertEqual(
+                lines, [f"line-{i:02d}" for i in range(5, 10)],
+                f"limit=5 must return newest 5, got: {lines!r}",
+            )
+        finally:
+            _shutdown_isolated(daemon, home)
+
+
+    def test_default_returns_newest_capped_at_200(self):
+        client, daemon, home = _isolated_client()
+        try:
+            data = home / ".local" / "share" / "lmux"
+            log_file = str(data / "tail-default.log")
+            Path(log_file).write_text("")
+            client.send("config.set", {"key": "log_file", "value": log_file})
+            with open(log_file, "a") as fh:
+                for i in range(250):
+                    fh.write(f"dline-{i:03d}\n")
+            resp = client.send("logs", {})
+            self.assertTrue(resp.get("ok"), f"logs failed: {str(resp)[:200]}")
+            lines = resp.get("result", {}).get("lines", [])
+            self.assertLessEqual(
+                len(lines), 200, f"default must cap at 200, got {len(lines)}")
+            self.assertIn(
+                "dline-249", lines, "default must include the newest line")
+            self.assertNotIn(
+                "dline-000", lines, "default must tail, not serve oldest")
+        finally:
+            _shutdown_isolated(daemon, home)
+
+
+class TestHttpSlotRelease(unittest.TestCase):
+    """ISS-0008 RC5: worker threads never released their ``client_fds``
+    slot, so 32 connections wedged the server forever (every later
+    connection silently dropped). Fixed: the slot is released on every
+    exit path — 40 sequential connections plus a 41st must all succeed."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.c = _ensure_daemon()
+
+    def test_40_sequential_connections_then_41st_served(self):
+        import urllib.request
+        url = "http://127.0.0.1:8080/api/logs"
+        served = 0
+        for _ in range(40):
+            try:
+                with urllib.request.urlopen(url, timeout=10) as resp:
+                    json.loads(resp.read().decode(errors="replace"))
+                served += 1
+            except Exception:  # noqa: BLE001 - a dropped conn is the bug
+                break
+            time.sleep(0.05)
+        if served < 5:
+            try:
+                self.c.send("ping")
+            except Exception:  # noqa: BLE001 - daemon socket gone
+                pass
+            self.skipTest("HTTP log server not reachable in this env")
+        try:
+            with urllib.request.urlopen(url, timeout=10) as resp:
+                json.loads(resp.read().decode(errors="replace"))
+        except Exception as exc:  # noqa: BLE001 - dropped conn is the bug
+            self.fail(
+                f"server wedged after {served} connections "
+                f"(slot leak, max 32): {exc}")
+        self.assertEqual(
+            served, 40,
+            f"all 40 sequential connections must succeed, got {served}")
+
+
+class TestSseSigintStopFlag(unittest.TestCase):
+    """ISS-0008 RC4: ``sse_stream_logs`` installed ``SIG_IGN`` for SIGINT
+    while polling only the socket, so Ctrl+C could never stop the stream.
+    Fixed: a ``sig_atomic_t`` stop flag set by the handler, checked in
+    the poll loop, with the previous handler restored on exit."""
+
+    @classmethod
+    def setUpClass(cls):
+        repo = Path(__file__).parent.parent
+        src = (repo / "src" / "cli" / "main.c").read_text()
+        start = src.index("/* SSE log streaming client */")
+        end = src.index("static void print_usage")
+        cls.sse = src[start:end]
+
+    def test_sigint_not_ignored_in_sse_stream(self):
+        self.assertNotIn(
+            "sa_handler = SIG_IGN", self.sse,
+            "sse_stream_logs must not ignore SIGINT (Ctrl+C must stop it)")
+        self.assertNotIn(
+            "sa_handler=SIG_IGN", self.sse,
+            "sse_stream_logs must not ignore SIGINT (Ctrl+C must stop it)")
+
+    def test_stop_flag_set_and_checked(self):
+        self.assertIn(
+            "sig_atomic_t", self.sse,
+            "SSE stream needs a sig_atomic_t stop flag for Ctrl+C")
+
+
 class TestTmuxCompatCli(unittest.TestCase):
     """CLI-level checks that run the binary directly.
 
@@ -620,7 +1194,10 @@ class TestSnapshotTruncationDetection(unittest.TestCase):
     def test_oversized_snapshot_is_rejected_not_silently_truncated(self):
         client, daemon, home = _isolated_client()
         try:
-            snap = Path(tempfile.gettempdir(),
+            # ISS-0003: snapshot.load is confined to the data root, so the
+            # fixture lives there; without ids it is malformed content and
+            # must be refused loudly (load_failed), never half-applied.
+            snap = Path(home, ".local", "share", "lmux",
                         f"lmux-test-big-{os.getpid()}.json")
             # ~70 KB, comfortably past the 64 KB buffer.
             workspaces = "".join(
@@ -716,7 +1293,9 @@ class TestPtyDeferralOnRestore(unittest.TestCase):
                     client = None
             self.assertIsNotNone(client, "daemon did not come up")
 
-            snap = home / "snap.json"
+            # ISS-0003: snapshot.load is confined to the data root, so the
+            # fixture must live there (home IS this daemon's $HOME).
+            snap = home / ".local" / "share" / "lmux" / "snap.json"
             n = 20
             ws = ",".join(
                 '{"id":%d,"title":"w%d","cwd":"/tmp","git_branch":"",'
@@ -1758,7 +2337,9 @@ class TestSnapshotParserCorrectness(unittest.TestCase):
         """T3: an unbalanced document must fail loudly."""
         client, daemon, home = _isolated_client()
         try:
-            snap = Path(tempfile.gettempdir(),
+            # ISS-0003: load is confined to the data root; the truncated
+            # document lives there so this still exercises the parser.
+            snap = Path(home, ".local", "share", "lmux",
                         f"lmux-test-trunc-{os.getpid()}.json")
             snap.write_text('{"version":1,"workspaces":[{"id":1,"title":"a",'
                             '"cwd":"/tmp","surfaces":[{"id":1,"title":"b"')
@@ -1781,7 +2362,9 @@ class TestSnapshotParserCorrectness(unittest.TestCase):
         """
         client, daemon, home = _isolated_client()
         try:
-            snap = Path(tempfile.gettempdir(),
+            # ISS-0003: load is confined to the data root; the large
+            # fixture lives there so this still exercises the loader.
+            snap = Path(home, ".local", "share", "lmux",
                         f"lmux-test-large-{os.getpid()}.json")
             n = 40
             pad = "/x" * 1700
@@ -1931,6 +2514,70 @@ class TestSnapshotSaveRoot(unittest.TestCase):
                 pass
             Path(sock).unlink(missing_ok=True)
             shutil.rmtree(bare, ignore_errors=True)
+
+
+class TestSnapshotLoadConfinement(unittest.TestCase):
+    """ISS-0003: snapshot.load called is_safe_path(path, NULL), which rejects
+    ".." but places no containment, so any absolute path was accepted and
+    the daemon read it. Confine it to the data root, mirroring the
+    snapshot.save fix (#12 step 4)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.client, cls.daemon, cls.home = _isolated_client()
+        cls.root = Path(cls.home, ".local", "share", "lmux")
+
+    @classmethod
+    def tearDownClass(cls):
+        _shutdown_isolated(cls.daemon, cls.home)
+
+    def _load(self, path=None):
+        args = {"path": path} if path else {}
+        return self.client.send("snapshot.load", args)
+
+    def test_absolute_path_outside_root_is_rejected(self):
+        resp = self._load("/etc/hosts")
+        self.assertFalse(resp.get("ok"), f"must be rejected: {resp}")
+        self.assertEqual(resp.get("error", {}).get("code"), "invalid_params")
+
+    def test_home_relative_escape_is_rejected(self):
+        resp = self._load("~/.ssh/id_rsa")
+        self.assertFalse(resp.get("ok"), f"must be rejected: {resp}")
+        self.assertEqual(resp.get("error", {}).get("code"), "invalid_params")
+
+    def test_dotdot_is_rejected(self):
+        resp = self._load("../outside.json")
+        self.assertFalse(resp.get("ok"), f"must be rejected: {resp}")
+        self.assertEqual(resp.get("error", {}).get("code"), "invalid_params")
+
+    def test_sibling_prefix_escape_is_rejected(self):
+        # <root>-evil shares a name prefix with <root> but is outside it;
+        # a startswith() containment check would wrongly accept it.
+        evil = self.root.parent / (self.root.name + "-evil") / "snap.json"
+        resp = self._load(str(evil))
+        self.assertFalse(resp.get("ok"), f"must be rejected: {resp}")
+        self.assertEqual(resp.get("error", {}).get("code"), "invalid_params")
+
+    def test_relative_name_inside_root_loads(self):
+        self.client.workspace_create(_unique("load-confine"))
+        saved = self.client.snapshot_save("confine-rt.json")["path"]
+        resp = self._load("confine-rt.json")
+        self.assertTrue(resp.get("ok"), f"relative load must work: {resp}")
+        self.assertEqual(resp["result"]["path"], saved)
+
+    def test_absolute_path_inside_root_loads(self):
+        # The absolute path snapshot.save returns must keep working.
+        saved = self.client.snapshot_save("confine-abs.json")["path"]
+        self.assertTrue(Path(saved).exists())
+        resp = self._load(saved)
+        self.assertTrue(resp.get("ok"), f"in-root absolute load: {resp}")
+
+    def test_default_path_matches_save_default(self):
+        self.client.workspace_create(_unique("load-default"))
+        saved = self.client.snapshot_save()["path"]
+        resp = self._load()
+        self.assertTrue(resp.get("ok"), f"default load must work: {resp}")
+        self.assertEqual(resp["result"]["path"], saved)
 
 
 class TestDependencyGateTargetsMaster(unittest.TestCase):
@@ -4996,6 +5643,139 @@ class TestHarnessSocketCleanup(unittest.TestCase):
         finally:
             listener.close()
             live_path.unlink(missing_ok=True)
+
+
+# ====================================================================
+# Log rotation
+# ====================================================================
+
+class TestLogRotation(unittest.TestCase):
+    """Log rotation: verify rotated files are created and max_files is enforced."""
+
+    def test_log_rotation_creates_rotated_files(self):
+        """Configure log_max_size_mb=1, write enough logs to trigger rotation.
+        
+        Verifies:
+        - Rotated files are created (.1, .2, etc.)
+        - Old log data is preserved in rotated files
+        - Max files limit is enforced (oldest deleted when limit reached)
+        """
+        # Create an isolated home directory for this test
+        home = tempfile.mkdtemp(prefix="lmux-logrot-home-")
+        home_path = Path(home)
+        try:
+            data = home_path / ".local" / "share"
+            (data / "lmux").mkdir(parents=True, exist_ok=True)
+            config_dir = home_path / ".config"
+            config_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Write config with small log size to trigger rotation quickly
+            log_file = str(home_path / "logs" / "lmux.log")
+            (home_path / "logs").mkdir(parents=True, exist_ok=True)
+            config = {
+                "log_level": 0,  # DEBUG - generates more logs
+                "log_file": log_file,
+                "log_max_size_mb": 1,  # 1 MB - small for testing
+                "log_max_files": 3,    # Keep only 3 total files (main + 2 rotated)
+                "log_json": False,
+            }
+            config_path = config_dir / "lmux" / "config.json"
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            config_path.write_text(json.dumps(config, indent=2))
+            
+            # Start daemon with this config
+            env = dict(os.environ)
+            env["HOME"] = str(home_path)
+            env["XDG_DATA_HOME"] = str(data)
+            env["XDG_CONFIG_HOME"] = str(config_dir)
+            sock = f"/tmp/lmux-logrot-{os.getpid()}.sock"
+            Path(sock).unlink(missing_ok=True)
+            daemon = LmuxDaemon(sock, env=env)
+            client = daemon.start(timeout=60)
+            
+            try:
+                # Generate some initial log entries
+                for i in range(5):
+                    ws = client.workspace_create(f"ws-{i}")
+                    ws_id = ws["id"]
+                    client.surface_create(ws_id, f"surf-{i}")
+                    client.surface_send_text(f"echo 'test {i}'\n")
+                    client.workspace_close(ws_id)
+                    time.sleep(0.05)
+                
+                # Wait for logs to be written
+                time.sleep(1)
+                
+                # Trigger first rotation by padding log file to exceed 1 MB
+                log_path = Path(log_file)
+                if log_path.exists():
+                    current_size = log_path.stat().st_size
+                    target_size = 1024 * 1024 + 1000  # 1 MB + 1 KB
+                    if current_size < target_size:
+                        padding = b"x" * (target_size - current_size)
+                        with open(log_path, "ab") as f:
+                            f.write(padding)
+                
+                # Trigger rotation check with a ping
+                client.ping()
+                time.sleep(0.5)
+                
+                # Check that rotated log file (.1) was created
+                log_dir = home_path / "logs"
+                log_files = sorted(log_dir.glob("lmux.log*"))
+                
+                # Should have main log file + 1 rotated file
+                self.assertGreaterEqual(len(log_files), 2,
+                    f"Expected at least 2 log files (main + rotated), got {len(log_files)}: {log_files}")
+                
+                # Verify rotated file exists and has content
+                rotated_files = [f for f in log_files if f.name != "lmux.log"]
+                self.assertGreaterEqual(len(rotated_files), 1,
+                    f"Expected at least 1 rotated log file, got {rotated_files}")
+                
+                for rot_file in rotated_files:
+                    content = rot_file.read_text()
+                    self.assertTrue(len(content) > 0,
+                        f"Rotated file {rot_file} should not be empty")
+                
+                # Trigger more rotations to test max_files limit
+                # With log_max_files=3, we should have at most 3 files total (main + 2 rotated)
+                for rotation in range(4):
+                    if log_path.exists():
+                        current_size = log_path.stat().st_size
+                        target_size = 1024 * 1024 + 1000
+                        if current_size < target_size:
+                            padding = b"x" * (target_size - current_size)
+                            with open(log_path, "ab") as f:
+                                f.write(padding)
+                    client.ping()
+                    time.sleep(0.2)
+                
+                # Check final file count - should not exceed log_max_files (3)
+                log_files = sorted(log_dir.glob("lmux.log*"))
+                self.assertLessEqual(len(log_files), 3,
+                    f"Expected at most 3 log files (max_files=3), got {len(log_files)}: {log_files}")
+                
+                # Verify rotated files have correct naming (.1, .2)
+                rotated_files = [f for f in log_files if f.name != "lmux.log"]
+                rotated_names = sorted([f.name for f in rotated_files])
+                # Should have .1 and .2 (2 rotated files for max_files=3)
+                self.assertIn("lmux.log.1", rotated_names,
+                    f"Expected lmux.log.1 in rotated files: {rotated_names}")
+                self.assertIn("lmux.log.2", rotated_names,
+                    f"Expected lmux.log.2 in rotated files: {rotated_names}")
+                
+                # Verify old log data is preserved in rotated files
+                for rot_file in rotated_files:
+                    content = rot_file.read_text()
+                    self.assertTrue(len(content) > 100000,  # Should have ~1MB of padding
+                        f"Rotated file {rot_file} should contain preserved data")
+                
+            finally:
+                daemon.stop()
+        finally:
+            # Clean up
+            shutil.rmtree(home, ignore_errors=True)
 
 
 class TestHarnessPtydTeardown(unittest.TestCase):

@@ -293,6 +293,21 @@ class LmuxClient:
     def capabilities(self) -> dict:
         return self.assert_ok("capabilities")
 
+    def logs(self, level: Optional[str] = None) -> dict:
+        """Show recent logs with optional level filter.
+        
+        Args:
+            level: Filter by log level (debug, info, warn, error). 
+                   If None, returns all levels.
+        
+        Returns:
+            dict with "lines" key containing list of log line strings
+        """
+        args: dict = {}
+        if level is not None:
+            args["level"] = level
+        return self.assert_ok("logs", args)
+
 
 class LmuxDaemon:
     """Manage an lmux daemon process for testing."""

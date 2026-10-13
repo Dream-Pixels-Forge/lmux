@@ -19,6 +19,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "lmux.h"
+#include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -36,6 +37,7 @@
 
 #include <fcntl.h>
 #include <errno.h>
+#include <limits.h>
 #include <sys/wait.h>
 #include <sys/ioctl.h>
 #include <termios.h>
@@ -439,6 +441,72 @@ struct lmux_workspace {
 
 
 
+/* True when absolute path `abs` resolves inside directory `root`
+ * (ISS-0003: snapshot.load confinement). Uses realpath() when the file
+ * exists so a symlink pointing outside cannot smuggle a path in, and
+ * falls back to a lexical component walk otherwise. Comparison is
+ * component-wise, so a sibling directory that merely shares a name
+ * prefix ("lmux-evil" vs "lmux") is not accepted. */
+static bool path_inside_root(const char *abs, const char *root) {
+    if (!abs || abs[0] != '/' || !root || !root[0]) return false;
+    char canon[2048];
+    const char *check = abs;
+    /* NB: the realpath() buffer must be PATH_MAX; anything smaller
+     * aborts under _FORTIFY_SOURCE even for short paths. Automatic
+     * storage (not static): dispatch runs on server threads. */
+    char via_link[PATH_MAX];
+    if (realpath(abs, via_link)) {
+        check = via_link;
+    }
+    /* Lexically normalize `check` into `canon`, resolving "." and "..". */
+    const char *parts[512];
+    size_t np = 0;
+    char work[2048];
+    snprintf(work, sizeof work, "%s", check);
+    for (char *tok = strtok(work, "/"); tok; tok = strtok(NULL, "/")) {
+        if (strcmp(tok, ".") == 0 || tok[0] == '\0') continue;
+        if (strcmp(tok, "..") == 0) {
+            if (np == 0) return false; /* escapes the filesystem root */
+            np--;
+            continue;
+        }
+        if (np >= sizeof parts / sizeof parts[0]) return false;
+        parts[np++] = tok;
+    }
+    size_t ci = 0;
+    for (size_t i = 0; i < np; i++) {
+        if (ci >= sizeof canon) return false;
+        ci += (size_t)snprintf(canon + ci, sizeof canon - ci, "/%s", parts[i]);
+        if (ci >= sizeof canon) return false;
+    }
+    if (ci == 0) { canon[0] = '/'; canon[1] = 0; ci = 1; }
+    /* Normalize `root` the same way for a component-wise comparison. */
+    const char *rparts[512];
+    size_t nr = 0;
+    char rwork[1024];
+    snprintf(rwork, sizeof rwork, "%s", root);
+    for (char *tok = strtok(rwork, "/"); tok; tok = strtok(NULL, "/")) {
+        if (strcmp(tok, ".") == 0 || tok[0] == '\0') continue;
+        if (strcmp(tok, "..") == 0) {
+            if (nr == 0) return false;
+            nr--;
+            continue;
+        }
+        if (nr >= sizeof rparts / sizeof rparts[0]) return false;
+        rparts[nr++] = tok;
+    }
+    if (np <= nr) return false; /* must be strictly inside, not root itself */
+    char rcanon[1024];
+    size_t ri = 0;
+    for (size_t i = 0; i < nr; i++) {
+        if (ri >= sizeof rcanon) return false;
+        ri += (size_t)snprintf(rcanon + ri, sizeof rcanon - ri, "/%s", rparts[i]);
+        if (ri >= sizeof rcanon) return false;
+    }
+    if (strncmp(canon, rcanon, ri) != 0) return false;
+    return canon[ri] == '/';
+}
+
 /* Root directory snapshot.save is confined to (#12 step 4). Mirrors the
  * browser_screenshot_root() policy so there is exactly one shape for "a path a
  * socket client may not choose". */
@@ -755,6 +823,16 @@ lmux_app *lmux_app_new(const char *socket_path) {
             a->auto_save_interval = 0;
         }
         a->restore_on_start = a->config->auto_save_session;
+        
+        /* Apply logging configuration (ISS-0002): file, level, format,
+         * rotation. These are per-process globals and each daemon is its
+         * own process, so per-app config maps cleanly onto them. */
+        if (a->config->log_file[0]) {
+            lmux_log_set_file(a->config->log_file);
+        }
+        lmux_log_set_level((lmux_log_level)a->config->log_level);
+        lmux_log_set_json(a->config->log_json);
+        lmux_log_set_rotation(a->config->log_max_size_mb, a->config->log_max_files);
     }
 
     if (!a->auto_save_interval) a->auto_save_interval = 0;
@@ -967,6 +1045,7 @@ void lmux_app_free(lmux_app *a) {
 
 /* Global log level shared by all apps in process. */
 static lmux_log_level g_log_level = LMUX_LOG_INFO;
+static char g_log_file_path[512] = {0};
 
 /* JSON logging mode: enabled via LMUX_LOG_JSON=1 environment variable. */
 static int g_log_json = -1;  /* -1 = not checked yet */
@@ -1000,8 +1079,103 @@ static size_t log_json_escape(const char *in, char *out, size_t cap) {
     return j;
 }
 
+/* Classify a log line by level for the `logs` level filter (ISS-0002).
+ * Handles the JSON form ("level":"info"), the legacy "[lmux INFO ]"
+ * form, and the earlier "[timestamp] [level]" file form. Returns 0-3,
+ * or -1 when no level can be determined (unknown lines are kept by
+ * the filter rather than dropped). */
+static int log_line_level(const char *line) {
+    if (!line) return -1;
+    /* JSON: "level":"<name>" */
+    const char *p = strstr(line, "\"level\"");
+    if (p) {
+        p = strchr(p + 7, '"');
+        if (p) {
+            p++;
+            char name[16] = {0};
+            size_t k = 0;
+            while (*p && *p != '"' && k < sizeof name - 1)
+                name[k++] = (char)tolower((unsigned char)*p++);
+            if (strcmp(name, "debug") == 0) return 0;
+            if (strcmp(name, "info") == 0) return 1;
+            if (strcmp(name, "warn") == 0 || strcmp(name, "warning") == 0) return 2;
+            if (strcmp(name, "error") == 0) return 3;
+        }
+    }
+    /* Text forms: scan case-insensitively (debug/warn/error first so a
+     * message that merely mentions another level still classifies). */
+    char lower[256];
+    size_t n = strlen(line);
+    if (n > sizeof lower - 1) n = sizeof lower - 1;
+    for (size_t i = 0; i < n; i++)
+        lower[i] = (char)tolower((unsigned char)line[i]);
+    lower[n] = 0;
+    if (strstr(lower, "debug")) return 0;
+    if (strstr(lower, "warn")) return 2;
+    if (strstr(lower, "error")) return 3;
+    if (strstr(lower, "info")) return 1;
+    return -1;
+}
+
 void lmux_log_set_level(lmux_log_level level) {
     g_log_level = level;
+}
+
+void lmux_log_set_file(const char *path)
+{
+    if (path) {
+        snprintf(g_log_file_path, sizeof g_log_file_path, "%s", path);
+    } else {
+        g_log_file_path[0] = '\0';
+    }
+}
+
+/* Log rotation limits (ISS-0002: configured via log_max_size_mb /
+ * log_max_files, applied from the config at startup). */
+static long g_log_max_bytes = 10L * 1024L * 1024L;
+static int g_log_max_files = 5;
+
+void lmux_log_set_json(bool enabled) {
+    g_log_json = enabled ? 1 : 0;
+}
+
+void lmux_log_set_rotation(int max_size_mb, int max_files) {
+    if (max_size_mb > 0) g_log_max_bytes = (long)max_size_mb * 1024L * 1024L;
+    if (max_files > 0) g_log_max_files = max_files;
+}
+
+/* Rotate the log file when the incoming write would exceed the size cap.
+ * Keeps main + (max_files - 1) rotated siblings (.1 newest). Called with
+ * the file closed; reopens are the caller's job (fopen "a" per write). */
+static void lmux_log_rotate_if_needed(size_t incoming) {
+    if (!g_log_file_path[0]) return;
+    if (g_log_max_bytes <= 0 || g_log_max_files <= 1) return;
+    struct stat st;
+    if (stat(g_log_file_path, &st) != 0) return;
+    if ((long)(st.st_size + (off_t)incoming) <= g_log_max_bytes) return;
+    /* Shift siblings down: drop .{max-1}, .{i-1} -> .{i}, main -> .1. */
+    char oldp[1024], newp[1024];
+    snprintf(oldp, sizeof oldp, "%s.%d", g_log_file_path, g_log_max_files - 1);
+    unlink(oldp);
+    for (int i = g_log_max_files - 1; i >= 2; i--) {
+        snprintf(oldp, sizeof oldp, "%s.%d", g_log_file_path, i - 1);
+        snprintf(newp, sizeof newp, "%s.%d", g_log_file_path, i);
+        rename(oldp, newp);
+    }
+    snprintf(newp, sizeof newp, "%s.1", g_log_file_path);
+    rename(g_log_file_path, newp);
+}
+
+/* Append one already-formatted line (with trailing '\n') to the log file,
+ * rotating first when the size cap would be exceeded. */
+static void lmux_log_to_file(const char *line) {
+    if (!g_log_file_path[0] || !line) return;
+    lmux_log_rotate_if_needed(strlen(line));
+    FILE *lf = fopen(g_log_file_path, "a");
+    if (lf) {
+        fputs(line, lf);
+        fclose(lf);
+    }
 }
 
 void lmux_log(lmux_log_level level, const char *fmt, ...) {
@@ -1009,36 +1183,36 @@ void lmux_log(lmux_log_level level, const char *fmt, ...) {
     static const char *names[] = {"DEBUG", "INFO ", "WARN ", "ERROR"};
     static const char *json_levels[] = {"debug", "info", "warn", "error"};
 
+    /* Format the message once; both sinks share it. */
+    char msg_buf[4096];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg_buf, sizeof msg_buf, fmt, ap);
+    va_end(ap);
+
+    time_t now = time(NULL);
+    struct tm tm_buf;
+    struct tm *tm = localtime_r(&now, &tm_buf);
+    char timestamp[32];
+    strftime(timestamp, sizeof timestamp, "%Y-%m-%dT%H:%M:%S", tm);
+
     if (log_json_enabled()) {
         /* JSON structured log: {"timestamp":"...","level":"...","message":"...","service":"lmux"} */
-        time_t now = time(NULL);
-        struct tm tm_buf;
-        struct tm *tm = localtime_r(&now, &tm_buf);
-        char timestamp[32];
-        strftime(timestamp, sizeof timestamp, "%Y-%m-%dT%H:%M:%S", tm);
-
-        /* Format the message into a buffer */
-        char msg_buf[4096];
-        va_list ap;
-        va_start(ap, fmt);
-        vsnprintf(msg_buf, sizeof msg_buf, fmt, ap);
-        va_end(ap);
-
-        /* Escape the message for JSON */
         char escaped[8192];
         log_json_escape(msg_buf, escaped, sizeof escaped);
 
-        fprintf(stderr,
+        char line[12288];
+        snprintf(line, sizeof line,
             "{\"timestamp\":\"%s\",\"level\":\"%s\",\"message\":\"%s\",\"service\":\"lmux\"}\n",
             timestamp, json_levels[level], escaped);
+        fputs(line, stderr);
+        lmux_log_to_file(line);
     } else {
         /* Legacy plain-text format */
-        fprintf(stderr, "[lmux %s] ", names[level]);
-        va_list ap;
-        va_start(ap, fmt);
-        vfprintf(stderr, fmt, ap);
-        va_end(ap);
-        fputc('\n', stderr);
+        char line[8192];
+        snprintf(line, sizeof line, "[lmux %s] %s\n", names[level], msg_buf);
+        fputs(line, stderr);
+        lmux_log_to_file(line);
     }
 }
 
@@ -1053,6 +1227,9 @@ void lmux_log(lmux_log_level level, const char *fmt, ...) {
 void lmux_log_request(const char *request_id, const char *cmd, bool ok, const char *detail) {
     if (g_log_level > LMUX_LOG_INFO) return;
 
+    /* Build the line once; stderr and the log file share it so `logs`
+     * and /api/logs can serve request history (ISS-0002). */
+    char line[2048];
     if (log_json_enabled()) {
         time_t now = time(NULL);
         struct tm tm_buf;
@@ -1064,21 +1241,24 @@ void lmux_log_request(const char *request_id, const char *cmd, bool ok, const ch
         log_json_escape(cmd ? cmd : "", cmd_escaped, sizeof cmd_escaped);
         log_json_escape(detail ? detail : "", detail_escaped, sizeof detail_escaped);
 
-        fprintf(stderr,
+        int n = snprintf(line, sizeof line,
             "{\"timestamp\":\"%s\",\"level\":\"info\",\"service\":\"lmux\","
             "\"trace_id\":\"%s\",\"cmd\":\"%s\",\"ok\":%s",
             timestamp, request_id ? request_id : "null", cmd_escaped,
             ok ? "true" : "false");
-        if (detail && detail[0]) {
-            fprintf(stderr, ",\"detail\":\"%s\"", detail_escaped);
+        if (detail && detail[0] && n > 0 && (size_t)n < sizeof line) {
+            snprintf(line + n, sizeof line - (size_t)n,
+                ",\"detail\":\"%s\"", detail_escaped);
         }
-        fprintf(stderr, "}\n");
+        strncat(line, "}\n", sizeof line - strlen(line) - 1);
     } else {
         /* Legacy format */
-        fprintf(stderr, "[lmux INFO ] %s: %s %s\n",
+        snprintf(line, sizeof line, "[lmux INFO ] %s: %s %s\n",
                 request_id ? request_id : "-", cmd ? cmd : "-",
                 ok ? "OK" : "FAIL");
     }
+    fputs(line, stderr);
+    lmux_log_to_file(line);
 }
 
 void lmux_app_quit(lmux_app *a, int code) {
@@ -2461,6 +2641,15 @@ static bool json_extract_string(const char *json, const char *key, char *out, si
     return true;
 }
 
+/* Extract a JSON integer value */
+static bool json_extract_int(const char *json, const char *key, int *out) {
+    const char *v = json_find_key(json, key);
+    if (!v) return false;
+    if (*v != '-' && (*v < '0' || *v > '9')) return false;
+    *out = (int)strtol(v, NULL, 10);
+    return true;
+}
+
 /* Extract a JSON boolean value */
 static bool json_extract_bool(const char *json, const char *key, bool *out) {
     const char *v = json_find_key(json, key);
@@ -3633,22 +3822,53 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
 
     /* --- snapshot.load [path] --- */
     if (strcmp(cmd, "snapshot.load") == 0) {
-        char path[1024] = {0};
-        json_extract_string(args_json, "path", path, sizeof path);
-        if (!path[0]) {
-            const char *home = getenv("HOME");
-            snprintf(path, sizeof path, "%s/.lmux_snapshot.json", home ? home : "/tmp");
-        }
-        /* Security: validate path to prevent traversal attacks */
-        if (!is_safe_path(path, NULL)) {
+        char req[1024] = {0};
+        char root[1024];
+        char resolved[2048];
+        char esc[2048];
+
+        /* ISS-0003: confine exactly like snapshot.save. The old
+         * is_safe_path(path, NULL) check rejected ".." but accepted any
+         * absolute path, so a socket client could make the daemon read
+         * arbitrary JSON files. Relative names resolve under the data
+         * root; absolute paths are accepted only when they resolve
+         * inside it (so the absolute path snapshot.save returns keeps
+         * working); the default matches the save default. */
+        lmux_data_root(root, sizeof root);
+
+        json_extract_string(args_json, "path", req, sizeof req);
+        if (!req[0]) {
+            snprintf(resolved, sizeof resolved, "%s/snapshot.json", root);
+        } else if (req[0] == '~') {
             written = snprintf(result, result_cap,
-                "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"path contains traversal sequences\"}}");
+                "{\"ok\":false,\"error\":{\"code\":\"invalid_params\","
+                "\"message\":\"snapshot path must be relative and inside %s\"}}",
+                root);
             goto done;
+        } else if (req[0] == '/') {
+            if (!path_inside_root(req, root)) {
+                written = snprintf(result, result_cap,
+                    "{\"ok\":false,\"error\":{\"code\":\"invalid_params\","
+                    "\"message\":\"snapshot path must be relative and inside %s\"}}",
+                    root);
+                goto done;
+            }
+            snprintf(resolved, sizeof resolved, "%s", req);
+        } else {
+            if (!is_safe_path(req, root)) {
+                written = snprintf(result, result_cap,
+                    "{\"ok\":false,\"error\":{\"code\":\"invalid_params\","
+                    "\"message\":\"snapshot path must be relative and inside %s\"}}",
+                    root);
+                goto done;
+            }
+            snprintf(resolved, sizeof resolved, "%s/%s", root, req);
         }
-        bool ok = lmux_snapshot_load(app, path);
+        bool ok = lmux_snapshot_load(app, resolved);
         if (ok) {
+            json_escape_str(esc, sizeof esc, resolved);
             written = snprintf(result, result_cap,
-                "{\"ok\":true,\"result\":{\"path\":\"%s\"}}", path);
+                "{\"ok\":true,\"result\":{\"path\":\"%s\"}}", esc);
         } else {
             written = snprintf(result, result_cap,
                 "{\"ok\":false,\"error\":{\"code\":\"load_failed\",\"message\":\"failed to load snapshot\"}}");
@@ -3981,6 +4201,134 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         goto done;
     }
 
+    /* --- logs --- Show recent logs with optional follow via SSE. */
+    if (strcmp(cmd, "logs") == 0) {
+        /* Optional level filter: debug|info|warn|error (case-insensitive).
+         * Unknown/absent values return everything. */
+        char level_arg[32] = {0};
+        json_extract_string(args_json, "level", level_arg, sizeof level_arg);
+        for (char *c = level_arg; *c; c++) *c = (char)tolower((unsigned char)*c);
+        int min_level = -1;
+        if (strcmp(level_arg, "debug") == 0) min_level = 0;
+        else if (strcmp(level_arg, "info") == 0) min_level = 1;
+        else if (strcmp(level_arg, "warn") == 0 || strcmp(level_arg, "warning") == 0) min_level = 2;
+        else if (strcmp(level_arg, "error") == 0) min_level = 3;
+
+        /* ISS-0007: honor the "limit" arg the CLI already sends
+         * (default 200 preserves the old shape, clamp to 1000). */
+        int log_limit = 200;
+        json_extract_int(args_json, "limit", &log_limit);
+        if (log_limit <= 0) log_limit = 200;
+        if (log_limit > 1000) log_limit = 1000;
+
+        /* Read log lines from the configured log file, or from the global log file path */
+        char *log_file = app->config->log_file;
+        int count = 0;
+        int start = 0; /* ring-buffer head: oldest kept line */
+        char line_buf[4096];
+        char **lines = malloc(sizeof(char *) * (size_t)log_limit);
+        if (!lines) {
+            free(result);
+            return strdup("{\"ok\":false,\"error\":{\"code\":\"oom\",\"message\":\"out of memory\"}}");
+        }
+
+        /* If no log file configured in config, try the global log file path */
+        if (!log_file[0]) {
+            log_file = g_log_file_path;
+        }
+
+        if (log_file[0]) {
+            /* Read from log file */
+            FILE *lf = fopen(log_file, "r");
+            if (lf) {
+                /* Read lines from the log file, keeping only the newest
+                 * log_limit (ring buffer) — the old code returned the
+                 * oldest 200. Bounded: at most log_limit lines held. */
+                while (fgets(line_buf, sizeof(line_buf), lf) != NULL) {
+                    /* Strip trailing newline */
+                    size_t len = strlen(line_buf);
+                    if (len > 0 && line_buf[len - 1] == '\n') {
+                        line_buf[len - 1] = '\0';
+                        len--;
+                    }
+                    /* Skip empty lines */
+                    if (len == 0) {
+                        continue;
+                    }
+                    /* Apply the level filter (ISS-0002); lines whose
+                     * level cannot be determined are kept. */
+                    if (min_level >= 0) {
+                        int lvl = log_line_level(line_buf);
+                        if (lvl >= 0 && lvl < min_level) {
+                            continue;
+                        }
+                    }
+                    /* Store the line (tail: evict oldest when full) */
+                    char *dup = strdup(line_buf);
+                    if (!dup) break;
+                    if (count < log_limit) {
+                        lines[count++] = dup;
+                    } else {
+                        free(lines[start]);
+                        lines[start] = dup;
+                        start = (start + 1) % log_limit;
+                    }
+                }
+                fclose(lf);
+            }
+        }
+
+        /* Build JSON response with lines (proper JSON strings, escaped). */
+        written = snprintf(result, result_cap,
+            "{\"ok\":true,\"result\":{\"lines\":[");
+        /* ISS-0010: grow the heap result buffer up front to the worst
+         * case (each escaped line can approach 8KB plus quote/comma
+         * bytes; +64 covers the trailing "]", sse_endpoint and "}}")
+         * BEFORE emitting. Growing mid-loop while freeing each emitted
+         * line meant a realloc failure at iteration k>=1 re-freed
+         * slots already freed for j<k (double-free on the OOM path).
+         * count<=1000 so the bound is ~8MB max — no size_t overflow
+         * at these magnitudes. No lines are freed yet here, so the
+         * OOM cleanup below cannot double-free. */
+        {
+            size_t need = (size_t)written + (size_t)count * (8192 + 4) + 64;
+            if (need > result_cap) {
+                char *_grow = realloc(result, need);
+                if (!_grow) {
+                    for (int f = 0; f < count; f++) free(lines[f]);
+                    free(lines);
+                    free(result);
+                    return strdup("{\"ok\":false,\"error\":{\"code\":\"oom\",\"message\":\"out of memory\"}}");
+                }
+                result = _grow;
+                result_cap = need;
+            }
+        }
+        for (int k = 0; k < count; k++) {
+            if (k > 0) written += snprintf(result + written, result_cap - written, ",");
+            /* Escape the line for JSON */
+            char escaped[8192] = {0};
+            int idx = (start + k) % log_limit;
+            log_json_escape(lines[idx], escaped, sizeof(escaped));
+            written += snprintf(result + written, result_cap - written,
+                "\"%s\"", escaped);
+            free(lines[idx]);
+        }
+        free(lines);
+        written += snprintf(result + written, result_cap - written, "]");
+        /* ISS-0006: advertise the SSE stream when the caller asked to
+         * follow — the CLI only streams (sse_stream_logs) while this
+         * endpoint is present in the response. */
+        bool follow = false;
+        json_extract_bool(args_json, "follow", &follow);
+        if (follow) {
+            RESULT_GROW;
+            written += snprintf(result + written, result_cap - written,
+                ",\"sse_endpoint\":\"/api/logs/stream\"");
+        }
+        written += snprintf(result + written, result_cap - written, "}}");
+        goto done;
+    }
 
     /* --- clear-history --- */
     if (strcmp(cmd, "clear-history") == 0 || strcmp(cmd, "clear_history") == 0) {
@@ -4348,7 +4696,8 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                 "\"auto_save_session\":%s,\"auto_save_interval_sec\":%d,"
                 "\"default_shell\":\"%s\","
                 "\"agent_claude_code\":\"%s\",\"agent_opencode\":\"%s\","
-                "\"agent_codex\":\"%s\",\"agent_aider\":\"%s\",\"agent_goose\":\"%s\"}}",
+                "\"agent_codex\":\"%s\",\"agent_aider\":\"%s\",\"agent_goose\":\"%s\","
+                "\"log_file\":\"%s\"}}",
                 app->config->font_family, app->config->font_size,
                 app->config->theme, app->config->scrollback_lines,
                 app->config->show_sidebar ? "true" : "false",
@@ -4358,7 +4707,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                 app->config->default_shell,
                 app->config->agent_paths[0], app->config->agent_paths[1],
                 app->config->agent_paths[2], app->config->agent_paths[3],
-                app->config->agent_paths[4]);
+                app->config->agent_paths[4], app->config->log_file);
         } else {
             /* Return single key value */
             char val[1024] = {0};
@@ -4370,7 +4719,8 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             else if (strcmp(key, "auto_save_session") == 0) snprintf(val, sizeof val, "%s", app->config->auto_save_session ? "true" : "false");
             else if (strcmp(key, "auto_save_interval_sec") == 0) snprintf(val, sizeof val, "%d", app->config->auto_save_interval_sec);
             else if (strcmp(key, "default_shell") == 0) snprintf(val, sizeof val, "\"%s\"", app->config->default_shell);
-            else snprintf(val, sizeof val, "null");
+            else if (strcmp(key, "log_file") == 0) snprintf(val, sizeof val, "\"%s\"", app->config->log_file);
+        else snprintf(val, sizeof val, "null");
             written = snprintf(result, result_cap,
                 "{\"ok\":true,\"result\":{\"key\":\"%s\",\"value\":%s}}", key, val);
         }
@@ -4413,6 +4763,10 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         else if (strcmp(key, "agent_codex") == 0) snprintf(app->config->agent_paths[2], 512, "%s", value);
         else if (strcmp(key, "agent_aider") == 0) snprintf(app->config->agent_paths[3], 512, "%s", value);
         else if (strcmp(key, "agent_goose") == 0) snprintf(app->config->agent_paths[4], 512, "%s", value);
+        else if (strcmp(key, "log_file") == 0) {
+            snprintf(app->config->log_file, sizeof app->config->log_file, "%s", value);
+            lmux_log_set_file(app->config->log_file);
+        }
         else {
             /* #6: unknown keys used to fall through and still report
              * {"ok":true}, so typos silently discarded the value while
@@ -8056,6 +8410,16 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         cmd);
 
 done:
+    /* ISS-0002: record every dispatched request in the log stream so
+     * `logs` and /api/logs serve real history. lmux_log_request
+     * previously had no callers, so the log file stayed empty. The
+     * `logs` query itself is excluded: logging it would append a line
+     * between the read and the response, so back-to-back identical
+     * queries would never agree. */
+    if (!cmd || strcmp(cmd, "logs") != 0) {
+        lmux_log_request(NULL, cmd ? cmd : "",
+            result && strstr(result, "\"ok\":true") != NULL, NULL);
+    }
     return result;
 }
 
@@ -9056,3 +9420,10 @@ void lmux_focus_history_clear(struct lmux_focus_history *h) {
     if (!h) return;
     memset(h, 0, sizeof(*h));
 }
+
+
+const char *lmux_app_get_log_file(const lmux_app *app) {
+    if (!app || !app->config) return "";
+    return app->config->log_file;
+}
+

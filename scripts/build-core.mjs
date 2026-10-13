@@ -42,6 +42,7 @@ const CFLAGS = [
 
 const sources = [
     join(ROOT, "src", "core", "model.c"),
+    join(ROOT, "src", "core", "http_server.c"),
     join(ROOT, "src", "core", "osc.c"),
     join(ROOT, "src", "core", "server.c"),
     join(ROOT, "src", "core", "config.c"),
