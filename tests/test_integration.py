@@ -1058,6 +1058,71 @@ class TestHttpSlotRelease(unittest.TestCase):
             f"all 40 sequential connections must succeed, got {served}")
 
 
+class TestDaemonSigterm(unittest.TestCase):
+    """ISS-0012: the daemon must exit gracefully on SIGTERM.
+
+    The daemon used to need ``kill -9`` in cleanup: the SIGTERM/SIGINT
+    handler set the exit flag, but shutdown wedged joining the HTTP
+    accept thread (``close()`` does not wake a thread blocked in
+    ``accept()``), so SIGTERM never took effect. Fixed: the accept loop
+    is woken via ``shutdown()`` and workers are drained, so the daemon
+    exits 0 within seconds — no SIGKILL needed."""
+
+    def test_sigterm_exits_zero_without_sigkill(self):
+        repo = Path(__file__).parent.parent
+        cli = repo / "build" / "lmux"
+        self.assertTrue(cli.exists(), "build/lmux must exist (run make build)")
+        home = Path(tempfile.mkdtemp(prefix="lmux-term-home-"))
+        (home / ".local" / "share" / "lmux").mkdir(parents=True, exist_ok=True)
+        (home / ".config").mkdir(parents=True, exist_ok=True)
+        env = dict(os.environ)
+        env["HOME"] = str(home)
+        env["XDG_DATA_HOME"] = str(home / ".local" / "share")
+        env["XDG_CONFIG_HOME"] = str(home / ".config")
+        sock = f"/tmp/lmux-term-{os.getpid()}.sock"
+        Path(sock).unlink(missing_ok=True)
+        proc = subprocess.Popen(
+            [str(cli), "--socket", sock, "daemon"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=env,
+        )
+        try:
+            # Wait until the daemon answers ping (it restores the
+            # snapshot before listening, so the socket alone is not
+            # enough to call it ready).
+            ready = False
+            deadline = time.time() + 60
+            while time.time() < deadline:
+                if proc.poll() is not None:
+                    self.fail(
+                        f"daemon exited early with {proc.returncode}")
+                try:
+                    probe = LmuxClient(sock, timeout=5.0)
+                    if probe.send("ping", {}).get("ok"):
+                        ready = True
+                        break
+                except Exception:  # noqa: BLE001 - not ready yet
+                    pass
+                time.sleep(0.2)
+            self.assertTrue(ready, "daemon did not become ready in 60s")
+            proc.send_signal(signal.SIGTERM)
+            try:
+                rc = proc.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+                self.fail("daemon ignored SIGTERM (SIGKILL was needed)")
+            self.assertEqual(
+                rc, 0, f"daemon must exit 0 on SIGTERM, got {rc}")
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            Path(sock).unlink(missing_ok=True)
+            shutil.rmtree(home, ignore_errors=True)
+
+
 class TestSseSigintStopFlag(unittest.TestCase):
     """ISS-0008 RC4: ``sse_stream_logs`` installed ``SIG_IGN`` for SIGINT
     while polling only the socket, so Ctrl+C could never stop the stream.
