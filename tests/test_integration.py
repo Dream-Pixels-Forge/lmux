@@ -6328,6 +6328,58 @@ class TestHarnessPtydTeardown(unittest.TestCase):
                          f"daemon survived its teardown as pid(s) {survivors} — #37 regressed")
 
 
+# ====================================================================
+# Release version parity — every version site must agree (no daemon).
+# ====================================================================
+class TestVersionParity(unittest.TestCase):
+    """All six version sites must report the same release version.
+
+    package.json is canonical for packaging; the C header, the GUI
+    companion/updater, the web /api/ping literal and the flatpak
+    metainfo release each duplicated it by hand, and past bumps left
+    them disagreeing (1.1.2 vs 1.0.0). Pure file reads — no daemon,
+    no Gtk import (companion.py hard-requires Gtk at import).
+    """
+
+    def test_all_version_sites_agree(self):
+        root = Path(__file__).parent.parent
+        sites = {}
+
+        pkg = json.loads((root / "package.json").read_text())
+        sites["package.json"] = pkg["version"]
+
+        m = re.search(r'#define\s+LMUX_VERSION\s+"([^"]+)"',
+                      (root / "include" / "lmux.h").read_text())
+        self.assertIsNotNone(m, "include/lmux.h should define LMUX_VERSION")
+        sites["include/lmux.h"] = m.group(1)
+
+        m = re.search(r'^LMUX_VERSION\s*=\s*"([^"]+)"',
+                      (root / "gui" / "companion.py").read_text(), re.MULTILINE)
+        self.assertIsNotNone(m, "gui/companion.py should set LMUX_VERSION")
+        sites["gui/companion.py"] = m.group(1)
+
+        m = re.search(r'^CURRENT_VERSION[^"]*"([^"]+)"',
+                      (root / "gui" / "updater.py").read_text(), re.MULTILINE)
+        self.assertIsNotNone(m, "gui/updater.py should set CURRENT_VERSION")
+        sites["gui/updater.py"] = m.group(1)
+
+        m = re.search(r'"/api/ping".*?"version":\s*"([^"]+)"',
+                      (root / "web" / "server.py").read_text(), re.DOTALL)
+        self.assertIsNotNone(m, "web/server.py /api/ping should carry a version")
+        sites["web/server.py /api/ping"] = m.group(1)
+
+        m = re.search(r'<release\s+version="([^"]+)"',
+                      (root / "packaging" / "io.github.lmux.lmux.yml").read_text())
+        self.assertIsNotNone(m, "flatpak manifest should declare a release version")
+        sites["flatpak metainfo"] = m.group(1)
+
+        distinct = set(sites.values())
+        self.assertEqual(
+            len(distinct), 1,
+            "version sites disagree:\n" + "\n".join(
+                f"  {name}: {ver}" for name, ver in sites.items()))
+
+
 if __name__ == "__main__":
     # Clean up leftover test sockets — only the dead ones (#38): never
     # unlink a socket that still answers, it may belong to a live runner.

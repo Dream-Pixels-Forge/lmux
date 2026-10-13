@@ -1,7 +1,7 @@
 # lmux Implementation Plan — Close the cmux Gap
 
 > **Date:** 2026-06-20
-> **Baseline:** lmux v1.0.0 — 81 tests passing, all performance optimizations applied
+> **Baseline:** lmux v1.2.0 — 81 tests passing, all performance optimizations applied
 > **Target:** Feature parity with cmux where Linux-appropriate
 > **Constraint:** C17 core + Python GTK3 GUI, no new dependencies beyond what's installed
 
@@ -126,7 +126,7 @@ Check for updates and notify user, like cmux's Sparkle updater.
 - **Backend:** Check GitHub releases API for latest version
 - **Flow:**
   1. On startup, check `https://api.github.com/repos/<owner>/lmux/releases/latest`
-  2. Compare version with current (`1.0.0` from `lmux.h`)
+  2. Compare version with current (`1.2.0` from `lmux.h`)
   3. If newer: show notification bar with "Update available" + link
   4. User clicks → opens browser to releases page
 - **Alternative:** If published to apt, check `apt list --upgradable lmux`

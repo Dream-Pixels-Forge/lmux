@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-10-13
+
 ### Changed
 
 - Session snapshot default moved to the data directory
@@ -15,6 +17,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   confine paths to that directory. The legacy default
   `~/.lmux_snapshot.json` is no longer loaded — move it once to the new
   location (see "Session snapshots" in the README).
+
+### Fixed
+
+- Harness PTY descriptor reap on teardown (#40).
+- Shutdown race, SIGTERM handling, `/api/logs` limit + tail parameters
+  (#43).
+- SSH host keys accept-new policy, `sshpass -e` password handling (#45).
+
+### Security
+
+- SSE streaming with log rotation, fail-closed updater, snapshot
+  directory confinement (#42).
+- Web gates: XSS escaping, path-traversal confinement, token
+  authentication; dropped wildcard CORS (#44).
+- Updater trust chain, `log_file` confinement, extension type-on-first-use
+  verification, `shell=False` subprocess hardening (#46).
+- Companion least-privilege allowlist, auth honesty, TOCTOU/shlex/SSE
+  hardening, test hardening (#47).
+
+### CI
+
+- Integration test suite runs on every PR (#41).
+
+### Known limitations
+
+- Auto-update stays inactive until the release-signing key ships.
+- Daemon HTTP is fixed at `:8080` (the dashboard accepts `--port`).
+- RPM packaging is unsupported.
+- Headless installs still pull GUI dependencies.
 
 ## [0.1.0] - 2026-06-20
 
@@ -44,5 +75,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - C17 unit tests for model, config, and OSC modules
 - Node.js build scripts for core library, CLI binary, watch mode, and test runner
 
-[unreleased]: https://github.com/Dream-Pixels-Forge/lmux/compare/v0.1.0...HEAD
+[unreleased]: https://github.com/Dream-Pixels-Forge/lmux/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/Dream-Pixels-Forge/lmux/releases/tag/v1.2.0
 [0.1.0]: https://github.com/Dream-Pixels-Forge/lmux/releases/tag/v0.1.0

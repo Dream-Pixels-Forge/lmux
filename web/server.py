@@ -67,7 +67,7 @@ class LmuxAPIHandler(http.server.SimpleHTTPRequestHandler):
         elif path == "/api/notifications":
             self._json_response(self._api_notifications())
         elif path == "/api/ping":
-            self._json_response({"ok": True, "version": "1.0.0"})
+            self._json_response({"ok": True, "version": "1.2.0"})
         elif path == "/" or path == "/index.html":
             self._serve_index()
         elif path.endswith(".css"):

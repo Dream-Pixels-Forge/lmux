@@ -16,7 +16,7 @@
 - **GUI:** Python GTK3/VTE
 - **Build System:** Node.js scripts (ESM modules)
 - **License:** MIT
-- **Version:** 1.0.0
+- **Version:** 1.2.0
 
 ---
 

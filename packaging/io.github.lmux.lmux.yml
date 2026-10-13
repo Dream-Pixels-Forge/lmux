@@ -155,7 +155,7 @@ modules:
           <url type="homepage">https://github.com/Dream-Pixels-Forge/lmux</url>
           <url type="bugtracker">https://github.com/Dream-Pixels-Forge/lmux/issues</url>
           <releases>
-            <release version="1.1.2" date="2026-10-04"/>
+            <release version="1.2.0" date="2026-10-13"/>
           </releases>
           <content_rating type="oars-1.1"/>
           <!-- The flatpak path installs io.github.lmux.lmux.desktop (see the
