@@ -411,12 +411,54 @@ done:
         g_http_server->running = false;
 
         if (g_http_server->listen_fd >= 0) {
+            /* ISS-0011/ISS-0012: shutdown() first — close() alone does
+             * not wake a thread blocked in accept(), so the join below
+             * would hang forever (daemon ignores SIGTERM). shutdown()
+             * forces the pending accept() to fail so the loop sees
+             * running == false and exits. */
+            shutdown(g_http_server->listen_fd, SHUT_RDWR);
             close(g_http_server->listen_fd);
             g_http_server->listen_fd = -1;
         }
 
         pthread_join(g_http_server->thread_id, NULL);
 
+        /* ISS-0011: wake workers WITHOUT closing their fds. Each
+         * worker owns close() of its fd at its `done:` label; closing
+         * here as well double-closes the fd number (which the kernel
+         * may already have recycled for another thread). shutdown()
+         * only unblocks the worker's read()/poll() — the fd number
+         * stays valid until the worker itself closes it. */
+        pthread_mutex_lock(&g_http_server->clients_lock);
+        for (int i = 0; i < HTTP_MAX_CLIENTS; i++) {
+            if (g_http_server->client_fds[i] >= 0) {
+                shutdown(g_http_server->client_fds[i], SHUT_RDWR);
+            }
+        }
+        pthread_mutex_unlock(&g_http_server->clients_lock);
+
+        /* Wait (bounded) for every worker to close its fd and release
+         * its slot. Only after all slots are clear is it safe to free
+         * the server: workers touch server->clients_lock on their way
+         * out, so freeing earlier is a use-after-free. */
+        for (int waited = 0; waited < 500; waited++) {
+            int busy = 0;
+            pthread_mutex_lock(&g_http_server->clients_lock);
+            for (int i = 0; i < HTTP_MAX_CLIENTS; i++) {
+                if (g_http_server->client_fds[i] >= 0) {
+                    busy = 1;
+                    break;
+                }
+            }
+            pthread_mutex_unlock(&g_http_server->clients_lock);
+            if (!busy) break;
+            struct timespec ts = {0, 10 * 1000 * 1000L};
+            nanosleep(&ts, NULL);
+        }
+
+        /* Stragglers that ignored shutdown (should be none): close
+         * here now that no new workers can appear (accept thread is
+         * joined) and remaining ones are being torn down anyway. */
         pthread_mutex_lock(&g_http_server->clients_lock);
         for (int i = 0; i < HTTP_MAX_CLIENTS; i++) {
             if (g_http_server->client_fds[i] >= 0) {
