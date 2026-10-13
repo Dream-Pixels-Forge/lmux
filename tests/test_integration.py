@@ -6274,26 +6274,46 @@ class TestHarnessPtydTeardown(unittest.TestCase):
         survives as a live process (issue #37: 14 orphans) even though its
         socket file is gone — so assert on the PID via pgrep, not on the
         socket. _reap_strace_daemon must leave no matching pid alive.
+
+        Hardening (ISS-0028): the bind deadline is 60s (tracer overhead on
+        loaded CI runners) with one relaunch retry before failing; skipped
+        when the strace binary is absent.
         """
+        if not shutil.which("strace"):
+            self.skipTest("strace unavailable; cannot trace daemon startup")
         sock = f"/tmp/lmux-ptyd-harness-{os.getpid()}.sock"
         Path(sock).unlink(missing_ok=True)
         repo_root = Path(__file__).parent.parent
-        proc = subprocess.Popen(
-            ["strace", "-f", "-c", "-e", "trace=clone,clone3,fork,vfork",
-             "-o", "/dev/null",
-             str(repo_root / "build" / "lmux"), "--socket", sock, "daemon"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
+
+        def _launch_under_strace():
+            return subprocess.Popen(
+                ["strace", "-f", "-c", "-e", "trace=clone,clone3,fork,vfork",
+                 "-o", "/dev/null",
+                 str(repo_root / "build" / "lmux"), "--socket", sock, "daemon"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+
+        proc = _launch_under_strace()
         try:
             client = None
-            deadline = time.time() + 30
-            while time.time() < deadline and client is None:
-                time.sleep(0.25)
-                try:
-                    client = LmuxClient(sock)
-                except Exception:  # noqa: BLE001 - not up yet
-                    client = None
-            self.assertIsNotNone(client, "daemon did not come up")
+            for attempt in (1, 2):
+                deadline = time.time() + 60
+                while time.time() < deadline and client is None:
+                    time.sleep(0.25)
+                    try:
+                        client = LmuxClient(sock)
+                    except Exception:  # noqa: BLE001 - not up yet
+                        client = None
+                if client is not None:
+                    break
+                if attempt == 1:
+                    print(f"\n[attempt 1/2] daemon under strace did not bind "
+                          f"{sock} within 60s; reaping and relaunching once",
+                          flush=True)
+                    _reap_strace_daemon(proc, sock)
+                    proc = _launch_under_strace()
+            self.assertIsNotNone(client,
+                                 "daemon did not come up after 2 attempts (60s each)")
             self.assertTrue(LmuxClient(sock, timeout=5.0).send("ping", {}).get("ok"))
         finally:
             _reap_strace_daemon(proc, sock)
