@@ -11,6 +11,14 @@
  *   OSC 99 ; <meta> ; <text> ST    - meta is a comma-separated list;
  *                                   'i' = waiting-for-input
  *   OSC 777 ; notify ; <text> ST   - rxvt-style notify
+ *   OSC 133 ; A|B|C|D<code> ST     - shell-integration command markers
+ *                                   (ISS-0037): A = prompt start, B =
+ *                                   prompt end / command start, C =
+ *                                   command end, D = exit code
+ *                                   (tmux oracle: input.c:3063+). The
+ *                                   body carries the marker; callers
+ *                                   feeding pty output detect it by the
+ *                                   133-class completion flag.
  *
  * String-terminator (ST) is recognized as either ESC \ (the standard
  * 7-bit form) or BEL (0x07) for compatibility with iTerm2 / many
@@ -40,11 +48,24 @@ struct lmux_osc_parser {
     char  buf[2048];
     size_t len;
     bool  waiting;
+    bool  last_was_osc133_valid; /* set while the most recently completed
+                                   * sequence was an OSC 133 shell-integration
+                                   * marker (ISS-0037). It is set when the ps
+                                   * is recognized, preserved through the
+                                   * completion reset, and cleared when a new
+                                   * sequence starts ("]" after ESC) or when a
+                                   * non-133 ps is recognized. */
     /* The 'body' is what we emit on completion. We separate the
      * OSC 99 'meta' portion (semicolon-delimited) from the text. */
     char  meta[256];
     size_t meta_len;
     size_t text_off;  /* index in buf where the text portion starts */
+
+    /* OSC 133 completion queue (ISS-0037). The parser may complete
+     * multiple sequences in a single feed call; the caller drains
+     * this queue via lmux_osc_parser_pop_133(). */
+    char   osc133_queue[8][32];
+    size_t osc133_qhead, osc133_qtail;
 };
 
 lmux_osc_parser *lmux_osc_parser_new(void) {
@@ -56,6 +77,21 @@ void lmux_osc_parser_free(lmux_osc_parser *p) {
     free(p);
 }
 
+bool lmux_osc_parser_last_was_osc133(lmux_osc_parser *p) {
+    return p && p->last_was_osc133_valid;
+}
+
+/* Pop the next completed OSC 133 marker from the parser's queue.
+ * Returns true if a marker was popped into `out_marker` (caller must
+ * provide a buffer of at least 32 bytes). Returns false if queue empty. */
+bool lmux_osc_parser_pop_133(lmux_osc_parser *p, char *out_marker) {
+    if (!p || p->osc133_qhead == p->osc133_qtail) return false;
+    strncpy(out_marker, p->osc133_queue[p->osc133_qtail], 31);
+    out_marker[31] = 0;
+    p->osc133_qtail = (p->osc133_qtail + 1) % 8;
+    return true;
+}
+
 /* Reset parser state for next sequence. Does NOT touch the state
  * field so callers can set state before/after calling this. */
 static void osc_reset(lmux_osc_parser *p) {
@@ -63,6 +99,7 @@ static void osc_reset(lmux_osc_parser *p) {
     p->meta_len  = 0;
     p->text_off  = 0;
     p->waiting   = false;
+    p->last_was_osc133_valid = false;
 }
 
 static void osc_finish(lmux_osc_parser *p, const char **out_text,
@@ -81,12 +118,17 @@ static void osc_finish(lmux_osc_parser *p, const char **out_text,
             }
         }
     }
-    /* If text_off is 0 there was no meta separator; treat whole buf
-     * as text. */
+    /*
+     * If text_off is 0 the ps separator (';') was consumed without
+     * accumulating body bytes at an offset — the whole buffer is the
+     * text (OSC 9/133 style). Otherwise the buffer layout is
+     * [meta ';' body...]: NUL-terminate just past the separator so
+     * the body starts at buf[text_off]. */
     if (p->text_off == 0) {
         *out_text   = p->buf;
         *out_waiting = p->waiting;
     } else {
+        p->buf[p->text_off] = 0;
         *out_text   = p->buf + p->text_off;
         *out_waiting = p->waiting;
     }
@@ -96,6 +138,7 @@ bool lmux_osc_parser_feed(lmux_osc_parser *p, const char *bytes, size_t n,
                           const char **out_text, bool *out_waiting) {
     *out_text    = NULL;
     *out_waiting = false;
+    bool any_completed = false;
 
     for (size_t i = 0; i < n; i++) {
         unsigned char c = (unsigned char)bytes[i];
@@ -115,15 +158,39 @@ bool lmux_osc_parser_feed(lmux_osc_parser *p, const char *bytes, size_t n,
             break;
 
         case OSC_OSC:
-            /* OSC <ps> ; - ps is the sequence selector. We only care
-             * about 9, 99, 777. Anything else is dropped. */
+            /* OSC <ps> ; - ps is the sequence selector. We care about
+             * 9, 99, 777 (notifications) and 133 (shell-integration
+             * command markers, ISS-0037; payload A|B|C|D<code> is the
+             * body text). Anything else is dropped.
+             *
+             * SUS (0x1A) terminates the entire sequence here — tmux
+             * treats it as a string terminator like BEL. The pty
+             * translates it to BEL, but if it arrives raw (or the shell
+             * emits SUS directly), it must not be accumulated into the
+             * ps digits: that would produce a garbage ps that silently
+             * drops the marker without flagging it as 133. */
             if (c == ';' || c == 0x07 || c == 0x1B) {
                 /* Determine which ps we have. */
                 int ps = atoi(p->buf);
-                if (ps == 9 || ps == 99 || ps == 777) {
+                if (ps == 9 || ps == 99 || ps == 777 || ps == 133) {
+                    /* Record whether this sequence is an OSC 133
+                     * shell-integration marker (ISS-0037) so a caller
+                     * feeding pty output can distinguish 133 completions
+                     * from 9/99/777 notifications. The flag is set at the
+                     * ps-recognition boundary and preserved through the
+                     * completion; a non-133 ps or a new sequence start
+                     * clears it. */
+                    p->last_was_osc133_valid = (ps == 133);
                     /* Clear ps digits from buffer before entering body */
                     p->len = 0;
                     if (c == ';') {
+                        /* ';' separates the ps selector from the body;
+                         * the ps digits (already consumed) are discarded
+                         * so the body is collected starting at buf[0].
+                         * With text_off == 0, osc_finish() emits the
+                         * whole body (OSC 9/99/777 text, or an OSC 133
+                         * marker such as "B", "D0"). */
+                        p->len      = 0;
                         p->text_off = 0;
                         p->state    = OSC_BODY;
                     } else if (c == 0x07) {
@@ -132,7 +199,17 @@ bool lmux_osc_parser_feed(lmux_osc_parser *p, const char *bytes, size_t n,
                         *out_text = p->buf;
                         *out_waiting = false;
                         osc_reset(p);
-                        return true;
+                        p->state = OSC_GROUND;
+                        p->last_was_osc133_valid = (ps == 133);
+                        any_completed = true;
+                        if (ps == 133) {
+                            size_t next = (p->osc133_qhead + 1) % 8;
+                            if (next != p->osc133_qtail) {
+                                p->osc133_queue[p->osc133_qhead][0] = 0;
+                                p->osc133_qhead = next;
+                            }
+                        }
+                        /* Continue processing remaining bytes in buffer. */
                     } else {
                         /* ESC - expect \ as ST */
                         p->state = OSC_ST_ESC;
@@ -151,10 +228,44 @@ bool lmux_osc_parser_feed(lmux_osc_parser *p, const char *bytes, size_t n,
         case OSC_BODY:
             if (c == 0x07) {
                 osc_finish(p, out_text, out_waiting);
+                bool was_133 = p->last_was_osc133_valid;
                 osc_reset(p);
-                return true;
+                /* osc_reset() returns the parser to a fresh-sequence state
+                 * (and to the ground state so the ESC ] of the next
+                 * sequence is read as a start, not as body content);
+                 * restore the 133 flag so the completion is still
+                 * distinguishable on the caller's poll. */
+                p->last_was_osc133_valid = was_133;
+                p->state = OSC_GROUND;
+                any_completed = true;
+                if (was_133 && *out_text) {
+                    size_t next = (p->osc133_qhead + 1) % 8;
+                    if (next != p->osc133_qtail) {
+                        snprintf(p->osc133_queue[p->osc133_qhead], 32, "%s", *out_text);
+                        p->osc133_qhead = next;
+                    }
+                }
+                /* Continue processing remaining bytes in buffer. */
             } else if (c == 0x1B) {
                 p->state = OSC_ST_ESC;
+            } else if (c == 0x1A) {
+                /* SUS (ASCII SUB, 0x1A) — some terminals use this to
+                 * terminate OSC strings in lieu of ST (ESC \). Treat
+                 * it exactly like BEL: emit the completion. */
+                osc_finish(p, out_text, out_waiting);
+                bool was_133 = p->last_was_osc133_valid;
+                osc_reset(p);
+                p->last_was_osc133_valid = was_133;
+                p->state = OSC_GROUND;
+                any_completed = true;
+                if (was_133 && *out_text) {
+                    size_t next = (p->osc133_qhead + 1) % 8;
+                    if (next != p->osc133_qtail) {
+                        snprintf(p->osc133_queue[p->osc133_qhead], 32, "%s", *out_text);
+                        p->osc133_qhead = next;
+                    }
+                }
+                /* Continue processing remaining bytes in buffer. */
             } else if (c == ';' && p->text_off == 0) {
                 /* OSC 99 separator between meta and text. Move what
                  * we have so far into the meta buffer. */
@@ -173,8 +284,19 @@ bool lmux_osc_parser_feed(lmux_osc_parser *p, const char *bytes, size_t n,
         case OSC_ST_ESC:
             if (c == '\\') {
                 osc_finish(p, out_text, out_waiting);
+                bool was_133 = p->last_was_osc133_valid;
                 osc_reset(p);
-                return true;
+                p->last_was_osc133_valid = was_133;
+                p->state = OSC_GROUND;
+                any_completed = true;
+                if (was_133 && *out_text) {
+                    size_t next = (p->osc133_qhead + 1) % 8;
+                    if (next != p->osc133_qtail) {
+                        snprintf(p->osc133_queue[p->osc133_qhead], 32, "%s", *out_text);
+                        p->osc133_qhead = next;
+                    }
+                }
+                /* Continue processing remaining bytes in buffer. */
             } else {
                 /* Not a valid ST; treat as content. */
                 p->state = OSC_BODY;
@@ -189,5 +311,5 @@ bool lmux_osc_parser_feed(lmux_osc_parser *p, const char *bytes, size_t n,
             break;
         }
     }
-    return false;
+    return any_completed;
 }

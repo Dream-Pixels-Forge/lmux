@@ -101,6 +101,13 @@ typedef struct {
     lmux_id id;                /* pane id                               */
     char    kind[16];          /* "terminal" | "browser"                */
     bool    focused;           /* true if focused within its surface    */
+    /* OSC 133 shell-integration command telemetry (ISS-0037).
+     * Additive: pre-existing consumers (memset + first 3 fields) are
+     * unaffected. All zero/false when no markers have been parsed. */
+    bool    command_running;           /* B seen, C/D not yet           */
+    int     last_command_exit;         /* D<code>; 0 default            */
+    long    last_command_duration_ms;  /* C - B on monotonic clock      */
+    long    last_command_started;      /* B, epoch ms                   */
 } lmux_pane_info;
 
 /* ------------------------------------------------------------------ */
@@ -377,11 +384,24 @@ typedef struct lmux_osc_parser lmux_osc_parser;
 lmux_osc_parser *lmux_osc_parser_new(void);
 void             lmux_osc_parser_free(lmux_osc_parser *p);
 
-/* Feed bytes. When a complete OSC 9 / 99 / 777 sequence is parsed,
+/* Feed bytes. When a complete OSC 9 / 99 / 777 / 133 sequence is parsed,
  * *out_text is filled with the body (caller owns the buffer's lifetime
- * until the next feed call) and the function returns true. */
+ * until the next feed call) and the function returns true. OSC 133
+ * shell-integration markers (ISS-0037) complete with the marker payload
+ * (A / B / C / D<code>) as the body. */
 bool lmux_osc_parser_feed(lmux_osc_parser *p, const char *bytes, size_t n,
                           const char **out_text, bool *out_waiting);
+
+/* True when the last sequence completed by lmux_osc_parser_feed() was an
+ * OSC 133 shell-integration marker (ISS-0037); *out_text then carries the
+ * marker payload (A / B / C / D<code>). Valid until the next feed call.
+ * OSC 133 has no waiting semantics, so out_waiting stays false. */
+bool lmux_osc_parser_last_was_osc133(lmux_osc_parser *p);
+
+/* Pop the next completed OSC 133 marker from the parser's queue.
+ * Returns true if a marker was popped into `out_marker` (caller must
+ * provide a buffer of at least 32 bytes). Returns false if queue empty. */
+bool lmux_osc_parser_pop_133(lmux_osc_parser *p, char *out_marker);
 
 /* ------------------------------------------------------------------ */
 /* Socket protocol                                                    */

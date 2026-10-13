@@ -318,6 +318,18 @@ struct lmux_pane {
     char         *sb;
     size_t        sb_len;
     size_t        sb_cap;
+    /* OSC 133 shell-integration command telemetry (ISS-0037). Markers
+     * are parsed from the pty stream (read-screen drain); A = prompt
+     * start, B = prompt end / command start, C = command end, D<code>
+     * = exit code. Duration/duration_ms use the monotonic clock;
+     * last_command_started is epoch ms (wall clock). */
+    bool          cmd_running;
+    int           last_cmd_exit;
+    int           pending_cmd_exit;   /* exit the next C finalizes with; D bakes it into last_cmd_exit */
+    long          last_cmd_duration_ms;
+    long          last_cmd_started_ms;
+    long          cmd_started_mono_ms;
+    lmux_osc_parser *osc;
 };
 /* pane_new defined after lmux_workspace struct — needs ws->app dereference */
 /* Spawn a child process with a pty for this pane.
@@ -663,12 +675,140 @@ static void pane_scrollback_append(lmux_pane *p, const char *data, size_t n) {
     p->sb_len += n;
 }
 
+/* ---- OSC 133 shell-integration telemetry (ISS-0037) ---- */
+
+static long now_mono_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long)ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+}
+
+static long now_wall_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (long)ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+}
+
+/* Feed pty bytes to this pane's OSC parser and apply any OSC 133
+ * shell-integration marker to the pane's command telemetry.
+ *
+ * Marker semantics (tmux oracle, input.c:3063+):
+ *   A        prompt start - no consumer today (documented, no fan-out)
+ *   B        prompt end / command start -> command_running = true,
+ *           last_command_started = now, %pane-command-started <id>
+ *   C        command end -> command_running = false,
+ *           duration = now - start, %pane-command-finished <id> <exit> <dur>
+ *   D<code>  exit code -> last_cmd_exit = code (independent of C, per
+ *           tmux: D may arrive without a preceding C). When a command
+ *           was running, this also finalizes it: command_running =
+ *           false, duration filled, %pane-command-finished fan-out.
+ */
+static void pane_osc133_feed(lmux_pane *p, const char *data, size_t n);
+static void control_emit(const char *cls, const char *line);  /* fwd; defn ~line 2840 */
+
+static void pane_osc133_feed(lmux_pane *p, const char *data, size_t n) {
+    if (!p || !data || n == 0) return;
+    if (!p->osc) p->osc = lmux_osc_parser_new();
+    if (!p->osc) return;
+    const char *text = NULL;
+    bool waiting = false;
+    /* Feed the chunk once; the parser maintains state across calls
+     * and may complete multiple sequences per chunk. */
+    lmux_osc_parser_feed(p->osc, data, n, &text, &waiting);
+    /* Drain all completed OSC 133 markers from the parser's queue. */
+    char marker[32];
+    while (lmux_osc_parser_pop_133(p->osc, marker)) {
+        size_t mlen = strlen(marker);
+        if (mlen == 0) continue;
+        char m = marker[0];
+        if (m == 'B') {
+            /* Edge-deduped: shell-integration re-emits B on prompt
+             * repaints without a matching C/D to close it. Fanning out
+             * every repaint would flood the notification stream. So B
+             * only re-starts when a command is already running (genuine
+             * back-to-back command start); a repaint B while idle is
+             * ignored. A fresh B on a truly idle pane does start a
+             * command and re-arms the exit pending slot. */
+            if (p->cmd_running) {
+                /* Real B..B overlap: refresh the start and re-emit. */
+                p->cmd_started_mono_ms = now_mono_ms();
+                p->last_cmd_started_ms = now_wall_ms();
+                p->last_cmd_duration_ms = 0;
+                p->pending_cmd_exit = 0;
+                char line[64];
+                snprintf(line, sizeof line, "%%pane-command-started %u", p->id);
+                control_emit("pane", line);
+            } else {
+                /* Idle B: new command start. */
+                p->cmd_running = true;
+                p->cmd_started_mono_ms = now_mono_ms();
+                p->last_cmd_started_ms = now_wall_ms();
+                p->last_cmd_duration_ms = 0;
+                p->pending_cmd_exit = 0;
+                char line[64];
+                snprintf(line, sizeof line, "%%pane-command-started %u", p->id);
+                control_emit("pane", line);
+            }
+        } else if (m == 'C') {
+            if (p->cmd_running) {
+                p->last_cmd_duration_ms = now_mono_ms() - p->cmd_started_mono_ms;
+                /* C carries no exit code in tmux; use the exit pending
+                 * from the most recent D in this command window. A
+                 * replay that has no D yet reports 0. */
+                p->last_cmd_exit = p->pending_cmd_exit;
+                p->cmd_running = false;
+                char line[128];
+                snprintf(line, sizeof line,
+                         "%%pane-command-finished %u %d %ld",
+                         p->id, p->last_cmd_exit, p->last_cmd_duration_ms);
+                control_emit("pane", line);
+            }
+        } else if (m == 'D') {
+            int code = 0;
+            bool had_digits = false;
+            for (size_t i = 1; i < mlen; i++) {
+                if (marker[i] >= '0' && marker[i] <= '9') {
+                    code = code * 10 + (marker[i] - '0');
+                    had_digits = true;
+                } else break;
+            }
+            if (!had_digits) continue;
+            if (p->cmd_running) {
+                /* D while a command is running: record its exit and
+                 * finalize it (tmux: D may arrive without a preceding C). */
+                p->pending_cmd_exit = code;
+                p->last_cmd_exit = code;
+                p->last_cmd_duration_ms = now_mono_ms() - p->cmd_started_mono_ms;
+                p->cmd_running = false;
+                char line[128];
+                snprintf(line, sizeof line,
+                         "%%pane-command-finished %u %d %ld",
+                         p->id, p->last_cmd_exit, p->last_cmd_duration_ms);
+                control_emit("pane", line);
+            } else {
+                /* D while idle: remember the exit for the next C's
+                 * finalize notification (tmux semantics: C after D must
+                 * carry the D's exit). */
+                p->pending_cmd_exit = code;
+            }
+        }  /* else if (m == 'D') */
+        /* 'A' (prompt start): recorded nowhere on purpose - no existing
+         * consumer. Documented as the pane-shell-prompt hook in the
+         * ISS-0037 notes; a control notification would fan out on
+         * every prompt render, which is noise without a consumer. */
+    }  /* while */
+}
+
 static void pane_scrollback_free(lmux_pane *p) {
     if (!p) return;
     free(p->sb);
     p->sb = NULL;
     p->sb_len = 0;
     p->sb_cap = 0;
+    /* OSC 133 parser (ISS-0037) is lazily allocated; free alongside
+     * the scrollback so pane_close / workspace teardown cannot leak it. */
+    lmux_osc_parser_free(p->osc);
+    p->osc = NULL;
 }
 
 /* Agent lifecycle events a hook script can bind to (ARCHITECTURE.md). */
@@ -1701,6 +1841,11 @@ bool lmux_pane_get_info(lmux_pane *p, lmux_pane_info *out) {
     out->id      = p->id;
     snprintf(out->kind, sizeof out->kind, "%s", p->kind);
     out->focused = p->focused;
+    /* ISS-0037: OSC 133 command telemetry (additive fields). */
+    out->command_running = p->cmd_running;
+    out->last_command_exit = p->last_cmd_exit;
+    out->last_command_duration_ms = p->last_cmd_duration_ms;
+    out->last_command_started = p->last_cmd_started_ms;
     return true;
 }
 bool lmux_pane_pty_set_size(lmux_pane *p, int cols, int rows) {
@@ -2646,6 +2791,36 @@ static bool json_extract_string(const char *json, const char *key, char *out, si
         if (*v == '"') { v++; break; }
         if (*v == '\\') {
             v++;
+            if (*v == 'u') {
+                /* Unicode escape \uXXXX */
+                v++;
+                unsigned int codepoint = 0;
+                for (int i = 0; i < 4 && *v && n < cap - 1; i++, v++) {
+                    char c = *v;
+                    int digit = (c >= '0' && c <= '9') ? c - '0' :
+                                (c >= 'a' && c <= 'f') ? c - 'a' + 10 :
+                                (c >= 'A' && c <= 'F') ? c - 'A' + 10 : -1;
+                    if (digit < 0) { codepoint = 0; break; }
+                    codepoint = (codepoint << 4) | digit;
+                }
+                /* Encode codepoint as UTF-8 */
+                if (codepoint <= 0x7F) {
+                    out[n++] = (char)codepoint;
+                } else if (codepoint <= 0x7FF) {
+                    out[n++] = 0xC0 | (codepoint >> 6);
+                    out[n++] = 0x80 | (codepoint & 0x3F);
+                } else if (codepoint <= 0xFFFF) {
+                    out[n++] = 0xE0 | (codepoint >> 12);
+                    out[n++] = 0x80 | ((codepoint >> 6) & 0x3F);
+                    out[n++] = 0x80 | (codepoint & 0x3F);
+                } else {
+                    /* Out of BMP - replace with replacement char */
+                    out[n++] = 0xEF;
+                    out[n++] = 0xBF;
+                    out[n++] = 0xBD;
+                }
+                continue;
+            }
             switch (*v) {
             case '"':  out[n++] = '"';  break;
             case '\\': out[n++] = '\\'; break;
@@ -3329,8 +3504,13 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                     RESULT_GROW;
                     if (!first) written += snprintf(result + written, result_cap - written, ",");
                     written += snprintf(result + written, result_cap - written,
-                        "{\"id\":%u,\"kind\":\"%s\",\"focused\":%s,\"surface_id\":%u}",
-                        p->id, p->kind, p->focused ? "true" : "false", s->id);
+                        "{\"id\":%u,\"kind\":\"%s\",\"focused\":%s,\"surface_id\":%u,"
+                        "\"command_running\":%s,\"last_command_exit\":%d,"
+                        "\"last_command_duration_ms\":%ld,\"last_command_started\":%ld}",
+                        p->id, p->kind, p->focused ? "true" : "false", s->id,
+                        p->cmd_running ? "true" : "false",
+                        p->last_cmd_exit, p->last_cmd_duration_ms,
+                        p->last_cmd_started_ms);
                     first = false;
                 }
             }
@@ -3524,6 +3704,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         ssize_t r;
         while ((r = read(p->pty_fd, chunk, sizeof chunk)) > 0) {
             pane_scrollback_append(p, chunk, (size_t)r);
+            pane_osc133_feed(p, chunk, (size_t)r);   /* ISS-0037 */
             drained += (size_t)r;
             if (drained >= LMUX_PTY_DRAIN_MAX) break;
         }

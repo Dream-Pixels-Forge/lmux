@@ -20,8 +20,19 @@
  *                      %session-changed <workspace-id> <title>
  *                      %window-pane-changed <surface-id> <pane-id>
  *                      %output <pane-id> <text...>
+ *                      %pane-command-started <pane-id>
+ *                      %pane-command-finished <pane-id> <exit> <duration-ms>
  *                      %subscription-changed <name> <1|0>
  *                      %dropped <n>                (backpressure overflow)
+ *
+ *   %pane-command-started / %pane-command-finished (ISS-0037) are emitted
+ *   when OSC 133 shell-integration markers (B = command start, C/D =
+ *   command end) are parsed from a pane's pty stream during read-screen.
+ *   They are the honest hook surface for the tmux pane-shell-prompt /
+ *   command-started / command-finished hooks: the named lmux_hook_script
+ *   registry only covers session-start / prompt-submit / stop / error, so
+ *   the three shell-integration hooks land as control notifications under
+ *   the existing "pane" class, filtered via refresh-client -B.
  *
  * Subscriptions (refresh-client -B name:what:format, tmux form):
  *   - subscribe:   {"cmd":"refresh-client","args":{"subscription":"name:what:format"}}
