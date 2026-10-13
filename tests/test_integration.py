@@ -5359,6 +5359,73 @@ class TestIOSCompanion(unittest.TestCase):
 
 
 # ====================================================================
+# ISS-0026 — companion least-privilege proxy + hook gate
+# ====================================================================
+
+class TestCompanionHardening(unittest.TestCase):
+    """Source + behavior gates for the companion remote API (ISS-0026)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.repo = Path(__file__).resolve().parent.parent
+        cls.src = (cls.repo / "gui" / "companion.py").read_text()
+        cls.hooks_src = (cls.repo / "gui" / "agent_hooks.py").read_text()
+        sys.path.insert(0, str(cls.repo / "gui"))
+
+    def test_token_never_in_query(self):
+        """Token via header/body only — no query-param auth path."""
+        self.assertNotIn('params.get("token"', self.src,
+                         "query-param token auth must be gone")
+        self.assertNotIn("query_token", self.src,
+                         "query token plumbing must be gone")
+        self.assertIn("X-Companion-Token", self.src)
+        self.assertIn("Bearer ", self.src)
+        self.assertIn("compare_digest", self.src)
+
+    def test_remote_allowlist(self):
+        """Remote role allowlist + denylist with clear 403 denial."""
+        from companion import CompanionServer, RemoteCommand
+        srv = CompanionServer()
+        for cmd in ("pane.focus", "surface.split", "workspace.create",
+                    "workspace.close", "workspace.list", "pane.list"):
+            ok, _ = srv._check_remote_allowed(cmd)
+            self.assertTrue(ok, f"{cmd} should be allowed")
+        for cmd in ("hooks.add", "config.set", "agent.spawn",
+                    "surface.send_text", "ssh", "pipe-pane",
+                    "notification.hooks.add"):
+            ok, reason = srv._check_remote_allowed(cmd)
+            self.assertFalse(ok, f"{cmd} must be denied")
+            self.assertTrue(reason, "denial needs a clear error")
+            res = srv._execute_command(RemoteCommand(command=cmd, args={}))
+            self.assertFalse(res.get("ok", True))
+            self.assertIn("error", res)
+
+    def test_mkstemp_not_mktemp(self):
+        """QR temp file must use mkstemp (no mktemp TOCTOU)."""
+        self.assertIn("mkstemp", self.src)
+        self.assertNotIn("mktemp(",
+                         self.src.replace("mkstemp(", ""),
+                         "tempfile.mktemp must be gone")
+
+    def test_hook_gate(self):
+        """Remote hook registration denied unless locally enabled."""
+        from agent_hooks import HookRegistry
+        reg = HookRegistry()
+        self.assertFalse(reg.register_remote("workspace_created", "/bin/true"))
+        reg.allow_remote_registration(True)
+        self.assertTrue(reg.register_remote("workspace_created", "/bin/true"))
+        self.assertIn("register_remote", self.hooks_src)
+
+    def test_lan_bind_refused_and_qr_json(self):
+        """Non-loopback bind refused; QR payload carries no query token."""
+        from companion import CompanionServer
+        srv = CompanionServer()
+        with self.assertRaises(ValueError):
+            srv.start(host="0.0.0.0")
+        self.assertNotIn("?token=", self.src)
+
+
+# ====================================================================
 # Agent Teams — multi-agent workflow orchestration
 # ====================================================================
 

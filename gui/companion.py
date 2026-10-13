@@ -33,6 +33,53 @@ TOKEN_MAX_AGE = 300  # 5 minutes
 RATE_LIMIT_PER_SEC = 10
 _HOST = "127.0.0.1"
 
+# ISS-0026: remote role is deliberately narrow. The companion proxy
+# forwards to the daemon socket, so an allowlist — not a denylist —
+# bounds what a paired phone can do. Read-only queries plus the four
+# pane/workspace navigation verbs; everything else (hooks.add,
+# config.set, pane spawn, agent.*, snapshot.*, session.*, auth.*,
+# notification hooks, ssh, pipe-pane, respawn, …) is denied with a
+# clear error. LAN-bind risk: the server binds 127.0.0.1 only; binding
+# a LAN interface would expose this API to the whole network, so
+# CompanionServer.start() refuses non-loopback hosts (see start()).
+REMOTE_COMMAND_ALLOWLIST = frozenset({
+    # navigation verbs
+    "pane.focus",
+    "pane.focus_dir",
+    "surface.split",
+    "surface.focus",
+    "workspace.create",
+    "workspace.close",
+    "workspace.select",
+    "surface.close",
+    # read-only queries
+    "workspace.list",
+    "surface.list",
+    "pane.list",
+    "list_workspaces",
+    "get_active_pane",
+    "status",
+    "tree",
+})
+
+# Explicitly denied even if a future allowlist edit is careless —
+# these are the command-injection / persistence amplifiers.
+REMOTE_COMMAND_DENYLIST = frozenset({
+    "hooks.add",
+    "hook.add",
+    "notification.hooks.add",
+    "config.set",
+    "pane.spawn",
+    "agent.spawn",
+    "respawn-pane",
+    "pipe-pane",
+    "surface.send_text",
+    "surface.send_key",
+    "ssh",
+})
+
+TOKEN_HEADER = "X-Companion-Token"
+
 
 # ── Data classes ─────────────────────────────────────────────
 
@@ -107,12 +154,31 @@ class _CompanionHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _check_token(self) -> str | None:
-        """Return query token or None if missing/invalid."""
-        parsed = urlparse(self.path)
-        params = parse_qs(parsed.query)
-        tokens = params.get("token", [])
-        if tokens and secrets.compare_digest(tokens[0], self.server_ref._token):
-            return tokens[0]
+        """Return the bearer token from header or JSON body — never query.
+
+        ISS-0026: tokens in the query string leak into server logs,
+        proxy logs, QR payloads and browser history. Accept only the
+        X-Companion-Token header, an Authorization: Bearer header, or
+        (for POST /api/command) the JSON body "token" field.
+        """
+        header_token = self.headers.get(TOKEN_HEADER, "")
+        if header_token and secrets.compare_digest(
+                header_token, self.server_ref._token):
+            return header_token
+        auth = self.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            bearer = auth[len("Bearer "):]
+            if bearer and secrets.compare_digest(
+                    bearer, self.server_ref._token):
+                return bearer
+        return None
+
+    def _body_token(self, payload: dict) -> str | None:
+        """Return the JSON-body token if valid, else None."""
+        body_token = payload.get("token", "") if isinstance(payload, dict) else ""
+        if body_token and secrets.compare_digest(
+                body_token, self.server_ref._token):
+            return body_token
         return None
 
     def _check_rate(self) -> bool:
@@ -167,10 +233,9 @@ class _CompanionHandler(BaseHTTPRequestHandler):
                 self._send_json({"error": "invalid json"}, 400)
                 return
 
-            # Accept token from query param or JSON body
-            query_token = self._check_token()
-            body_token = payload.get("token", "")
-            token = query_token or body_token
+            # Accept token from header or JSON body — never the query string
+            header_token = self._check_token()
+            token = header_token or self._body_token(payload)
             if not token:
                 self._send_json({"error": "unauthorized"}, 401)
                 return
@@ -190,6 +255,11 @@ class _CompanionHandler(BaseHTTPRequestHandler):
                 self.client_address[0],
                 payload.get("device_name", "phone"),
             )
+            allowed, denial = self.server_ref._check_remote_allowed(
+                cmd.command)
+            if not allowed:
+                self._send_json({"ok": False, "error": denial}, 403)
+                return
             result = self.server_ref._execute_command(cmd)
             self._send_json(result)
         else:
@@ -213,8 +283,24 @@ class CompanionServer:
 
     # ── lifecycle ────────────────────────────────────────
 
-    def start(self) -> None:
-        """Start the HTTP server in a background daemon thread."""
+    def start(self, host: str = _HOST) -> None:
+        """Start the HTTP server in a background daemon thread.
+
+        ISS-0026: loopback-only. A LAN bind would expose the remote
+        API (workspace control + token auth) to the whole network,
+        so non-loopback hosts are refused loudly instead of warned.
+        """
+        if host not in ("127.0.0.1", "::1", "localhost"):
+            import warnings
+            warnings.warn(
+                f"refusing to bind companion server to non-loopback "
+                f"host {host!r}: LAN exposure would let any network "
+                f"peer drive the daemon socket",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            raise ValueError(
+                f"companion server binds loopback only, got {host!r}")
         if self._running:
             return
         self._rotate_token()
@@ -321,8 +407,29 @@ class CompanionServer:
 
     # ── command execution ────────────────────────────────
 
+    @staticmethod
+    def _check_remote_allowed(command: str) -> tuple[bool, str]:
+        """Allowlist gate for the remote role (ISS-0026).
+
+        Returns (True, "") when allowed, else (False, reason).
+        Denylist is checked first so the amplifier commands stay
+        denied even if the allowlist is widened carelessly.
+        """
+        if command in REMOTE_COMMAND_DENYLIST:
+            return (False,
+                    f"command {command!r} is not permitted over the "
+                    f"companion remote API")
+        if command not in REMOTE_COMMAND_ALLOWLIST:
+            return (False,
+                    f"command {command!r} is not in the companion "
+                    f"remote allowlist")
+        return (True, "")
+
     def _execute_command(self, cmd: RemoteCommand) -> dict:
         """Dispatch a validated command to the daemon."""
+        allowed, denial = self._check_remote_allowed(cmd.command)
+        if not allowed:
+            return {"ok": False, "error": denial}
         try:
             from daemon_client import DaemonClient
             client = DaemonClient()
@@ -379,8 +486,12 @@ class QRCodeGenerator:
         return self._text_fallback(text)
 
     def generate_with_payload(self, server_url: str, token: str) -> Gtk.Image:
-        """Generate a QR image from a server URL + token pair."""
-        payload = f"{server_url}?token={token}"
+        """Generate a QR image from a server URL + token pair.
+
+        ISS-0026: the token travels as a separate JSON field, never
+        in the URL query string (query tokens leak into logs).
+        """
+        payload = json.dumps({"url": server_url, "token": token})
         return self.generate(payload) or self._text_fallback(payload)
 
     # ── strategy 1: qrencode CLI ────────────────────────
@@ -388,8 +499,12 @@ class QRCodeGenerator:
     def _try_qrencode(self, text: str, size: int) -> Gtk.Image | None:
         import subprocess
         import tempfile
+        svg_path = ""
         try:
-            svg_path = tempfile.mktemp(suffix=".svg")
+            # ISS-0026: mkstemp, not mktemp — mktemp is a TOCTOU race
+            # (another uid/process can claim the name first).
+            fd, svg_path = tempfile.mkstemp(suffix=".svg")
+            os.close(fd)
             subprocess.run(
                 ["qrencode", "-o", svg_path, "-s", "4", "-m", "1", text],
                 check=True,
@@ -409,6 +524,11 @@ class QRCodeGenerator:
                 os.unlink(svg_path)
                 return None
         except (FileNotFoundError, subprocess.SubprocessError, OSError):
+            if svg_path:
+                try:
+                    os.unlink(svg_path)
+                except OSError:
+                    pass
             return None
 
     # ── strategy 2: python-qrcode ───────────────────────
