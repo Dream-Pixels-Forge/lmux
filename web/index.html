@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>lmux dashboard</title>
+    <meta name="lmux-token" content="__LMUX_WEB_TOKEN__">
     <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -64,7 +65,16 @@
         return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
     }
 
+    function webToken() {
+        const m = document.querySelector('meta[name="lmux-token"]');
+        return m ? m.content : '';
+    }
+
     async function api(path, options = {}) {
+        // ISS-0018: per-boot POST token, injected same-origin by the
+        // server (meta tag). Cross-origin pages cannot read it (no ACAO).
+        options.headers = Object.assign(
+            { 'X-Lmux-Token': webToken() }, options.headers || {});
         try {
             const resp = await fetch(path, options);
             return await resp.json();
