@@ -14,6 +14,7 @@ Usage:
 """
 
 import json
+import inspect
 import os
 import re
 import shutil
@@ -31,6 +32,25 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from lmux import LmuxClient, LmuxDaemon, LmuxError
+
+
+# ====================================================================
+# Gtk availability probe (PR #47: CI container has no Gtk typelibs).
+# GUI modules (gui/companion.py, gui/auth.py, gui/agent_sessions.py)
+# hard-require Gtk at import, so the tests exercising them skip
+# gracefully where Gtk is absent — same precedent as the existing
+# skipTest env guards for unreachable services below.
+# ====================================================================
+
+try:
+    import gi
+    gi.require_version("Gtk", "3.0")
+    from gi.repository import Gtk  # noqa: F401  (probe only)
+    GUI_AVAILABLE = True
+except (ImportError, ValueError):
+    GUI_AVAILABLE = False
+
+_GUI_SKIP_REASON = "Gtk unavailable (no Gtk typelibs in this env)"
 
 
 # ====================================================================
@@ -5359,6 +5379,173 @@ class TestIOSCompanion(unittest.TestCase):
 
 
 # ====================================================================
+# ISS-0026 — companion least-privilege proxy + hook gate
+# ====================================================================
+
+class TestCompanionHardening(unittest.TestCase):
+    """Source + behavior gates for the companion remote API (ISS-0026)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.repo = Path(__file__).resolve().parent.parent
+        cls.src = (cls.repo / "gui" / "companion.py").read_text()
+        cls.hooks_src = (cls.repo / "gui" / "agent_hooks.py").read_text()
+        sys.path.insert(0, str(cls.repo / "gui"))
+
+    def test_token_never_in_query(self):
+        """Token via header/body only — no query-param auth path."""
+        self.assertNotIn('params.get("token"', self.src,
+                         "query-param token auth must be gone")
+        self.assertNotIn("query_token", self.src,
+                         "query token plumbing must be gone")
+        self.assertIn("X-Companion-Token", self.src)
+        self.assertIn("Bearer ", self.src)
+        self.assertIn("compare_digest", self.src)
+
+    @unittest.skipUnless(GUI_AVAILABLE, _GUI_SKIP_REASON)
+    def test_remote_allowlist(self):
+        """Remote role allowlist + denylist with clear 403 denial."""
+        from companion import CompanionServer, RemoteCommand
+        srv = CompanionServer()
+        for cmd in ("pane.focus", "surface.split", "workspace.create",
+                    "workspace.close", "workspace.list", "pane.list"):
+            ok, _ = srv._check_remote_allowed(cmd)
+            self.assertTrue(ok, f"{cmd} should be allowed")
+        for cmd in ("hooks.add", "config.set", "agent.spawn",
+                    "surface.send_text", "ssh", "pipe-pane",
+                    "notification.hooks.add"):
+            ok, reason = srv._check_remote_allowed(cmd)
+            self.assertFalse(ok, f"{cmd} must be denied")
+            self.assertTrue(reason, "denial needs a clear error")
+            res = srv._execute_command(RemoteCommand(command=cmd, args={}))
+            self.assertFalse(res.get("ok", True))
+            self.assertIn("error", res)
+
+    def test_mkstemp_not_mktemp(self):
+        """QR temp file must use mkstemp (no mktemp TOCTOU)."""
+        self.assertIn("mkstemp", self.src)
+        self.assertNotIn("mktemp(",
+                         self.src.replace("mkstemp(", ""),
+                         "tempfile.mktemp must be gone")
+
+    def test_hook_gate(self):
+        """Remote hook registration denied unless locally enabled."""
+        from agent_hooks import HookRegistry
+        reg = HookRegistry()
+        self.assertFalse(reg.register_remote("workspace_created", "/bin/true"))
+        reg.allow_remote_registration(True)
+        self.assertTrue(reg.register_remote("workspace_created", "/bin/true"))
+        self.assertIn("register_remote", self.hooks_src)
+
+    @unittest.skipUnless(GUI_AVAILABLE, _GUI_SKIP_REASON)
+    def test_lan_bind_refused_and_qr_json(self):
+        """Non-loopback bind refused; QR payload carries no query token."""
+        from companion import CompanionServer
+        srv = CompanionServer()
+        with self.assertRaises(ValueError):
+            srv.start(host="0.0.0.0")
+        self.assertNotIn("?token=", self.src)
+
+
+# ====================================================================
+# ISS-0015 — auth honesty (GUI lock, not a boundary)
+# ====================================================================
+
+class TestAuthHonesty(unittest.TestCase):
+    """ISS-0015: no su/PAM fallbacks; docs state the real boundary."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.repo = Path(__file__).resolve().parent.parent
+        cls.src = (cls.repo / "gui" / "auth.py").read_text()
+        cls.sec = (cls.repo / "SECURITY.md").read_text()
+        sys.path.insert(0, str(cls.repo / "gui"))
+
+    def test_no_su_fallback(self):
+        """The dead su-stdin password-pipe path must be gone."""
+        self.assertNotIn('"su"', self.src)
+        self.assertNotIn("'su'", self.src)
+        self.assertNotIn("subprocess", self.src)
+
+    def test_no_phantom_pam_binary(self):
+        """No subprocess invocation of a pam_authenticate binary."""
+        self.assertNotIn('["pam_authenticate"', self.src)
+        self.assertNotIn("['pam_authenticate'", self.src)
+
+    def test_spwd_path_kept(self):
+        """Shadow-database verification (the meaningful case) stays."""
+        self.assertIn("spwd.getspnam", self.src)
+        self.assertIn("crypt.crypt", self.src)
+
+    def test_honesty_docs(self):
+        """Module + SECURITY.md state GUI lock is not the boundary."""
+        self.assertIn("not a security boundary", self.src)
+        self.assertIn("GUI lock is not a security boundary", self.sec)
+        self.assertIn("same-UID", self.sec)
+
+    @unittest.skipUnless(GUI_AVAILABLE, _GUI_SKIP_REASON)
+    def test_legit_flow_intact(self):
+        """Import + API stable; unknown user cleanly rejected."""
+        import auth as auth_mod
+        backend = auth_mod.AuthBackend()
+        self.assertFalse(backend.authenticate("nonexistent-user-xyz", "x"))
+        self.assertFalse(backend.is_authenticated())
+
+
+# ====================================================================
+# ISS-0027 — hardening batch (N7 TOCTOU, N10 shlex, N11 SSE caps)
+# ====================================================================
+
+class TestHardeningBatch(unittest.TestCase):
+    """Source + behavior gates for ISS-0027 hardening."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.repo = Path(__file__).resolve().parent.parent
+        sys.path.insert(0, str(cls.repo / "gui"))
+
+    def test_snapshot_no_follow_open(self):
+        """model.c snapshot load: O_NOFOLLOW|O_CLOEXEC + fstat + re-validate."""
+        src = (self.repo / "src" / "core" / "model.c").read_text()
+        self.assertIn("O_NOFOLLOW", src)
+        self.assertIn("O_CLOEXEC", src)
+        self.assertIn("snapshot_open_nofollow", src)
+        self.assertIn("/proc/self/fd/", src)
+        self.assertIn("S_ISREG", src)
+
+    @unittest.skipUnless(GUI_AVAILABLE, _GUI_SKIP_REASON)
+    def test_resume_shlex_allowlist(self):
+        """resume_command: shlex.split + binary allowlist, no .split()."""
+        from agent_sessions import parse_resume_command
+        mod_src = (self.repo / "gui" / "agent_sessions.py").read_text()
+        self.assertIn("shlex.split", mod_src)
+        self.assertIn("RESUME_BINARY_ALLOWLIST", mod_src)
+        self.assertNotIn("resume_command.split()", mod_src)
+        # quoted args survive intact
+        self.assertEqual(
+            parse_resume_command('claude --resume "my session"'),
+            ["claude", "--resume", "my session"])
+        # flag-smuggling / unknown binaries refused
+        self.assertIsNone(parse_resume_command("my-agent; rm -rf ~"))
+        self.assertIsNone(parse_resume_command("/usr/bin/evil --exec id"))
+        self.assertIsNone(parse_resume_command("claude \"unterminated"))
+
+    def test_sse_caps(self):
+        """SSE: server cap (8 + 503) and client exponential backoff."""
+        http_src = (self.repo / "src" / "core" / "http_server.c").read_text()
+        self.assertIn("HTTP_MAX_SSE_CLIENTS", http_src)
+        self.assertIn("503", http_src)
+        self.assertIn("Retry-After", http_src)
+        self.assertIn("sse_count", http_src)
+        import daemon_client as dc
+        self.assertEqual(dc.SSE_BACKOFF_INITIAL, 1.0)
+        self.assertEqual(dc.SSE_BACKOFF_MAX, 30.0)
+        src = inspect.getsource(dc.DaemonClient.send_events)
+        self.assertIn("backoff", src)
+        self.assertIn("stop.wait", src)
+
+
+# ====================================================================
 # Agent Teams — multi-agent workflow orchestration
 # ====================================================================
 
@@ -6087,26 +6274,46 @@ class TestHarnessPtydTeardown(unittest.TestCase):
         survives as a live process (issue #37: 14 orphans) even though its
         socket file is gone — so assert on the PID via pgrep, not on the
         socket. _reap_strace_daemon must leave no matching pid alive.
+
+        Hardening (ISS-0028): the bind deadline is 60s (tracer overhead on
+        loaded CI runners) with one relaunch retry before failing; skipped
+        when the strace binary is absent.
         """
+        if not shutil.which("strace"):
+            self.skipTest("strace unavailable; cannot trace daemon startup")
         sock = f"/tmp/lmux-ptyd-harness-{os.getpid()}.sock"
         Path(sock).unlink(missing_ok=True)
         repo_root = Path(__file__).parent.parent
-        proc = subprocess.Popen(
-            ["strace", "-f", "-c", "-e", "trace=clone,clone3,fork,vfork",
-             "-o", "/dev/null",
-             str(repo_root / "build" / "lmux"), "--socket", sock, "daemon"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
+
+        def _launch_under_strace():
+            return subprocess.Popen(
+                ["strace", "-f", "-c", "-e", "trace=clone,clone3,fork,vfork",
+                 "-o", "/dev/null",
+                 str(repo_root / "build" / "lmux"), "--socket", sock, "daemon"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+
+        proc = _launch_under_strace()
         try:
             client = None
-            deadline = time.time() + 30
-            while time.time() < deadline and client is None:
-                time.sleep(0.25)
-                try:
-                    client = LmuxClient(sock)
-                except Exception:  # noqa: BLE001 - not up yet
-                    client = None
-            self.assertIsNotNone(client, "daemon did not come up")
+            for attempt in (1, 2):
+                deadline = time.time() + 60
+                while time.time() < deadline and client is None:
+                    time.sleep(0.25)
+                    try:
+                        client = LmuxClient(sock)
+                    except Exception:  # noqa: BLE001 - not up yet
+                        client = None
+                if client is not None:
+                    break
+                if attempt == 1:
+                    print(f"\n[attempt 1/2] daemon under strace did not bind "
+                          f"{sock} within 60s; reaping and relaunching once",
+                          flush=True)
+                    _reap_strace_daemon(proc, sock)
+                    proc = _launch_under_strace()
+            self.assertIsNotNone(client,
+                                 "daemon did not come up after 2 attempts (60s each)")
             self.assertTrue(LmuxClient(sock, timeout=5.0).send("ping", {}).get("ok"))
         finally:
             _reap_strace_daemon(proc, sock)

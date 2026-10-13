@@ -60,6 +60,34 @@ class HookRegistry:
         self._lock = threading.Lock()
         self._recent_events = []  # last N events for UI indicators
         self._max_recent = 20
+        # ISS-0026: hook registration is local-only by default. A
+        # remote peer (companion socket) must never be able to plant
+        # an executable script path that the GUI will later run —
+        # that turns any token leak into arbitrary code execution.
+        # The local GUI can opt in via allow_remote_registration().
+        self._allow_remote_registration = False
+
+    def allow_remote_registration(self, allow: bool = True) -> None:
+        """Opt in/out of remote hook registration (local GUI only).
+
+        Must be called from local GUI code (e.g. after an explicit
+        user confirmation dialog). Defaults to False.
+        """
+        with self._lock:
+            self._allow_remote_registration = allow
+
+    def register_remote(self, event, script) -> bool:
+        """Register a hook on behalf of a remote (socket) caller.
+
+        ISS-0026 hook gate: refused unless the local user explicitly
+        enabled remote registration. The companion proxy denies
+        hooks.add before it ever reaches here (defense in depth).
+        """
+        with self._lock:
+            allowed = self._allow_remote_registration
+        if not allowed:
+            return False
+        return self.register(event, script)
 
     def register(self, event, script):
         """Register a hook script for an event.

@@ -1,7 +1,11 @@
-"""Authentication system for lmux GUI — PAM integration for Linux.
+"""Authentication nicety for the lmux GUI — screen lock, not a boundary.
 
-Provides login/logout, session tracking, and optional PAM-based
-authentication for protecting workspace actions.
+ISS-0015 honesty statement: the daemon's trust boundary is the Unix
+domain socket with SO_PEERCRED UID checks (same-UID peers only) —
+see SECURITY.md. This module's AuthBackend is a *screen-lock nicety*
+that keeps a casual passerby from clicking GUI buttons; it is NOT a
+security boundary. A local same-UID process can always talk to the
+daemon socket directly, so no GUI password prompt can stop it.
 """
 import gi
 gi.require_version("Gtk", "3.0")
@@ -9,7 +13,6 @@ from gi.repository import Gtk, GLib, GObject
 import os
 import sys
 import threading
-import subprocess
 import crypt
 import pwd
 import spwd
@@ -40,12 +43,22 @@ class AuthBackend:
             return user
 
     def authenticate(self, username, password):
-        """Verify username/password against system. Returns True if valid.
+        """Verify username/password against the shadow database.
 
-        Uses crypt() to compare against /etc/shadow.
-        Falls back to PAM if shadow access is denied.
+        Returns True if valid. Screen-lock nicety only (see module
+        docstring) — not a security boundary.
+
+        ISS-0015: single method — crypt() against /etc/shadow, which
+        only succeeds when the process can already read the entry
+        (i.e. verifying the *same* user, the only meaningful case
+        for a screen lock). The old fallbacks are gone: `su -c`
+        reads its password from /dev/tty, not stdin, so piping the
+        password to it was dead code that pointlessly duplicated the
+        secret into another process's argv-adjacent memory; and the
+        `pam_authenticate` binary does not exist on any real system
+        (phantom path — real PAM needs python-pam, an optional dep
+        we deliberately do not require).
         """
-        # Method 1: Direct shadow comparison (fast, requires root or same user)
         try:
             shadow = spwd.getspnam(username)
             expected = shadow.sp_pwdp
@@ -56,36 +69,7 @@ class AuthBackend:
                     return True
             return False
         except (PermissionError, KeyError):
-            pass
-
-        # Method 2: PAM via python-pam or systemd-run
-        try:
-            result = subprocess.run(
-                ["pam_authenticate", username, password],
-                capture_output=True, timeout=5
-            )
-            if result.returncode == 0:
-                self._current_user = username
-                self._authenticated = True
-                return True
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass
-
-        # Method 3: su -c test
-        try:
-            result = subprocess.run(
-                ["su", "-c", "echo ok", username],
-                input=password + "\n",
-                capture_output=True, text=True, timeout=5
-            )
-            if result.returncode == 0 and "ok" in result.stdout:
-                self._current_user = username
-                self._authenticated = True
-                return True
-        except (subprocess.TimeoutExpired, OSError):
-            pass
-
-        return False
+            return False
 
     def logout(self):
         """Clear authentication state."""

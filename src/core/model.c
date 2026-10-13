@@ -9153,10 +9153,67 @@ static bool snap_load_workspaces(lmux_app *app, snap_rd *r) {
     }
 }
 
+/* N7 (ISS-0027): open a snapshot path without following a trailing
+ * symlink and re-validate the opened file against the directory the
+ * caller confined. Closes the TOCTOU window between the
+ * snapshot.load path check and the read: an attacker who swaps in a
+ * symlink (or swaps the directory) after confinement gets ELOOP / a
+ * directory mismatch instead of our file descriptor. Returns an open
+ * fd on success, -1 on refusal. */
+static int snapshot_open_nofollow(const char *path) {
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) {
+        if (errno == ELOOP)
+            lmux_log(LMUX_LOG_ERROR,
+                     "snapshot: %s is a symlink; refusing (TOCTOU)", path);
+        return -1;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        if (fstat(fd, &st) == 0)
+            lmux_log(LMUX_LOG_ERROR,
+                     "snapshot: %s is not a regular file; refusing", path);
+        close(fd);
+        return -1;
+    }
+    /* Re-validate: the fd's real path must sit in the same directory
+     * as the confined input path (catches dir-swap races). */
+    char fdlink[64], real[PATH_MAX], wantdir[PATH_MAX];
+    snprintf(fdlink, sizeof fdlink, "/proc/self/fd/%d", fd);
+    ssize_t r = readlink(fdlink, real, sizeof real - 1);
+    if (r < 0) { close(fd); return -1; }
+    real[r] = '\0';
+    snprintf(wantdir, sizeof wantdir, "%s", path);
+    char *slash = strrchr(wantdir, '/');
+    if (slash) {
+        *slash = '\0';
+        char realdir[PATH_MAX];
+        snprintf(realdir, sizeof realdir, "%s", real);
+        char *rslash = strrchr(realdir, '/');
+        if (rslash) *rslash = '\0';
+        char canon_want[PATH_MAX], canon_got[PATH_MAX];
+        /* wantdir was already resolved by the caller; resolve what we got. */
+        if (!realpath(wantdir, canon_want) ||
+            !realpath(realdir, canon_got) ||
+            strcmp(canon_want, canon_got) != 0) {
+            lmux_log(LMUX_LOG_ERROR,
+                     "snapshot: %s resolved outside its directory; refusing (TOCTOU)",
+                     path);
+            close(fd);
+            return -1;
+        }
+    }
+    return fd;
+}
+
 bool lmux_snapshot_load(lmux_app *app, const char *path) {
     if (!app || !path) return false;
-    FILE *f = fopen(path, "rb");
-    if (!f) return false;
+    /* N7: no-follow open + fstat + re-validation (covers the main
+     * path and, via load_with_recovery, the .bak second path). */
+    int fd = snapshot_open_nofollow(path);
+    if (fd < 0) return false;
+    FILE *f = fdopen(fd, "rb");
+    if (!f) { close(fd); return false; }
 
     /* Size the buffer from the file rather than capping it: a legitimately
      * large session must load, while an unreadable one still fails below. */

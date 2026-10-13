@@ -27,6 +27,14 @@ def _get_default_socket_path():
 DEFAULT_SOCKET_PATH = _get_default_socket_path()
 MAX_RESPONSE_SIZE = 16 * 1024 * 1024  # 16 MiB cap to prevent unbounded reads
 
+# N11 (ISS-0027): reconnect backoff for the events stream. A fixed
+# 1s retry turns a dead daemon into a busy reconnect spin (86k
+# connects/day/client); exponential backoff with a cap keeps
+# reconnection prompt while sparing the CPU and the log.
+SSE_BACKOFF_INITIAL = 1.0  # seconds
+SSE_BACKOFF_MAX = 30.0  # seconds
+SSE_BACKOFF_FACTOR = 2.0
+
 
 class DaemonClient:
     """Thread-safe client for lmux daemon socket API with connection pooling (H2 fix)."""
@@ -204,6 +212,7 @@ class DaemonClient:
         stop = threading.Event()
 
         def _run():
+            backoff = SSE_BACKOFF_INITIAL
             while not stop.is_set():
                 try:
                     s = socket.socket(socket.AF_UNIX)
@@ -211,6 +220,7 @@ class DaemonClient:
                     s.connect(self.path)
                     payload = json.dumps({"cmd": "events", "args": args}) + "\n"
                     s.sendall(payload.encode())
+                    backoff = SSE_BACKOFF_INITIAL  # connected: reset
                     # consume until stop
                     buf = ""
                     while not stop.is_set():
@@ -233,10 +243,13 @@ class DaemonClient:
                             continue
                     s.close()
                 except Exception:
-                    if not stop.is_set():
-                        time.sleep(1)
+                    pass
                 if not stop.is_set():
-                    time.sleep(1)
+                    # N11: exponential backoff (1s doubling to 30s max),
+                    # interruptible so stop() stays prompt.
+                    stop.wait(min(backoff, SSE_BACKOFF_MAX))
+                    backoff = min(backoff * SSE_BACKOFF_FACTOR,
+                                  SSE_BACKOFF_MAX)
 
         t = threading.Thread(target=_run, daemon=True)
         t.start()

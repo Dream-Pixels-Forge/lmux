@@ -3,6 +3,7 @@
  *
  * Uses ONLY public API accessors. No internal struct access.
  */
+#define _POSIX_C_SOURCE 200809L
 #include "lmux.h"
 #include <stdio.h>
 #include <string.h>
@@ -366,6 +367,51 @@ static void test_snapshot_backup_recovery(void) {
     teardown(); PASS();
 }
 
+/* N7 (ISS-0027): a symlink swapped in where the snapshot should be
+ * must be refused, not followed — even when it points at a valid
+ * snapshot file. Same for the .bak fallback path. */
+static void test_snapshot_symlink_refused(void) {
+    TEST("snapshot load refuses symlinked file and .bak (TOCTOU)");
+    lmux_app *app = make_app();
+    lmux_workspace *ws = lmux_workspace_create(app, "symlink-test");
+    ASSERT(ws != NULL, "workspace created");
+
+    char real[256], link[256], baklink[268];
+    snprintf(real, sizeof real, "/tmp/lmux-snap-real-%d.json", getpid());
+    snprintf(link, sizeof link, "/tmp/lmux-snap-link-%d.json", getpid());
+    ASSERT(lmux_snapshot_save(app, real), "snapshot_save should succeed");
+    unlink(link);
+    ASSERT(symlink(real, link) == 0, "symlink setup should succeed");
+
+    /* Symlinked main path: refused even though the target is valid. */
+    ASSERT(!lmux_snapshot_load(app, link),
+           "symlinked snapshot must be refused");
+
+    /* Symlinked .bak: recovery must not follow it either. Main file
+     * is corrupt and the only good copy sits behind a symlink. */
+    snprintf(baklink, sizeof baklink, "%s.bak", link);
+    unlink(baklink);
+    ASSERT(symlink(real, baklink) == 0, ".bak symlink setup should succeed");
+    FILE *f = fopen(link, "w");
+    /* NOTE: fopen follows the link — that only corrupts the scratch
+     * target file, which is what we want to simulate here. */
+    if (f) { fprintf(f, "NOT_JSON"); fclose(f); }
+    lmux_app *app2 = make_app();
+    /* Point recovery at a corrupt main + symlinked .bak via link path:
+     * both must be refused. */
+    unlink(link);
+    ASSERT(symlink("/dev/null", link) == 0, "relink setup should succeed");
+    ASSERT(!lmux_snapshot_load_with_recovery(app2, link),
+           "symlinked snapshot+.bak must both be refused");
+
+    unlink(real);
+    unlink(link);
+    unlink(baklink);
+    lmux_app_free(app);
+    lmux_app_free(app2);
+    teardown(); PASS();
+}
+
 int main(void) {
     printf("lmux Model Unit Tests\n");
     printf("=====================\n\n");
@@ -392,6 +438,7 @@ int main(void) {
     test_dispatch_unknown_cmd();
     test_dispatch_naming_suggest_cache();
     test_snapshot_backup_recovery();
+    test_snapshot_symlink_refused();
     printf("\n=====================\n");
     printf("Tests: %d passed, %d failed, %d total\n\n",
            tests_pass, tests_fail, tests_run);
