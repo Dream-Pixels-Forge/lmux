@@ -99,7 +99,11 @@ modules:
         gcc -std=c17 -Wall -Wextra -Wpedantic -fPIC -O2 -DNDEBUG
         -Isrc/core -Iinclude
         -c src/core/control.c -o control.o
-      - ar rcs liblmux_core.a model.o osc.o server.o config.o http_server.o control.o
+      - >
+        gcc -std=c17 -Wall -Wextra -Wpedantic -fPIC -O2 -DNDEBUG
+        -Isrc/core -Iinclude
+        -c src/core/format.c -o format.o
+      - ar rcs liblmux_core.a model.o osc.o server.o config.o http_server.o control.o format.o
       - >
         gcc -std=c17 -Wall -Wextra -O2 -DNDEBUG
         -Iinclude
