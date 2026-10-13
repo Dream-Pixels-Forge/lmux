@@ -38,9 +38,9 @@ extern "C" {
 /* ------------------------------------------------------------------ */
 
 #define LMUX_VERSION_MAJOR 1
-#define LMUX_VERSION_MINOR 1
-#define LMUX_VERSION_PATCH 2
-#define LMUX_VERSION "1.1.2"
+#define LMUX_VERSION_MINOR 2
+#define LMUX_VERSION_PATCH 0
+#define LMUX_VERSION "1.2.0"
 
 const char *lmux_version(void);
 

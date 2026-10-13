@@ -32,7 +32,7 @@ log = logging.getLogger(__name__)
 
 # ── Constants ────────────────────────────────────────────────
 
-CURRENT_VERSION: str = "1.0.0"  # keep in sync with include/lmux.h
+CURRENT_VERSION: str = "1.2.0"  # keep in sync with include/lmux.h
 AUTO_UPDATE_INTERVAL: int = 86400  # seconds (24 h)
 
 _CONFIG_DIR = Path.home() / ".lmux"

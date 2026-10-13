@@ -39,7 +39,7 @@ jobs:
         run: |
           DATE=$(date +%Y%m%d)
           SHORT=$(echo $GITHUB_SHA | cut -c1-7)
-          echo "VERSION=0.1.0-nightly.${DATE}.${SHORT}" >> $GITHUB_OUTPUT
+          echo "VERSION=1.2.0-nightly.${DATE}.${SHORT}" >> $GITHUB_OUTPUT
 
       - name: Build release binaries
         run: node scripts/build-core.mjs && node scripts/build-cli.mjs

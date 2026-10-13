@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Dream-Pixels-Forge/lmux/releases/tag/v1.0.0-beta.1"><img src="https://img.shields.io/badge/release-v1.0.0--beta.1-blue" alt="Release"></a>
+  <a href="https://github.com/Dream-Pixels-Forge/lmux/releases/tag/v1.2.0"><img src="https://img.shields.io/badge/release-v1.2.0-blue" alt="Release"></a>
   <img src="https://img.shields.io/badge/tests-217%20passing-brightgreen" alt="Tests">
   <img src="https://img.shields.io/badge/core-C17-orange" alt="Core">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="License">

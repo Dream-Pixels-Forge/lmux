@@ -2,7 +2,7 @@
 
 **Date:** 2026-10-05 (evening update — memorius session)
 **Branch state:** `master` @ `db369af` (PR #41), clean, in sync with origin
-**Version:** 1.1.2
+**Version:** 1.2.0
 **Tests:** 314 integration (311 + 3 new) + 23 model + 8 osc + 12 config unit,
 fuzz 0 errors — all re-run fresh for the goal-met audits (gate PASS, 10/10).
 Sanitizer jobs run in CI only; not re-run locally this session.

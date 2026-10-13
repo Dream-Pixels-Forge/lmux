@@ -4,6 +4,8 @@
 
 | Version | Supported          |
 | ------- | ------------------ |
+| 1.2.x   | :white_check_mark: |
+| 1.0–1.1 | :x: (superseded — upgrade to 1.2.x) |
 | 0.1.x   | :white_check_mark: |
 | < 0.1   | :x:                |
 

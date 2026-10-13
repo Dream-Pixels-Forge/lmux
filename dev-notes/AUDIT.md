@@ -3,7 +3,7 @@
 **Date:** 2026-09-06
 **Phase:** 1 - Systematic Codebase Audit
 **Status:** Complete
-**Baseline:** lmux v1.0.0
+**Baseline:** lmux v1.2.0
 
 ---
 
