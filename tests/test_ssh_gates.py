@@ -41,5 +41,45 @@ class TestSshAdvancedHostKeyChecking(unittest.TestCase):
         )
 
 
+class TestSshpassNoArgvLeak(unittest.TestCase):
+    """ISS-0019: the password must never travel on the sshpass command
+    line (``-p`` leaks via /proc/PID/cmdline to every local user)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.src = (GUI / "ssh_client.py").read_text()
+        sys.path.insert(0, str(GUI))
+        import ssh_client as mod
+        cls.mod = mod
+        # sshpass is absent in CI — pin a fake path so the password
+        # branch of _build_base_cmd is exercised deterministically.
+        cls._saved = mod._SSHPASS_BIN
+        mod._SSHPASS_BIN = "/usr/bin/sshpass"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.mod._SSHPASS_BIN = cls._saved
+
+    def test_no_dash_p_password_in_source(self):
+        self.assertNotIn(
+            '"-p", password', self.src,
+            "sshpass -p exposes the password on the command line",
+        )
+
+    def test_password_never_in_built_argv(self):
+        client = self.mod.SSHClient()
+        host = self.mod.SSHHost(host="example.com", user="root")
+        cmd = client._build_base_cmd(host, password="s3cr3t-pw")
+        self.assertNotIn("s3cr3t-pw", cmd,
+                         f"password must not appear in argv: {cmd!r}")
+
+    def test_passwordless_build_unchanged(self):
+        client = self.mod.SSHClient()
+        host = self.mod.SSHHost(host="example.com", user="root")
+        cmd = client._build_base_cmd(host)
+        self.assertIn("-o", cmd)
+        self.assertIn("BatchMode=yes", cmd)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

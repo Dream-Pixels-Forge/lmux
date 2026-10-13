@@ -89,6 +89,10 @@ class SSHClient:
         else:
             cmd += ["-t"]
 
+        # ISS-0019: feed sshpass -e via the SSHPASS env var (never argv).
+        env = None
+        if password and _SSHPASS_BIN:
+            env = dict(os.environ, SSHPASS=password)
         # Start ControlMaster in background
         try:
             proc = subprocess.Popen(
@@ -96,11 +100,18 @@ class SSHClient:
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                env=env,
             )
         except FileNotFoundError as exc:
             raise ConnectionError(
                 f"SSH binary not found: {exc}"
             ) from exc
+        finally:
+            if env is not None:
+                # Wipe our copy promptly after spawn (the child already
+                # exec'd). Note: the caller's `password` str is immutable
+                # and cannot be scrubbed from here.
+                env["SSHPASS"] = ""
 
         # Give ControlMaster a moment to establish the socket
         time.sleep(0.6)
@@ -308,9 +319,11 @@ class SSHClient:
         # Auto-accept new host keys
         cmd += ["-o", "StrictHostKeyChecking=accept-new"]
 
-        # Password auth via sshpass if available
+        # ISS-0019: never sshpass -p (password leaks via /proc/PID/cmdline
+        # to every local user). -e reads it from the SSHPASS env var, which
+        # connect() supplies and wipes right after spawn.
         if password and _SSHPASS_BIN:
-            cmd = [_SSHPASS_BIN, "-p", password] + cmd
+            cmd = [_SSHPASS_BIN, "-e"] + cmd
 
         cmd.append(host.ssh_uri)
         return cmd
