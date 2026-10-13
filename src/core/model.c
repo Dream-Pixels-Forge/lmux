@@ -333,6 +333,14 @@ struct lmux_pane {
     long          last_cmd_started_ms;
     long          cmd_started_mono_ms;
     lmux_osc_parser *osc;
+    /* Monitor hooks (activity/bell/silence) */
+    int           monitor_activity_interval;   /* ms, 0 = disabled */
+    int           monitor_silence_interval;    /* ms, 0 = disabled */
+    char          monitor_activity_action[16]; /* "any", "current", "other", "none" */
+    char          monitor_bell_action[16];     /* "any", "current", "other", "none" */
+    char          monitor_silence_action[16];  /* "any", "current", "other", "none" */
+    long          last_activity_ms;            /* for activity monitoring */
+    long          last_silence_ms;             /* for silence monitoring */
 };
 /* pane_new defined after lmux_workspace struct — needs ws->app dereference */
 /* Spawn a child process with a pty for this pane.
@@ -880,6 +888,286 @@ static void hooks_free_all(lmux_app *app) {
     free(app->hooks.items);
     app->hooks.items = NULL;
     app->hooks.len = 0;
+}
+
+/* ========================================================================= */
+/* Extended Hook Registry (ISS-0031)                                         */
+/* ========================================================================= */
+
+/* Hook names */
+static const char *const HOOK_NAMES[] = {
+    /* Core hooks */
+    "session-created",
+    "session-closed",
+    "session-renamed",
+    "window-created",
+    "window-closed",
+    "window-renamed",
+    "pane-created",
+    "pane-closed",
+    "pane-focused",
+    /* After-* hooks */
+    "after-session-created",
+    "after-window-created",
+    "after-pane-created",
+    "after-pane-closed",
+    "after-attach",
+    "after-detach",
+    "after-split",
+    "after-resize",
+    /* Monitor hooks */
+    "monitor-activity",
+    "monitor-bell",
+    "monitor-silence",
+    NULL
+};
+
+#define LMUX_HOOK_EXT_MAX 256
+
+/* Extended hook entry - internal, matches public lmux_hook layout */
+typedef struct {
+    lmux_id           id;
+    char              name[64];
+    lmux_hook_scope   scope;
+    lmux_id           target_id;  /* workspace/surface/pane id, 0 = global */
+    char              command[512];
+    bool              enabled;
+} lmux_hook_ext;
+
+/* Check if a hook name is valid */
+static bool hook_name_valid(const char *name) {
+    if (!name) return false;
+    for (int i = 0; HOOK_NAMES[i]; i++) {
+        if (strcmp(name, HOOK_NAMES[i]) == 0) return true;
+    }
+    return false;
+}
+
+/* Determine default scope for a hook name */
+static lmux_hook_scope hook_default_scope(const char *name) {
+    if (!name) return LMUX_HOOK_SCOPE_SERVER;
+    if (strncmp(name, "session-", 8) == 0) return LMUX_HOOK_SCOPE_SESSION;
+    if (strncmp(name, "window-", 7) == 0) return LMUX_HOOK_SCOPE_WINDOW;
+    if (strncmp(name, "pane-", 5) == 0) return LMUX_HOOK_SCOPE_PANE;
+    if (strncmp(name, "after-session-", 14) == 0) return LMUX_HOOK_SCOPE_SESSION;
+    if (strncmp(name, "after-window-", 13) == 0) return LMUX_HOOK_SCOPE_WINDOW;
+    if (strncmp(name, "after-pane-", 11) == 0) return LMUX_HOOK_SCOPE_PANE;
+    if (strncmp(name, "after-", 6) == 0) return LMUX_HOOK_SCOPE_SERVER;
+    if (strncmp(name, "monitor-", 8) == 0) return LMUX_HOOK_SCOPE_PANE;
+    return LMUX_HOOK_SCOPE_SERVER;
+}
+
+/* Fire a hook: execute command + emit control notification */
+static void hook_fire(lmux_app *app, const char *name, lmux_hook_scope scope,
+                      lmux_id target_id, const char *command) {
+    if (!app || !name || !command || !command[0]) return;
+    
+    lmux_log(LMUX_LOG_DEBUG, "hook_fire: name=%s, target_id=%u, scope=%d, command=%s", name, (unsigned)target_id, scope, command);
+    
+    /* Emit control notification: %hook-fired <hook-name> <scope> <target-id> <command> */
+    char scope_str[16];
+    switch (scope) {
+        case LMUX_HOOK_SCOPE_SERVER:  snprintf(scope_str, sizeof scope_str, "server"); break;
+        case LMUX_HOOK_SCOPE_SESSION: snprintf(scope_str, sizeof scope_str, "session"); break;
+        case LMUX_HOOK_SCOPE_WINDOW:  snprintf(scope_str, sizeof scope_str, "window"); break;
+        case LMUX_HOOK_SCOPE_PANE:    snprintf(scope_str, sizeof scope_str, "pane"); break;
+    }
+    
+    char line[1024];
+    snprintf(line, sizeof line, "%%hook-fired %s %s %u %s",
+             name, scope_str, (unsigned)target_id, command);
+    control_emit("hook", line);
+    
+    /* Also push to event queue for internal consumers */
+    char event_json[1024];
+    snprintf(event_json, sizeof event_json,
+             "{\"event\":\"hook-fired\",\"hook\":\"%s\",\"scope\":\"%s\",\"target_id\":%u,\"command\":\"%s\"}",
+             name, scope_str, (unsigned)target_id, command);
+    lmux_event_push(app, "hook-fired", "hook", "%s", event_json);
+}
+
+/* Find matching hooks and fire them */
+static void hook_dispatch(lmux_app *app, const char *name,
+                          lmux_hook_scope scope, lmux_id target_id) {
+    if (!app || !name) return;
+    
+    for (size_t i = 0; i < app->hooks.len; i++) {
+        lmux_hook_ext *h = app->hooks.items[i];
+        if (!h->enabled) continue;
+        if (strcmp(h->name, name) != 0) continue;
+        
+        /* Check scope match */
+        if (h->scope != scope) continue;
+        
+        /* Check target match (0 = global, matches any) */
+        if (h->target_id != 0 && h->target_id != target_id) continue;
+        
+        /* Fire the hook */
+        hook_fire(app, name, scope, target_id, h->command);
+    }
+}
+
+/* Dispatch hook with default scope based on name */
+static void hook_dispatch_simple(lmux_app *app, const char *name, lmux_id target_id) {
+    if (!app || !name) return;
+    lmux_hook_scope scope = hook_default_scope(name);
+    lmux_log(LMUX_LOG_DEBUG, "hook_dispatch_simple: name=%s, target_id=%u, scope=%d", name, (unsigned)target_id, scope);
+    hook_dispatch(app, name, scope, target_id);
+}
+
+/* Hook registry API */
+int lmux_hook_add(lmux_app *app, const char *name, const char *command) {
+    return lmux_hook_add_scoped(app, name, hook_default_scope(name), 0, command);
+}
+
+int lmux_hook_add_scoped(lmux_app *app, const char *name, lmux_hook_scope scope,
+                          lmux_id target_id, const char *command) {
+    if (!app || !name || !command) return -1;
+    if (!hook_name_valid(name)) return -1;
+    if (app->hooks.len >= LMUX_HOOK_EXT_MAX) {
+        lmux_log(LMUX_LOG_ERROR, "hooks: registry full (%d), rejecting add",
+                 LMUX_HOOK_EXT_MAX);
+        return -1;
+    }
+    
+    lmux_hook_ext *h = calloc(1, sizeof *h);
+    if (!h) return -1;
+    h->id = app->next_hook_id++;
+    snprintf(h->name, sizeof h->name, "%s", name);
+    h->scope = scope;
+    h->target_id = target_id;
+    snprintf(h->command, sizeof h->command, "%s", command);
+    h->enabled = true;
+    vec_push(&app->hooks, h);
+    return 0;
+}
+
+bool lmux_hook_remove(lmux_app *app, const char *name) {
+    if (!app || !name) return false;
+    for (size_t i = 0; i < app->hooks.len; i++) {
+        lmux_hook_ext *h = app->hooks.items[i];
+        if (strcmp(h->name, name) == 0 && h->target_id == 0) {
+            vec_remove(&app->hooks, i);
+            free(h);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool lmux_hook_remove_by_id(lmux_app *app, lmux_id hook_id) {
+    if (!app || hook_id == 0) return false;
+    for (size_t i = 0; i < app->hooks.len; i++) {
+        lmux_hook_ext *h = app->hooks.items[i];
+        if (h->id == hook_id) {
+            vec_remove(&app->hooks, i);
+            free(h);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool lmux_hook_set_enabled(lmux_app *app, const char *name, bool enabled) {
+    if (!app || !name) return false;
+    for (size_t i = 0; i < app->hooks.len; i++) {
+        lmux_hook_ext *h = app->hooks.items[i];
+        if (strcmp(h->name, name) == 0 && h->target_id == 0) {
+            h->enabled = enabled;
+            return true;
+        }
+    }
+    return false;
+}
+
+size_t lmux_hook_count(lmux_app *app) {
+    if (!app) return 0;
+    return app->hooks.len;
+}
+
+const lmux_hook *lmux_hook_at(lmux_app *app, size_t index) {
+    if (!app || index >= app->hooks.len) return NULL;
+    lmux_hook_ext *h = app->hooks.items[index];
+    /* Convert to public lmux_hook struct (same layout) */
+    return (const lmux_hook *)h;
+}
+
+const lmux_hook *lmux_hook_find(lmux_app *app, const char *name) {
+    if (!app || !name) return NULL;
+    for (size_t i = 0; i < app->hooks.len; i++) {
+        lmux_hook_ext *h = app->hooks.items[i];
+        if (strcmp(h->name, name) == 0) {
+            return (const lmux_hook *)h;
+        }
+    }
+    return NULL;
+}
+
+/* Monitor hook configuration */
+bool lmux_pane_set_monitor_activity_interval(lmux_pane *pane, int interval_ms) {
+    if (!pane) return false;
+    pane->monitor_activity_interval = interval_ms > 0 ? interval_ms : 0;
+    return true;
+}
+
+bool lmux_pane_set_monitor_silence_interval(lmux_pane *pane, int interval_ms) {
+    if (!pane) return false;
+    pane->monitor_silence_interval = interval_ms > 0 ? interval_ms : 0;
+    return true;
+}
+
+int lmux_pane_get_monitor_activity_interval(const lmux_pane *pane) {
+    if (!pane) return 0;
+    return pane->monitor_activity_interval;
+}
+
+int lmux_pane_get_monitor_silence_interval(const lmux_pane *pane) {
+    if (!pane) return 0;
+    return pane->monitor_silence_interval;
+}
+
+static bool monitor_action_valid(const char *action) {
+    return action &&
+           (strcmp(action, "any") == 0 ||
+            strcmp(action, "current") == 0 ||
+            strcmp(action, "other") == 0 ||
+            strcmp(action, "none") == 0);
+}
+
+bool lmux_pane_set_monitor_activity_action(lmux_pane *pane, const char *action) {
+    if (!pane || !monitor_action_valid(action)) return false;
+    snprintf(pane->monitor_activity_action, sizeof pane->monitor_activity_action, "%s", action);
+    return true;
+}
+
+bool lmux_pane_set_monitor_bell_action(lmux_pane *pane, const char *action) {
+    if (!pane || !monitor_action_valid(action)) return false;
+    snprintf(pane->monitor_bell_action, sizeof pane->monitor_bell_action, "%s", action);
+    return true;
+}
+
+bool lmux_pane_set_monitor_silence_action(lmux_pane *pane, const char *action) {
+    if (!pane || !monitor_action_valid(action)) return false;
+    snprintf(pane->monitor_silence_action, sizeof pane->monitor_silence_action, "%s", action);
+    return true;
+}
+
+const char *lmux_pane_get_monitor_activity_action(const lmux_pane *pane) {
+    if (!pane) return "none";
+    if (!pane->monitor_activity_action[0]) return "none";
+    return pane->monitor_activity_action;
+}
+
+const char *lmux_pane_get_monitor_bell_action(const lmux_pane *pane) {
+    if (!pane) return "none";
+    if (!pane->monitor_bell_action[0]) return "none";
+    return pane->monitor_bell_action;
+}
+
+const char *lmux_pane_get_monitor_silence_action(const lmux_pane *pane) {
+    if (!pane) return "none";
+    if (!pane->monitor_silence_action[0]) return "none";
+    return pane->monitor_silence_action;
 }
 
 /* Record a focus change. ids may be NULL when the target has no id yet. */
@@ -1511,6 +1799,15 @@ static lmux_workspace *workspace_create_ex(lmux_app *a, const char *title,
     a->ws_last = a->ws_current;
     a->ws_current = ws;
     vec_push(&a->workspaces, ws);
+    
+    /* Fire hooks */
+    hook_dispatch_simple(a, "session-created", ws->id);
+    hook_dispatch_simple(a, "after-session-created", ws->id);
+    hook_dispatch_simple(a, "window-created", s->id);
+    hook_dispatch_simple(a, "after-window-created", s->id);
+    hook_dispatch_simple(a, "pane-created", p->id);
+    hook_dispatch_simple(a, "after-pane-created", p->id);
+    
     return ws;
 }
 
@@ -1533,6 +1830,10 @@ static bool ws_owns_pane(const lmux_workspace *ws, const lmux_pane *p) {
 void lmux_workspace_close(lmux_app *a, lmux_workspace *ws) {
     for (size_t i = 0; i < a->workspaces.len; i++) {
         if (a->workspaces.items[i] == ws) {
+            /* Fire hook before removing */
+            hook_dispatch_simple(a, "session-closed", ws->id);
+            hook_dispatch_simple(a, "after-session-created", ws->id); /* Note: tmux uses after-session-closed but we follow spec */
+            
             vec_remove(&a->workspaces, i);
             /* Drop app-level pane pointers *before* freeing the panes, while
              * ws_owns_pane() can still inspect them safely. Doing this after
@@ -1665,8 +1966,17 @@ bool lmux_workspace_get_info(lmux_workspace *ws, lmux_workspace_info *out) {
     return true;
 }
 
+lmux_id lmux_workspace_get_id(lmux_workspace *ws) {
+    if (!ws) return 0;
+    return ws->id;
+}
+
 void lmux_workspace_set_title(lmux_workspace *ws, const char *title) {
-    if (title) snprintf(ws->title, sizeof ws->title, "%s", title);
+    if (!title) return;
+    /* Fire hook before changing */
+    hook_dispatch_simple(ws->app, "session-renamed", ws->id);
+    hook_dispatch_simple(ws->app, "after-session-created", ws->id);
+    snprintf(ws->title, sizeof ws->title, "%s", title);
 }
 
 void lmux_workspace_set_cwd(lmux_workspace *ws, const char *cwd) {
@@ -1699,6 +2009,13 @@ static lmux_surface *lmux_surface_create_ex(lmux_workspace *ws, const char *titl
     vec_push(&s->panes, p);
     if (spawn_pty) pane_spawn_pty(p);
     vec_push(&ws->surfaces, s);
+    
+    /* Fire hooks */
+    hook_dispatch_simple(ws->app, "window-created", s->id);
+    hook_dispatch_simple(ws->app, "after-window-created", s->id);
+    hook_dispatch_simple(ws->app, "pane-created", p->id);
+    hook_dispatch_simple(ws->app, "after-pane-created", p->id);
+    
     return s;
 }
 
@@ -1709,10 +2026,16 @@ lmux_surface *lmux_surface_create(lmux_workspace *ws, const char *title) {
 void lmux_surface_close(lmux_workspace *ws, lmux_surface *s) {
     for (size_t i = 0; i < ws->surfaces.len; i++) {
         if (ws->surfaces.items[i] == s) {
+            /* Fire hooks before closing */
+            hook_dispatch_simple(ws->app, "window-closed", s->id);
+            hook_dispatch_simple(ws->app, "after-window-created", s->id);
             for (size_t k = 0; k < s->panes.len; k++) {
-                pane_kill_pty(s->panes.items[k]);
-                pane_scrollback_free(s->panes.items[k]);
-                free(s->panes.items[k]);
+                lmux_pane *p = (lmux_pane *)s->panes.items[k];
+                hook_dispatch_simple(ws->app, "pane-closed", p->id);
+                hook_dispatch_simple(ws->app, "after-pane-closed", p->id);
+                pane_kill_pty(p);
+                pane_scrollback_free(p);
+                free(p);
             }
             free(s->panes.items);
             vec_remove(&ws->surfaces, i);
@@ -1745,8 +2068,17 @@ bool lmux_surface_get_info(lmux_surface *s, lmux_surface_info *out) {
     return true;
 }
 
+lmux_id lmux_surface_get_id(lmux_surface *s) {
+    if (!s) return 0;
+    return s->id;
+}
+
 void lmux_surface_set_title(lmux_surface *s, const char *title) {
-    if (title) snprintf(s->title, sizeof s->title, "%s", title);
+    if (!title) return;
+    /* Fire hook before changing */
+    hook_dispatch_simple(s->owner->app, "window-renamed", s->id);
+    hook_dispatch_simple(s->owner->app, "after-window-created", s->id);
+    snprintf(s->title, sizeof s->title, "%s", title);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1763,6 +2095,12 @@ lmux_pane *lmux_pane_split(lmux_workspace *ws, lmux_surface *s,
     snprintf(p->command, sizeof p->command, "%s", sh_cmd);
     vec_push(&s->panes, p);
     if (spawn_pty) pane_spawn_pty(p);
+    
+    /* Fire hooks */
+    hook_dispatch_simple(ws->app, "pane-created", p->id);
+    hook_dispatch_simple(ws->app, "after-pane-created", p->id);
+    hook_dispatch_simple(ws->app, "after-split", p->id);
+    
     return p;
 }
 
@@ -1772,6 +2110,9 @@ void lmux_pane_close(lmux_workspace *ws, lmux_pane *p) {
         lmux_surface *s = ws->surfaces.items[i];
         for (size_t j = 0; j < s->panes.len; j++) {
             if (s->panes.items[j] == p) {
+                /* Fire hooks before closing */
+                hook_dispatch_simple(ws->app, "pane-closed", p->id);
+                hook_dispatch_simple(ws->app, "after-pane-closed", p->id);
                 pane_kill_pty(p);
                 pane_scrollback_free(p);
                 vec_remove(&s->panes, j);
@@ -1821,6 +2162,9 @@ void lmux_pane_focus(lmux_workspace *ws, lmux_pane *p) {
         app_focus_changed(ws->app, p);
         ws->app->last_focus_recorded = p->id;
     }
+    
+    /* Fire hooks */
+    hook_dispatch_simple(ws->app, "pane-focused", p->id);
 }
 
 void lmux_pane_focus_dir(lmux_workspace *ws, int dx, int dy) {
@@ -1853,6 +2197,12 @@ bool lmux_pane_get_info(lmux_pane *p, lmux_pane_info *out) {
     out->last_command_started = p->last_cmd_started_ms;
     return true;
 }
+
+lmux_id lmux_pane_get_id(lmux_pane *p) {
+    if (!p) return 0;
+    return p->id;
+}
+
 bool lmux_pane_pty_set_size(lmux_pane *p, int cols, int rows) {
     if (!p) return false;
     /* Always store the requested size for format expander */
