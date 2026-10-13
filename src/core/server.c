@@ -35,6 +35,7 @@
 #include <sys/stat.h>
 #include <poll.h>
 #include <pwd.h>
+#include <time.h>
 
 /* Maximum request body we accept (including newline). */
 #define LMUX_MAX_REQUEST 65536
@@ -202,6 +203,170 @@ static int verify_socket_credentials(int client_fd, const char *socket_path) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Control mode (ISS-0029, tmux -C compatible subset)                 */
+/*                                                                     */
+/* When the first request on a connection is control.attach, the      */
+/* connection stays open: every command line is dispatched through    */
+/* lmux_dispatch_json() (the single dispatcher) and framed as        */
+/* %begin/payload/%end (or %error on failure). Async notifications    */
+/* from lmux_control_notify() stream between blocks. One-shot JSON    */
+/* clients are untouched (byte-identical path below).                 */
+/* ------------------------------------------------------------------ */
+
+/* Extract the "cmd" value from a JSON request line. Returns true on
+ * success with the command name in `out`. */
+static bool control_extract_cmd(const char *line, char *out, size_t cap) {
+    const char *k = strstr(line, "\"cmd\"");
+    if (!k) return false;
+    k += 5;
+    while (*k == ' ' || *k == '\t') k++;
+    if (*k != ':') return false;
+    k++;
+    while (*k == ' ' || *k == '\t') k++;
+    if (*k != '"') return false;
+    k++;
+    size_t n = 0;
+    while (*k && *k != '"' && n + 1 < cap) out[n++] = *k++;
+    out[n] = 0;
+    return n > 0;
+}
+
+static bool control_is_attach(const char *line) {
+    char cmd[128] = {0};
+    return control_extract_cmd(line, cmd, sizeof cmd) &&
+           strcmp(cmd, "control.attach") == 0;
+}
+
+/* Best-effort write of a line + newline. Returns 0 on success, -1 when
+ * the client is gone. MSG_NOSIGNAL: the daemon ignores SIGPIPE, but
+ * tick-mode embedders may not. */
+static int control_write_line(int fd, const char *line) {
+    size_t len = strlen(line);
+    ssize_t w = send(fd, line, len, MSG_NOSIGNAL);
+    if (w != (ssize_t)len) return -1;
+    w = send(fd, "\n", 1, MSG_NOSIGNAL);
+    return w == 1 ? 0 : -1;
+}
+
+/* Flush queued async lines to the client. Returns 0 while alive. */
+static int control_flush_pending(int slot, int fd) {
+    char *lines[64];
+    for (;;) {
+        size_t n = lmux_control_pop_pending(slot, lines, 64);
+        if (n == 0) return 0;
+        for (size_t i = 0; i < n; i++) {
+            int rc = control_write_line(fd, lines[i]);
+            free(lines[i]);
+            if (rc != 0) {
+                for (size_t k = i + 1; k < n; k++) free(lines[k]);
+                return -1;
+            }
+        }
+    }
+}
+
+/* Read one newline-terminated line, flushing async notifications while
+ * idle. Returns length (>0) on success, 0 on timeout-budget exhaustion
+ * without data (caller loops), -1 on disconnect/error. */
+static ssize_t control_read_line(int slot, int fd, char *buf, size_t cap) {
+    size_t total = 0;
+    for (;;) {
+        struct pollfd pfd = {.fd = fd, .events = POLLIN, .revents = 0};
+        int pr = poll(&pfd, 1, 100);
+        if (pr < 0) return -1;
+        if (pr == 0) {
+            /* Idle: stream async notifications while waiting. */
+            if (control_flush_pending(slot, fd) != 0) return -1;
+            continue;
+        }
+        if (!(pfd.revents & POLLIN)) {
+            if (pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) return -1;
+            continue;
+        }
+        char c;
+        ssize_t r = recv(fd, &c, 1, 0);
+        if (r <= 0) return -1;
+        if (c == '\n') {
+            while (total > 0 && (buf[total - 1] == '\r')) total--;
+            buf[total] = 0;
+            return (ssize_t)total;
+        }
+        if (total + 1 < cap) buf[total++] = c;
+        /* Over-long lines are truncated (request cap is 64KB; the line
+         * buffer here is the same size, so truncation only clips the
+         * excess before dispatch rejects it). */
+    }
+}
+
+/* Handle one framed command inside a control session. */
+static int control_run_command(lmux_app *app, int slot, int fd,
+                               const char *line, unsigned seq) {
+    char guard[64];
+    long epoch = (long)time(NULL);
+
+    lmux_control_begin_block(slot);
+    char *response = lmux_dispatch_json(app, line);
+    lmux_metrics_inc_requests(app);
+
+    const char *kind = (response && strstr(response, "\"ok\":false"))
+                       ? "error" : "end";
+    lmux_control_format_guard(guard, sizeof guard, "begin", epoch, seq);
+    int rc = control_write_line(fd, guard);
+    if (rc == 0 && response) rc = control_write_line(fd, response);
+    if (rc == 0) {
+        lmux_control_format_guard(guard, sizeof guard, kind, epoch, seq);
+        rc = control_write_line(fd, guard);
+    }
+    free(response);
+    lmux_control_end_block(slot);
+    if (rc != 0) return -1;
+    /* Deferred notifications (arrived mid-block) flush right after %end,
+     * mirroring tmux's guard_depth flush. */
+    return control_flush_pending(slot, fd);
+}
+
+/* Persistent control session. `first_line` is the control.attach request
+ * already read by serve_client(). Closes fd on return. Runs on the
+ * connection's thread (threaded mode). In tick mode this blocks the host
+ * loop while attached — the headless daemon (threaded) is the supported
+ * control-mode host for v1. */
+static void serve_control_client(lmux_app *app, int fd,
+                                 const char *first_line) {
+    int slot = lmux_control_register();
+    if (slot < 0) {
+        const char *err = "{\"ok\":false,\"error\":{\"code\":\"busy\",\"message\":\"no control slots\"}}";
+        ssize_t _w = send(fd, err, strlen(err), MSG_NOSIGNAL);
+        (void)_w;
+        close(fd);
+        return;
+    }
+    lmux_control_set_thread_slot(slot);
+
+    char line[LMUX_MAX_REQUEST];
+    unsigned seq = 0;
+
+    seq++;
+    if (control_run_command(app, slot, fd, first_line, seq) != 0)
+        goto out;
+    for (;;) {
+        ssize_t n = control_read_line(slot, fd, line, sizeof line);
+        if (n < 0) break;   /* disconnect */
+        if (n == 0) continue; /* blank line: ignore */
+        /* Skip leading whitespace; ignore empty lines. */
+        const char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) continue;
+        seq++;
+        if (control_run_command(app, slot, fd, p, seq) != 0) break;
+    }
+
+out:
+    lmux_control_set_thread_slot(-1);
+    lmux_control_unregister(slot);
+    close(fd);
+}
+
+/* ------------------------------------------------------------------ */
 /* Internal: accept and serve one client connection.                   */
 /* ------------------------------------------------------------------ */
 static void serve_client(lmux_app *app, int client_fd) {
@@ -266,6 +431,12 @@ static void serve_client(lmux_app *app, int client_fd) {
     }
 
     /* Dispatch. */
+    /* ISS-0029: control.attach upgrades this connection to a persistent,
+     * %framed control session. serve_control_client() owns fd from here. */
+    if (control_is_attach(p)) {
+        serve_control_client(app, client_fd, p);
+        return;
+    }
     char *response = lmux_dispatch_json(app, buf);
     lmux_metrics_inc_requests(app);
 

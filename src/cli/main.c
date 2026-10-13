@@ -500,6 +500,37 @@ static char *build_json_command(int argc, char **argv) {
         }
     }
 
+    /* refresh-client [-B name:what:format | -B name] (ISS-0029 control subscriptions) */
+    if (strcmp(cmd, "refresh-client") == 0 || strcmp(cmd, "refresh_client") == 0) {
+        const char *spec = NULL;
+        for (int ri = 1; ri < argc; ri++) {
+            if (strcmp(argv[ri], "-B") == 0 && ri + 1 < argc) {
+                spec = argv[ri + 1];
+                break;
+            }
+        }
+        if (spec) {
+            if (strchr(spec, ':')) {
+                args_len = snprintf(args_buf, sizeof args_buf,
+                    "\"subscription\":\"%s\"", (json_escape(spec, _esc, sizeof _esc), _esc));
+            } else {
+                args_len = snprintf(args_buf, sizeof args_buf,
+                    "\"unsubscribe\":\"%s\"", (json_escape(spec, _esc, sizeof _esc), _esc));
+            }
+        }
+        /* bare refresh-client: args stay empty (status ack from daemon) */
+    }
+
+    /* control.attach / attach-session → control session entry (ISS-0029).
+     * The daemon upgrades the connection to framed control mode when the
+     * first request is control.attach; `lmux -C attach-session` (tmux form)
+     * is the interactive entry point. */
+    if (strcmp(cmd, "control.attach") == 0 || strcmp(cmd, "control_attach") == 0 ||
+        strcmp(cmd, "attach-session") == 0 || strcmp(cmd, "attach_session") == 0) {
+        snprintf(cmd_normalized, sizeof cmd_normalized, "control.attach");
+        cmd = cmd_normalized;
+    }
+
     /* move-surface <id> <target_ws> [source_ws] */
     else if (strcmp(cmd, "move-surface") == 0 || strcmp(cmd, "move_surface") == 0) {
         if (argc >= 3) {
@@ -1054,6 +1085,182 @@ static char *build_json_command(int argc, char **argv) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Control client (ISS-0029, tmux -C equivalent)                      */
+/*                                                                     */
+/* `lmux -C attach-session` opens a persistent control session: stdin */
+/* lines go to the daemon, daemon lines (%) come back to stdout raw.  */
+/* JSON lines are sent as-is; anything else is tokenized (basic      */
+/* single/double-quote handling) and translated via                  */
+/* build_json_command(), so tmux-style `refresh-client -B ...` works. */
+/* `lmux -C <command> [args]` runs one command framed and exits.      */
+/* ------------------------------------------------------------------ */
+
+/* Split a line into argv tokens, honoring 'single' and "double" quotes
+ * (quotes are stripped, no escapes). Returns argc; argv entries point
+ * into `buf` (modified in place). */
+static int control_tokenize(char *buf, char **argv, int max) {
+    int argc = 0;
+    char *p = buf;
+    while (*p && argc < max) {
+        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+        if (!*p) break;
+        char quote = 0;
+        if (*p == '\'' || *p == '"') { quote = *p++; }
+        argv[argc++] = p;
+        if (quote) {
+            char *dst = p;
+            while (*p && *p != quote) *dst++ = *p++;
+            *dst = 0;
+            if (*p == quote) p++;
+        } else {
+            while (*p && *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n') p++;
+            if (*p) *p++ = 0;
+        }
+    }
+    return argc;
+}
+
+/* Read daemon lines and print them until the closing %end/%error of the
+ * currently open %begin block. Returns 0 on clean close, -1 on EOF. */
+static int control_read_block(int fd) {
+    char buf[65536];
+    size_t n = 0;
+    bool opened = false;
+    for (;;) {
+        struct pollfd pfd = {.fd = fd, .events = POLLIN};
+        if (poll(&pfd, 1, 30000) <= 0) return -1;
+        char tmp[8192];
+        ssize_t r = read(fd, tmp, sizeof tmp);
+        if (r <= 0) return -1;
+        for (ssize_t i = 0; i < r; i++) {
+            if (n + 2 < sizeof buf) buf[n++] = tmp[i];
+            if (tmp[i] == '\n') {
+                buf[n] = 0;
+                fputs(buf, stdout);
+                fflush(stdout);
+                if (strncmp(buf, "%begin", 6) == 0) opened = true;
+                if (opened && (strncmp(buf, "%end", 4) == 0 ||
+                               strncmp(buf, "%error", 6) == 0))
+                    return 0;
+                n = 0;
+            }
+        }
+    }
+}
+
+static int run_control_client(const char *socket_path, int argc, char **argv) {
+    bool interactive = (argc < 1);
+    if (!interactive && argc == 1 &&
+        (strcmp(argv[0], "attach-session") == 0 ||
+         strcmp(argv[0], "attach_session") == 0 ||
+         strcmp(argv[0], "control.attach") == 0 ||
+         strcmp(argv[0], "control_attach") == 0)) {
+        interactive = true;
+    }
+
+    int fd = connect_socket(socket_path);
+    if (fd < 0) {
+        fprintf(stderr, "lmux: is the daemon running? (socket: %s)\n", socket_path);
+        return 1;
+    }
+
+    const char *attach = "{\"cmd\":\"control.attach\",\"args\":{}}\n";
+    if (write(fd, attach, strlen(attach)) != (ssize_t)strlen(attach)) {
+        fprintf(stderr, "lmux: failed to attach control session\n");
+        close(fd);
+        return 1;
+    }
+
+    if (!interactive) {
+        /* One-shot framed command: consume the attach ack, run the
+         * command, print its %block, exit. */
+        if (control_read_block(fd) != 0) { close(fd); return 1; }
+        char *json = build_json_command(argc, argv);
+        if (!json) { close(fd); return 1; }
+        size_t len = strlen(json);
+        bool need_nl = (len == 0 || json[len - 1] != '\n');
+        if (write(fd, json, len) != (ssize_t)len ||
+            (need_nl && write(fd, "\n", 1) != 1)) {
+            fprintf(stderr, "lmux: write failed\n");
+            free(json);
+            close(fd);
+            return 1;
+        }
+        free(json);
+        int rc = control_read_block(fd);
+        close(fd);
+        return rc == 0 ? 0 : 1;
+    }
+
+    /* Interactive: multiplex stdin -> daemon, daemon -> stdout. */
+    if (control_read_block(fd) != 0) {
+        fprintf(stderr, "lmux: control attach failed\n");
+        close(fd);
+        return 1;
+    }
+    char inbuf[65536];
+    size_t inlen = 0;
+    bool stdin_eof = false;
+    for (;;) {
+        struct pollfd pfds[2];
+        pfds[0].fd = stdin_eof ? -1 : STDIN_FILENO;
+        pfds[0].events = POLLIN;
+        pfds[1].fd = fd;
+        pfds[1].events = POLLIN;
+        int pr = poll(pfds, 2, 250);
+        if (pr < 0) break;
+        if (!stdin_eof && (pfds[0].revents & POLLIN)) {
+            char tmp[8192];
+            ssize_t r = read(STDIN_FILENO, tmp, sizeof tmp);
+            if (r <= 0) {
+                stdin_eof = true;
+                /* qEOF: leave the session; the daemon cleans up. */
+                break;
+            }
+            for (ssize_t i = 0; i < r; i++) {
+                if (inlen + 2 < sizeof inbuf) inbuf[inlen++] = tmp[i];
+                if (tmp[i] == '\n') {
+                    inbuf[inlen] = 0;
+                    char *line = inbuf;
+                    while (*line == ' ' || *line == '\t') line++;
+                    if (*line && *line != '\n') {
+                        if (*line == '{') {
+                            size_t wl = strlen(line);
+                            if (write(fd, line, wl) != (ssize_t)wl) goto done;
+                        } else {
+                            char *targv[64];
+                            int targc = control_tokenize(line, targv, 64);
+                            if (targc > 0) {
+                                char *json = build_json_command(targc, targv);
+                                if (json) {
+                                    size_t jl = strlen(json);
+                                    bool ok = (write(fd, json, jl) == (ssize_t)jl) &&
+                                              (write(fd, "\n", 1) == 1);
+                                    free(json);
+                                    if (!ok) goto done;
+                                }
+                            }
+                        }
+                    }
+                    inlen = 0;
+                }
+            }
+        }
+        if (pfds[1].revents & POLLIN) {
+            char tmp[8192];
+            ssize_t r = read(fd, tmp, sizeof tmp);
+            if (r <= 0) break;
+            if (fwrite(tmp, 1, (size_t)r, stdout) != (size_t)r) break;
+            fflush(stdout);
+        }
+        if (pfds[1].revents & (POLLHUP | POLLERR | POLLNVAL)) break;
+    }
+done:
+    close(fd);
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /* Pretty-print JSON response                                           */
 /* ------------------------------------------------------------------ */
 
@@ -1349,6 +1556,8 @@ static void print_usage(void) {
     printf("  lmux <command> [args...]          Run a command (connects to lmux socket)\n");
     printf("  lmux --socket <path> <cmd> [args] Use specific socket path\n");
     printf("  lmux --json <cmd> [args]          Raw JSON output\n");
+    printf("  lmux -C attach-session            Open a control session (tmux -C equivalent)\n");
+    printf("  lmux -C <command> [args]          Run one command with %%begin/%%end framing\n");
     printf("  lmux daemon                       Start headless lmux daemon\n");
     printf("  lmux help                         Show this help\n");
     printf("  lmux version                      Show version\n\n");
@@ -1433,7 +1642,9 @@ static void print_usage(void) {
     printf("  health.live                        Check if daemon is alive\n");
     printf("  health.ready                       Check if daemon is ready\n");
     printf("  metrics                            Show server metrics\n");
-    printf("  logs [level] [--follow] [--limit N]  Show recent logs (level: debug|info|warn|error)\n\n");
+    printf("  logs [level] [--follow] [--limit N]  Show recent logs (level: debug|info|warn|error)\n");
+    printf("  control.attach                     Enter control mode (framed; use with -C)\n");
+    printf("  refresh-client [-B name:what:format] Subscribe/unsubscribe control notifications\n\n");
     printf("Tmux compatibility:\n");
     printf("  lmux tmux new-session [-s name]    Create a new workspace\n");
     printf("  lmux tmux kill-session [-t name]   Close a workspace\n");
@@ -1463,6 +1674,7 @@ int main(int argc, char **argv) {
     /* Default socket path. */
     const char *socket_path = NULL;
     bool raw_json = false;
+    bool control_mode = false;
 
     /* Parse global flags. */
     int i = 1;
@@ -1471,6 +1683,8 @@ int main(int argc, char **argv) {
             socket_path = argv[++i];
         } else if (strcmp(argv[i], "--json") == 0) {
             raw_json = true;
+        } else if (strcmp(argv[i], "-C") == 0) {
+            control_mode = true;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             print_usage();
             return 0;
@@ -1500,6 +1714,11 @@ int main(int argc, char **argv) {
     /* Remaining args = command. */
     argc -= i;
     argv += i;
+
+    /* Control mode (tmux -C equivalent) handles its own dispatch. */
+    if (control_mode) {
+        return run_control_client(socket_path, argc, argv);
+    }
 
     if (argc < 1) {
         /* Check if lmux daemon is running by trying ping. */

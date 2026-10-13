@@ -1958,9 +1958,17 @@ class TestAdvertisedCommandsAreDispatchable(unittest.TestCase):
                 # commands that are perfectly reachable.
                 wire = name.replace("-", "_")
                 r = client.send(wire)
-                if not r.get("ok") and r.get("error", {}).get(
-                        "code") == "unknown_command":
+                err = r.get("error")
+                if (not r.get("ok") and isinstance(err, dict)
+                        and err.get("code") == "unknown_command"):
                     missing.append(name)
+                # ISS-0029: control.attach is served by the server's control
+                # session (framed %begin/%end, stays open), so the one-shot
+                # LmuxClient cannot consume its reply. Treat an empty or
+                # %-framed reply as dispatched, not unknown.
+                elif r.get("error") == "empty response" or \
+                        isinstance(r.get("error"), str) and "%begin" in r["error"]:
+                    pass
             self.assertEqual(
                 missing, [],
                 f"{len(missing)} command(s) advertised in --help are not "

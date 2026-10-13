@@ -2718,6 +2718,33 @@ static unsigned hash_string(const char *s) {
     return h;
 }
 
+/* Flatten a string to a single control-protocol line fragment: CR/LF/TAB
+ * become spaces, other C0 controls are dropped, output is truncated.
+ * Control notifications are line-delimited, so a raw newline in a title
+ * or pane echo would split/smuggle frames (same class as ISS-0025). */
+static void control_sanitize(char *out, size_t cap, const char *in) {
+    if (!out || cap == 0) return;
+    if (!in) { out[0] = 0; return; }
+    size_t j = 0;
+    for (const char *p = in; *p && j + 1 < cap; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c == '\n' || c == '\r' || c == '\t') {
+            out[j++] = ' ';
+        } else if (c < 0x20) {
+            continue;
+        } else {
+            out[j++] = (char)c;
+        }
+    }
+    out[j] = 0;
+}
+
+/* Emit one pre-formatted control notification (ISS-0029). No-op when no
+ * control client is attached; never blocks; safe under the dispatch lock. */
+static void control_emit(const char *cls, const char *line) {
+    lmux_control_notify(cls, line);
+}
+
 /* Persist config to disk after a mutation. Workspace-group commands used to
  * mutate cfg->workspace_groups in memory only and never called
  * lmux_config_save, so every group was silently lost on daemon exit. */
@@ -2989,6 +3016,13 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                 "{\"ok\":true,\"result\":{\"id\":%u,\"title\":\"%s\"}}",
                 ws->id, JESC(ws->title));
             lmux_event_push(app, "workspace.created", "workspace", "\"id\":%u,\"title\":\"%s\"", ws->id, ws->title);
+            /* ISS-0029: control fan-out (framing layer only, no dispatch). */
+            {
+                char _ct[256], _cl[320];
+                control_sanitize(_ct, sizeof _ct, ws->title);
+                snprintf(_cl, sizeof _cl, "%%session-changed %u %s", ws->id, _ct);
+                control_emit("session", _cl);
+            }
         } else {
             written = snprintf(result, result_cap,
                 "{\"ok\":false,\"error\":{\"code\":\"create_failed\",\"message\":\"failed to create workspace\"}}");
@@ -3026,6 +3060,12 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             lmux_event_push(app, "workspace.closed", "workspace", "\"id\":%u", wid);
                 lmux_workspace_close(app, ws);
                 written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+                /* ISS-0029: control fan-out. */
+                {
+                    char _cl[128];
+                    snprintf(_cl, sizeof _cl, "%%session-changed %u closed", wid);
+                    control_emit("session", _cl);
+                }
             } else {
                 written = snprintf(result, result_cap,
                     "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"workspace not found\"}}");
@@ -3052,6 +3092,13 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                 app->ws_current = ws;
                 ws->focused = true;
                 written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+                /* ISS-0029: control fan-out. */
+                {
+                    char _ct[256], _cl[320];
+                    control_sanitize(_ct, sizeof _ct, ws->title);
+                    snprintf(_cl, sizeof _cl, "%%session-changed %u %s", ws->id, _ct);
+                    control_emit("session", _cl);
+                }
             } else {
                 written = snprintf(result, result_cap,
                     "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"workspace not found\"}}");
@@ -3092,6 +3139,13 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             if (ws) {
                 lmux_workspace_set_title(ws, title);
                 written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+                /* ISS-0029: control fan-out. */
+                {
+                    char _ct[256], _cl[320];
+                    control_sanitize(_ct, sizeof _ct, title);
+                    snprintf(_cl, sizeof _cl, "%%session-changed %u %s", wid, _ct);
+                    control_emit("session", _cl);
+                }
             } else {
                 written = snprintf(result, result_cap,
                     "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"workspace not found\"}}");
@@ -3112,9 +3166,21 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                                       : lmux_workspace_focused(app);
         if (ws) {
             lmux_surface *s = lmux_surface_create(ws, title[0] ? title : NULL);
-            written = snprintf(result, result_cap,
-                "{\"ok\":true,\"result\":{\"id\":%u,\"title\":\"%s\"}}",
-                s->id, JESC(s->title));
+            if (s) {
+                written = snprintf(result, result_cap,
+                    "{\"ok\":true,\"result\":{\"id\":%u,\"title\":\"%s\"}}",
+                    s->id, JESC(s->title));
+                /* ISS-0029: a new surface changes the layout. */
+                {
+                    char _cl[128];
+                    snprintf(_cl, sizeof _cl, "%%layout-change %u %zu",
+                             s->id, s->panes.len);
+                    control_emit("layout", _cl);
+                }
+            } else {
+                written = snprintf(result, result_cap,
+                    "{\"ok\":false,\"error\":{\"code\":\"create_failed\",\"message\":\"failed to create surface\"}}");
+            }
         } else {
             written = snprintf(result, result_cap,
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"workspace not found\"}}");
@@ -3154,21 +3220,45 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         json_extract_string(args_json, "id", s_id, sizeof s_id);
         lmux_workspace *ws = ws_id[0] ? lmux_workspace_by_id(app, (lmux_id)atol(ws_id))
                                       : lmux_workspace_focused(app);
-        if (ws && s_id[0]) {
+        if (!ws) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no workspaces\"}}");
+            goto done;
+        }
+        if (s_id[0]) {
             lmux_id sid = (lmux_id)atol(s_id);
             for (size_t i = 0; i < ws->surfaces.len; i++) {
                 lmux_surface *s = ws->surfaces.items[i];
                 if (s->id == sid) {
                     lmux_surface_close(ws, s);
                     written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+                    /* ISS-0029: control fan-out. */
+                    {
+                        char _cl[128];
+                        snprintf(_cl, sizeof _cl, "%%layout-change %u closed", sid);
+                        control_emit("layout", _cl);
+                    }
                     goto done;
                 }
             }
             written = snprintf(result, result_cap,
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"surface not found\"}}");
+        } else if (ws->surfaces.len > 0) {
+            /* tmux-like default: close the focused surface. */
+            lmux_surface *s = lmux_surface_focused(ws);
+            if (!s) s = ws->surfaces.items[0];
+            lmux_id cid = s->id;
+            lmux_surface_close(ws, s);
+            written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+            /* ISS-0029: control fan-out (id captured before close frees s). */
+            {
+                char _cl[128];
+                snprintf(_cl, sizeof _cl, "%%layout-change %u closed", cid);
+                control_emit("layout", _cl);
+            }
         } else {
             written = snprintf(result, result_cap,
-                "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing id\"}}");
+                "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"no surfaces\"}}");
         }
         goto done;
     }
@@ -3198,6 +3288,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             }
         } else {
             s = lmux_surface_focused(ws);
+            if (!s && ws->surfaces.len > 0) s = ws->surfaces.items[0];
         }
         if (!s) {
             written = snprintf(result, result_cap,
@@ -3212,6 +3303,13 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         written = snprintf(result, result_cap,
             "{\"ok\":true,\"result\":{\"id\":%u,\"kind\":\"%s\"}}",
             p->id, p->kind);
+        /* ISS-0029: control fan-out. */
+        {
+            char _cl[128];
+            snprintf(_cl, sizeof _cl, "%%layout-change %u %zu",
+                     s->id, s->panes.len);
+            control_emit("layout", _cl);
+        }
         goto done;
     }
 
@@ -3260,6 +3358,13 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                     if (p->id == pid) {
                         lmux_pane_focus(ws, p);
                         written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+                        /* ISS-0029: control fan-out. */
+                        {
+                            char _cl[128];
+                            snprintf(_cl, sizeof _cl,
+                                     "%%window-pane-changed %u %u", s->id, p->id);
+                            control_emit("pane", _cl);
+                        }
                         goto done;
                     }
                 }
@@ -3475,6 +3580,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             }
         } else {
             s = lmux_surface_focused(ws);
+            if (!s && ws->surfaces.len > 0) s = ws->surfaces.items[0];
         }
         if (s && text[0]) {
             /* Send to the focused pane in this surface */
@@ -3487,6 +3593,14 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                 }
                 lmux_pane_send_keys(p, text);
                 written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+                /* ISS-0029: %output streaming hook. v1 echoes the sent text
+                 * (sanitized, truncated); a PTY-output tap is future work. */
+                {
+                    char _ot[208], _ol[256];
+                    control_sanitize(_ot, sizeof _ot, text);
+                    snprintf(_ol, sizeof _ol, "%%output %u %s", p->id, _ot);
+                    control_emit("output", _ol);
+                }
             } else {
                 written = snprintf(result, result_cap,
                     "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no focused pane\"}}");
@@ -4653,6 +4767,102 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         goto done;
     }
 
+    /* --- control.attach (ISS-0029) --- */
+    if (strcmp(cmd, "control.attach") == 0) {
+        /* Persistence is handled by the server: when the first request on a
+         * connection is control.attach, serve_client() keeps the connection
+         * open and frames every reply as %begin/payload/%end. The dispatch
+         * itself only acknowledges. One-shot clients get plain JSON. */
+        written = snprintf(result, result_cap,
+            "{\"ok\":true,\"result\":{\"control\":true,\"protocol\":1}}");
+        goto done;
+    }
+
+    /* --- refresh-client (ISS-0029) --- */
+    if (strcmp(cmd, "refresh-client") == 0 ||
+        strcmp(cmd, "refresh_client") == 0) {
+        char sub[256] = {0}, unsub[64] = {0}, flags[256] = {0};
+        json_extract_string(args_json, "subscription", sub, sizeof sub);
+        json_extract_string(args_json, "unsubscribe", unsub, sizeof unsub);
+        json_extract_string(args_json, "flags", flags, sizeof flags);
+        /* Accept the tmux form "-B name:what:format" / "-B name" too. */
+        if (!sub[0] && !unsub[0] && flags[0]) {
+            const char *b = strstr(flags, "-B");
+            if (b) {
+                b += 2;
+                while (*b == ' ' || *b == '\t') b++;
+                char spec[256] = {0};
+                snprintf(spec, sizeof spec, "%s", b);
+                /* Strip surrounding quotes the shell may have left. */
+                size_t sl = strlen(spec);
+                if (sl >= 2 && (spec[0] == '\'' || spec[0] == '"') &&
+                    spec[sl - 1] == spec[0]) {
+                    memmove(spec, spec + 1, sl - 2);
+                    spec[sl - 2] = 0;
+                }
+                if (strchr(spec, ':')) snprintf(sub, sizeof sub, "%s", spec);
+                else snprintf(unsub, sizeof unsub, "%s", spec);
+            }
+        }
+        int slot = lmux_control_current_slot();
+        if (sub[0]) {
+            /* Split name:what:format (format optional). */
+            char name[64] = {0}, what[128] = {0}, fmt[128] = {0};
+            const char *c1 = strchr(sub, ':');
+            if (c1) {
+                size_t nl = (size_t)(c1 - sub);
+                if (nl >= sizeof name) nl = sizeof name - 1;
+                memcpy(name, sub, nl);
+                const char *c2 = strchr(c1 + 1, ':');
+                if (c2) {
+                    size_t wl = (size_t)(c2 - (c1 + 1));
+                    if (wl >= sizeof what) wl = sizeof what - 1;
+                    memcpy(what, c1 + 1, wl);
+                    snprintf(fmt, sizeof fmt, "%s", c2 + 1);
+                } else {
+                    snprintf(what, sizeof what, "%s", c1 + 1);
+                }
+            } else {
+                snprintf(name, sizeof name, "%s", sub);
+            }
+            if (slot >= 0 && name[0]) {
+                if (lmux_control_subscribe(slot, name, what, fmt) == 0) {
+                    char _cl[128];
+                    snprintf(_cl, sizeof _cl, "%%subscription-changed %s 1", name);
+                    lmux_control_notify("subscription", _cl);
+                    written = snprintf(result, result_cap,
+                        "{\"ok\":true,\"result\":{\"subscribed\":\"%s\"}}", name);
+                } else {
+                    written = snprintf(result, result_cap,
+                        "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"subscribe failed\"}}");
+                }
+            } else if (slot < 0) {
+                /* One-shot client: ack without effect. */
+                written = snprintf(result, result_cap,
+                    "{\"ok\":true,\"result\":{\"subscribed\":\"%s\"}}",
+                    name[0] ? name : sub);
+            } else {
+                written = snprintf(result, result_cap,
+                    "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing subscription name\"}}");
+            }
+            goto done;
+        }
+        if (unsub[0]) {
+            if (slot >= 0) {
+                lmux_control_unsubscribe(slot, unsub);
+                char _cl[128];
+                snprintf(_cl, sizeof _cl, "%%subscription-changed %s 0", unsub);
+                lmux_control_notify("subscription", _cl);
+            }
+            written = snprintf(result, result_cap,
+                "{\"ok\":true,\"result\":{\"unsubscribed\":\"%s\"}}", unsub);
+            goto done;
+        }
+        written = snprintf(result, result_cap,
+            "{\"ok\":true,\"result\":{\"subscriptions\":[]}}");
+        goto done;
+    }
+
     /* --- help / list commands --- */
     if (strcmp(cmd, "help") == 0) {
         written = snprintf(result, result_cap,
@@ -4673,6 +4883,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             "\"agent.spawn\",\"agent.list\",\"agent.stop\","
             "\"read-screen\",\"capture-pane\","
             "\"display-message\",\"events\",\"capabilities\","
+            "\"control.attach\",\"refresh-client\","
             "\"last-pane\",\"last-window\",\"move-surface\",\"surface.rename\","
             "\"next-window\",\"previous-window\",\"ping\",\"help\","
             "\"reload-config\",\"workspace.env\","
@@ -5160,6 +5371,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             "\"agent.hibernate\",\"agent.resume\",\"agent.hibernation.status\","
             "\"read-screen\",\"capture-pane\","
             "\"display-message\",\"events\",\"capabilities\","
+            "\"control.attach\",\"refresh-client\","
             "\"last-pane\",\"last-window\",\"move-surface\",\"surface.rename\","
             "\"next-window\",\"previous-window\",\"ping\",\"help\","
             "\"reload-config\",\"workspace.env\","
@@ -8494,6 +8706,7 @@ static bool is_readonly_cmd(const char *cmd) {
         "browser.list",
         "feed.panel.list",
         "profile.status",
+        "control.attach", "refresh-client",
     };
     for (size_t i = 0; i < sizeof ro / sizeof ro[0]; i++) {
         if (strcmp(cmd, ro[i]) == 0) return true;
