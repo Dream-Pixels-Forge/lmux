@@ -304,6 +304,41 @@ GSK_RENDERER=vulkan python3 gui/gtk4/main.py
 
 ---
 
+## Control Mode (tmux `-C` compatible)
+
+Headless scripts can drive the daemon with a tmux-style control protocol
+over the Unix socket. Open a persistent connection whose first request is
+`control.attach`; the connection stays open and every command reply is
+framed as a `%block`:
+
+```
+%begin <epoch> <seq> 0
+{"ok":true,"result":{...}}
+%end <epoch> <seq> 0          (ok:true)
+%error <epoch> <seq> 0       (ok:false, replaces %end)
+```
+
+Async notifications stream between blocks (deferred while a block is
+open): `%layout-change`, `%session-changed`, `%window-pane-changed`,
+`%output`, `%subscription-changed`, `%dropped <n>`.
+
+Subscribe to a filtered notification stream (tmux `refresh-client -B`
+form):
+
+```bash
+lmux refresh-client -B lo:layout        # layout notifications only
+lmux refresh-client -B lo:output        # replace `lo` with an output-only filter
+```
+
+Filter `what` values: `layout`, `session`, `pane`, `output` (substring
+match). No active subscriptions ⇒ every class is delivered. Backpressure:
+per-client 1024-line queue; overflow drops oldest `%output` lines and
+reports it as `%dropped <n>`. One-shot JSON clients never see `%` lines.
+
+Tests: `tests/test_control_mode.py`.
+
+---
+
 ## Testing
 
 ```bash
