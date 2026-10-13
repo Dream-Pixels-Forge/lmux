@@ -4278,7 +4278,18 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                 "\"%s\"", escaped);
             free(lines[k]);
         }
-        written += snprintf(result + written, result_cap - written, "]}}");
+        written += snprintf(result + written, result_cap - written, "]");
+        /* ISS-0006: advertise the SSE stream when the caller asked to
+         * follow — the CLI only streams (sse_stream_logs) while this
+         * endpoint is present in the response. */
+        bool follow = false;
+        json_extract_bool(args_json, "follow", &follow);
+        if (follow) {
+            RESULT_GROW;
+            written += snprintf(result + written, result_cap - written,
+                ",\"sse_endpoint\":\"/api/logs/stream\"");
+        }
+        written += snprintf(result + written, result_cap - written, "}}");
         goto done;
     }
 

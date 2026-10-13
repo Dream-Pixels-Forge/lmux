@@ -897,6 +897,39 @@ class TestHttpLogsLargeOutput(unittest.TestCase):
         )
 
 
+class TestLogsFollowSseEndpoint(unittest.TestCase):
+    """ISS-0006: ``logs`` with ``follow:true`` must advertise the SSE
+    endpoint — the CLI only streams (``sse_stream_logs``) when the
+    response contains ``"sse_endpoint":"/api/logs/stream"``. Before the
+    fix the handler never emitted it, so ``lmux logs --follow`` silently
+    fell through to a one-shot print."""
+
+    def test_follow_true_includes_sse_endpoint(self):
+        client, daemon, home = _isolated_client()
+        try:
+            resp = client.send("logs", {"follow": True})
+            self.assertTrue(resp.get("ok"), f"logs failed: {str(resp)[:200]}")
+            self.assertEqual(
+                resp.get("result", {}).get("sse_endpoint"),
+                "/api/logs/stream",
+                "follow:true must advertise the SSE endpoint",
+            )
+        finally:
+            _shutdown_isolated(daemon, home)
+
+    def test_without_follow_response_shape_unchanged(self):
+        client, daemon, home = _isolated_client()
+        try:
+            result = client.logs()
+            self.assertIn("lines", result)
+            self.assertNotIn(
+                "sse_endpoint", result,
+                "plain logs must not advertise the SSE endpoint",
+            )
+        finally:
+            _shutdown_isolated(daemon, home)
+
+
 class TestTmuxCompatCli(unittest.TestCase):
     """CLI-level checks that run the binary directly.
 
