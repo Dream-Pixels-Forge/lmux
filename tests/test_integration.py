@@ -16,6 +16,7 @@ Usage:
 import json
 import inspect
 import os
+import queue
 import re
 import shutil
 import signal
@@ -1917,6 +1918,193 @@ class TestReadScreenIsARepeatableCapture(unittest.TestCase):
                 f"capture is unbounded ({len(text)} bytes); it must be capped")
         finally:
             _shutdown_isolated(daemon, home)
+
+
+class TestOsc133CommandTelemetry(unittest.TestCase):
+    """ISS-0037: OSC 133 shell-integration markers produce per-pane
+    command telemetry + control notifications.
+
+    Tmux's shell integration writes OSC 133 markers into the pty stream
+    (A = prompt start, B = prompt end / command start, C = command end,
+    D<code> = exit code). lmux parses those markers in the pane pty read
+    path and exposes:
+      - additive pane.list JSON keys: command_running, last_command_exit,
+        last_command_duration_ms, last_command_started
+      - control notifications (class "pane"):
+          %pane-command-started <pane-id>
+          %pane-command-finished <pane-id> <exit> <duration_ms>
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.client, cls.daemon, cls.home = _isolated_client()
+        # Reach a clean prompt: a fresh zsh shows a first-run wizard that
+        # swallows the first keystrokes; '0\n' writes a .zshrc and exits
+        # the wizard (harmless under bash, see TestReadScreenIsARepeatableCapture).
+        cls.client.workspace_create("osc133")
+        cls.client.surface_send_text("0\n")
+        time.sleep(1.0)
+        cls.client.send("read-screen")
+
+    @classmethod
+    def tearDownClass(cls):
+        _shutdown_isolated(cls.daemon, cls.home)
+
+    def _pane_telemetry(self, pane_id):
+        r = self.client.send("pane.list")
+        self.assertTrue(r.get("ok"), r)
+        for p in r["result"]["panes"]:
+            if p["id"] == pane_id:
+                return p
+        self.fail(f"pane {pane_id} not found in pane.list: {r}")
+
+    def test_01_pane_list_has_additive_telemetry_keys(self):
+        """pane.list carries the new keys with valid default values."""
+        panes = self.client.send("pane.list")["result"]["panes"]
+        self.assertTrue(panes, "no panes in pane.list")
+        p = panes[0]
+        self.assertIn("command_running", p,
+                      f"pane.list missing command_running key: {p}")
+        self.assertIn("last_command_exit", p,
+                      f"pane.list missing last_command_exit key: {p}")
+        self.assertIn("last_command_duration_ms", p,
+                      f"pane.list missing last_command_duration_ms key: {p}")
+        self.assertIn("last_command_started", p,
+                      f"pane.list missing last_command_started key: {p}")
+        # Default state before any OSC 133 markers: not running, no exit.
+        self.assertFalse(p["command_running"])
+        self.assertEqual(p["last_command_exit"], 0)
+        self.assertEqual(p["last_command_duration_ms"], 0)
+        self.assertEqual(p["last_command_started"], 0)
+
+    def test_02_markers_update_telemetry_and_emit_notifications(self):
+        """B/C/D markers drive command_running transitions and fan-out."""
+        pid = self.client.send("pane.list")["result"]["panes"][0]["id"]
+        ctl = ControlClient(self.daemon.socket_path)
+        try:
+            ctl.wait_for("%begin")
+            ctl.wait_for("%end")
+            ctl.drain()
+            # Command start marker (prompt end).
+            self.client.surface_send_text(
+                r"printf '\033]133;B\007\n'")
+            deadline = time.time() + 10
+            running = False
+            while time.time() < deadline and not running:
+                time.sleep(0.3)
+                self.client.send("read-screen")
+                running = self._pane_telemetry(pid)["command_running"]
+            self.assertTrue(
+                running, "command_running did not go true after OSC 133 B marker")
+            started = ctl.wait_for("%pane-command-started", timeout=8.0)[0]
+            self.assertIn(str(pid), started,
+                          f"notification must name the pane: {started}")
+            # Command end marker.
+            self.client.surface_send_text(
+                r"printf '\033]133;C\007\n'")
+            finished = None
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                time.sleep(0.3)
+                self.client.send("read-screen")
+                p = self._pane_telemetry(pid)
+                if not p["command_running"] and p["last_command_duration_ms"] > 0:
+                    finished = ctl.wait_for("%pane-command-finished",
+                                            timeout=8.0)[0]
+                    break
+            self.assertIsNotNone(
+                finished,
+                f"no %pane-command-finished notification; pane: "
+                f"{self._pane_telemetry(pid)}")
+            self.assertIn(str(pid), finished)
+            p = self._pane_telemetry(pid)
+            self.assertFalse(p["command_running"])
+            self.assertGreater(p["last_command_duration_ms"], 0)
+            self.assertGreater(p["last_command_started"], 0)
+            # Exit code marker (independent of B/C, per tmux oracle).
+            self.client.surface_send_text(
+                r"printf '\033]133;D3\007\n'")
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                time.sleep(0.3)
+                self.client.send("read-screen")
+                if self._pane_telemetry(pid)["last_command_exit"] == 3:
+                    break
+            self.assertEqual(
+                self._pane_telemetry(pid)["last_command_exit"], 3,
+                "OSC 133 D3 must record exit code 3")
+        finally:
+            ctl.close()
+
+
+class ControlClient:
+    """Persistent control-mode connection (attach -C equivalent).
+
+    Copy of the helper in test_control_mode.py so this file stays
+    self-contained under `make test-integration` (single-file run).
+    """
+
+    def __init__(self, socket_path, timeout=10.0):
+        self.sock = socket.socket(socket.AF_UNIX)
+        self.sock.settimeout(timeout)
+        self.sock.connect(socket_path)
+        self.lines = queue.Queue()
+        self._stop = threading.Event()
+        self._buf = b""
+        self._reader = threading.Thread(target=self._read_loop, daemon=True)
+        self._reader.start()
+        # Enter control mode. The attach reply itself is %framed.
+        self.send({"cmd": "control.attach", "args": {}})
+
+    def _read_loop(self):
+        try:
+            while not self._stop.is_set():
+                try:
+                    chunk = self.sock.recv(65536)
+                except (socket.timeout, OSError):
+                    continue
+                if not chunk:
+                    break
+                self._buf += chunk
+                while b"\n" in self._buf:
+                    line, self._buf = self._buf.split(b"\n", 1)
+                    self.lines.put(line.decode(errors="replace"))
+        except OSError:
+            pass
+
+    def send(self, obj):
+        payload = json.dumps(obj) + "\n"
+        self.sock.sendall(payload.encode())
+
+    def drain(self):
+        while True:
+            try:
+                self.lines.get_nowait()
+            except queue.Empty:
+                return
+
+    def wait_for(self, prefix, timeout=8.0):
+        """Wait for a line starting with prefix; return (line, seen)."""
+        deadline = time.time() + timeout
+        seen = []
+        while time.time() < deadline:
+            try:
+                line = self.lines.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            seen.append(line)
+            if line.startswith(prefix):
+                return line, seen
+        raise AssertionError(
+            f"timed out waiting for {prefix!r}; saw {len(seen)} lines: "
+            f"{seen[-8:]}")
+
+    def close(self):
+        self._stop.set()
+        try:
+            self.sock.close()
+        except OSError:
+            pass
 
 
 GHOST_COMMANDS = [
