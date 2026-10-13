@@ -147,6 +147,8 @@ lmux_workspace *lmux_workspace_by_id(lmux_app *app, lmux_id id);
 
 bool lmux_workspace_get_info(lmux_workspace *ws, lmux_workspace_info *out);
 
+lmux_id lmux_workspace_get_id(lmux_workspace *ws);
+
 void lmux_workspace_set_title(lmux_workspace *ws, const char *title);
 void lmux_workspace_set_cwd  (lmux_workspace *ws, const char *cwd);
 
@@ -162,6 +164,7 @@ void          lmux_surface_close (lmux_workspace *ws, lmux_surface *s);
 size_t        lmux_surface_count (lmux_workspace *ws);
 lmux_surface *lmux_surface_focused(lmux_workspace *ws);
 bool          lmux_surface_get_info   (lmux_surface *s, lmux_surface_info *out);
+lmux_id       lmux_surface_get_id(lmux_surface *s);
 void          lmux_surface_set_title(lmux_surface *s, const char *title);
 
 /* ------------------------------------------------------------------ */
@@ -184,6 +187,7 @@ void       lmux_pane_focus_dir(lmux_workspace *ws,
                                int dx, int dy);   /* -1,0,+1 each     */
 
 bool lmux_pane_get_info(lmux_pane *p, lmux_pane_info *out);
+lmux_id  lmux_pane_get_id(lmux_pane *p);
 
 /* Send keystrokes to a terminal pane. Text is interpreted as
  * key-name syntax: literal chars, C-X for Ctrl-X, M-x for Alt-x. */
@@ -245,6 +249,84 @@ int  lmux_notification_hook_add(lmux_app *app, const char *event, const char *fi
 bool lmux_notification_hook_remove(lmux_app *app, const char *event);
 size_t lmux_notification_hook_count(lmux_app *app);
 const lmux_notification_hook *lmux_notification_hook_at(lmux_app *app, size_t index);
+
+/* ------------------------------------------------------------------ */
+/* Hook registry (named hooks, after-*, monitor)                      */
+/* ------------------------------------------------------------------ */
+
+/* Hook scope: where the hook applies */
+typedef enum {
+    LMUX_HOOK_SCOPE_SERVER   = 0,  /* global, fires for all */
+    LMUX_HOOK_SCOPE_SESSION  = 1,  /* per-workspace (session) */
+    LMUX_HOOK_SCOPE_WINDOW   = 2,  /* per-surface (window) */
+    LMUX_HOOK_SCOPE_PANE     = 3,  /* per-pane */
+} lmux_hook_scope;
+
+/* Hook entry - public view */
+typedef struct {
+    lmux_id        id;            /* unique hook id */
+    char           name[64];      /* hook name (e.g., "session-created") */
+    lmux_hook_scope scope;        /* scope of the hook */
+    lmux_id        target_id;     /* target workspace/surface/pane id (0 for global) */
+    char           command[512];  /* shell command to execute */
+    bool           enabled;       /* whether hook is active */
+} lmux_hook;
+
+/* Core hook names (tmux-compatible subset) */
+#define LMUX_HOOK_SESSION_CREATED      "session-created"
+#define LMUX_HOOK_SESSION_CLOSED       "session-closed"
+#define LMUX_HOOK_SESSION_RENAMED      "session-renamed"
+#define LMUX_HOOK_WINDOW_CREATED       "window-created"
+#define LMUX_HOOK_WINDOW_CLOSED        "window-closed"
+#define LMUX_HOOK_WINDOW_RENAMED       "window-renamed"
+#define LMUX_HOOK_PANE_CREATED         "pane-created"
+#define LMUX_HOOK_PANE_CLOSED          "pane-closed"
+#define LMUX_HOOK_PANE_FOCUSED         "pane-focused"
+
+/* After-* hook names */
+#define LMUX_HOOK_AFTER_SESSION_CREATED  "after-session-created"
+#define LMUX_HOOK_AFTER_WINDOW_CREATED   "after-window-created"
+#define LMUX_HOOK_AFTER_PANE_CREATED     "after-pane-created"
+#define LMUX_HOOK_AFTER_PANE_CLOSED      "after-pane-closed"
+#define LMUX_HOOK_AFTER_ATTACH           "after-attach"
+#define LMUX_HOOK_AFTER_DETACH           "after-detach"
+#define LMUX_HOOK_AFTER_SPLIT            "after-split"
+#define LMUX_HOOK_AFTER_RESIZE           "after-resize"
+
+/* Monitor hook names */
+#define LMUX_HOOK_MONITOR_ACTIVITY     "monitor-activity"
+#define LMUX_HOOK_MONITOR_BELL         "monitor-bell"
+#define LMUX_HOOK_MONITOR_SILENCE      "monitor-silence"
+
+/* Monitor actions (mirror tmux activity-action/bell-action) */
+#define LMUX_MONITOR_ACTION_ANY        "any"
+#define LMUX_MONITOR_ACTION_CURRENT    "current"
+#define LMUX_MONITOR_ACTION_OTHER      "other"
+#define LMUX_MONITOR_ACTION_NONE       "none"
+
+/* Hook registry management */
+int  lmux_hook_add(lmux_app *app, const char *name, const char *command);
+int  lmux_hook_add_scoped(lmux_app *app, const char *name, lmux_hook_scope scope,
+                           lmux_id target_id, const char *command);
+bool lmux_hook_remove(lmux_app *app, const char *name);
+bool lmux_hook_remove_by_id(lmux_app *app, lmux_id hook_id);
+bool lmux_hook_set_enabled(lmux_app *app, const char *name, bool enabled);
+size_t lmux_hook_count(lmux_app *app);
+const lmux_hook *lmux_hook_at(lmux_app *app, size_t index);
+const lmux_hook *lmux_hook_find(lmux_app *app, const char *name);
+
+/* Monitor hook configuration per pane */
+bool lmux_pane_set_monitor_activity_interval(lmux_pane *pane, int interval_ms);
+bool lmux_pane_set_monitor_silence_interval(lmux_pane *pane, int interval_ms);
+int  lmux_pane_get_monitor_activity_interval(const lmux_pane *pane);
+int  lmux_pane_get_monitor_silence_interval(const lmux_pane *pane);
+
+bool lmux_pane_set_monitor_activity_action(lmux_pane *pane, const char *action);
+bool lmux_pane_set_monitor_bell_action(lmux_pane *pane, const char *action);
+bool lmux_pane_set_monitor_silence_action(lmux_pane *pane, const char *action);
+const char *lmux_pane_get_monitor_activity_action(const lmux_pane *pane);
+const char *lmux_pane_get_monitor_bell_action(const lmux_pane *pane);
+const char *lmux_pane_get_monitor_silence_action(const lmux_pane *pane);
 
 /* ------------------------------------------------------------------ */
 /* Window management                                                   */

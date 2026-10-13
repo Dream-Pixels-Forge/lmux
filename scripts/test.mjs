@@ -36,6 +36,7 @@ const testPrograms = [
     { name: "test_server_rate_limit", sources: ["test_server_rate_limit.c"] },
     { name: "test_http_stop", sources: ["test_http_stop.c"] },
     { name: "test_fuzz",   sources: ["test_fuzz.c"] },
+    { name: "test_hooks",  sources: ["test_hooks.c"] },
 ];
 
 /* ── Compile and run each test ─────────────── */
