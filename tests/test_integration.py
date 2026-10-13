@@ -5426,6 +5426,50 @@ class TestCompanionHardening(unittest.TestCase):
 
 
 # ====================================================================
+# ISS-0015 — auth honesty (GUI lock, not a boundary)
+# ====================================================================
+
+class TestAuthHonesty(unittest.TestCase):
+    """ISS-0015: no su/PAM fallbacks; docs state the real boundary."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.repo = Path(__file__).resolve().parent.parent
+        cls.src = (cls.repo / "gui" / "auth.py").read_text()
+        cls.sec = (cls.repo / "SECURITY.md").read_text()
+        sys.path.insert(0, str(cls.repo / "gui"))
+
+    def test_no_su_fallback(self):
+        """The dead su-stdin password-pipe path must be gone."""
+        self.assertNotIn('"su"', self.src)
+        self.assertNotIn("'su'", self.src)
+        self.assertNotIn("subprocess", self.src)
+
+    def test_no_phantom_pam_binary(self):
+        """No subprocess invocation of a pam_authenticate binary."""
+        self.assertNotIn('["pam_authenticate"', self.src)
+        self.assertNotIn("['pam_authenticate'", self.src)
+
+    def test_spwd_path_kept(self):
+        """Shadow-database verification (the meaningful case) stays."""
+        self.assertIn("spwd.getspnam", self.src)
+        self.assertIn("crypt.crypt", self.src)
+
+    def test_honesty_docs(self):
+        """Module + SECURITY.md state GUI lock is not the boundary."""
+        self.assertIn("not a security boundary", self.src)
+        self.assertIn("GUI lock is not a security boundary", self.sec)
+        self.assertIn("same-UID", self.sec)
+
+    def test_legit_flow_intact(self):
+        """Import + API stable; unknown user cleanly rejected."""
+        import auth as auth_mod
+        backend = auth_mod.AuthBackend()
+        self.assertFalse(backend.authenticate("nonexistent-user-xyz", "x"))
+        self.assertFalse(backend.is_authenticated())
+
+
+# ====================================================================
 # Agent Teams — multi-agent workflow orchestration
 # ====================================================================
 

@@ -50,6 +50,15 @@ lmux applies the following hardening practices:
 - **Socket ownership verification** — The daemon refuses connections to
   sockets not owned by the current user, preventing impersonation.
   (`gui/daemon_client.py`)
+
+- **GUI lock is not a security boundary (ISS-0015)** — The GUI login
+  dialog (`gui/auth.py`) is a screen-lock nicety against casual
+  shoulder-surfing clicks. The daemon's trust boundary is the Unix
+  domain socket with SO_PEERCRED UID checks: **the daemon trusts any
+  same-UID socket peer**, and a local same-UID process can always
+  talk to the socket directly. No GUI password prompt can stop it,
+  so it does not try — `AuthBackend` verifies via the shadow
+  database only, with no `su`/PAM fallbacks.
 - **Rate limiting** — 1000 requests per 60 seconds per UID. When the
   rate limit table is full, new UIDs are denied (fail-closed).
   (`src/core/server.c`)
