@@ -35,6 +35,25 @@ from lmux import LmuxClient, LmuxDaemon, LmuxError
 
 
 # ====================================================================
+# Gtk availability probe (PR #47: CI container has no Gtk typelibs).
+# GUI modules (gui/companion.py, gui/auth.py, gui/agent_sessions.py)
+# hard-require Gtk at import, so the tests exercising them skip
+# gracefully where Gtk is absent — same precedent as the existing
+# skipTest env guards for unreachable services below.
+# ====================================================================
+
+try:
+    import gi
+    gi.require_version("Gtk", "3.0")
+    from gi.repository import Gtk  # noqa: F401  (probe only)
+    GUI_AVAILABLE = True
+except (ImportError, ValueError):
+    GUI_AVAILABLE = False
+
+_GUI_SKIP_REASON = "Gtk unavailable (no Gtk typelibs in this env)"
+
+
+# ====================================================================
 # Single daemon shared across all test classes.
 # Uses a module-level daemon so setUpClass only starts one process.
 # ====================================================================
@@ -5383,6 +5402,7 @@ class TestCompanionHardening(unittest.TestCase):
         self.assertIn("Bearer ", self.src)
         self.assertIn("compare_digest", self.src)
 
+    @unittest.skipUnless(GUI_AVAILABLE, _GUI_SKIP_REASON)
     def test_remote_allowlist(self):
         """Remote role allowlist + denylist with clear 403 denial."""
         from companion import CompanionServer, RemoteCommand
@@ -5417,6 +5437,7 @@ class TestCompanionHardening(unittest.TestCase):
         self.assertTrue(reg.register_remote("workspace_created", "/bin/true"))
         self.assertIn("register_remote", self.hooks_src)
 
+    @unittest.skipUnless(GUI_AVAILABLE, _GUI_SKIP_REASON)
     def test_lan_bind_refused_and_qr_json(self):
         """Non-loopback bind refused; QR payload carries no query token."""
         from companion import CompanionServer
@@ -5462,6 +5483,7 @@ class TestAuthHonesty(unittest.TestCase):
         self.assertIn("GUI lock is not a security boundary", self.sec)
         self.assertIn("same-UID", self.sec)
 
+    @unittest.skipUnless(GUI_AVAILABLE, _GUI_SKIP_REASON)
     def test_legit_flow_intact(self):
         """Import + API stable; unknown user cleanly rejected."""
         import auth as auth_mod
@@ -5491,6 +5513,7 @@ class TestHardeningBatch(unittest.TestCase):
         self.assertIn("/proc/self/fd/", src)
         self.assertIn("S_ISREG", src)
 
+    @unittest.skipUnless(GUI_AVAILABLE, _GUI_SKIP_REASON)
     def test_resume_shlex_allowlist(self):
         """resume_command: shlex.split + binary allowlist, no .split()."""
         from agent_sessions import parse_resume_command
