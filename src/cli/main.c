@@ -1274,7 +1274,6 @@ static int sse_stream_logs(const char *socket_path) {
     char line[4096];
     size_t line_pos = 0;
     bool in_headers = true;
-    bool headers_done = false;
 
     /* Set up signal handler for Ctrl+C (stop flag, never ignore) */
     sse_stream_stop = 0;
@@ -1316,7 +1315,6 @@ static int sse_stream_logs(const char *socket_path) {
                     if (in_headers) {
                         if (line[0] == '\0' || (line[0] == '\r' && line[1] == '\0')) {
                             in_headers = false;
-                            headers_done = true;
                         }
                     } else {
                         /* Parse SSE data line */
