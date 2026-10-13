@@ -227,23 +227,37 @@ static void *http_client_thread(void *arg) {
                 } else {
                     char line_buf[4096];
                     char *json = malloc(65536);
+                    if (!json) {
+                        fclose(fp);
+                        http_send_response(client_fd, 500, "text/plain", "Out of memory");
+                        close(client_fd);
+                        return NULL;
+                    }
                     size_t json_len = snprintf(json, 65536, "{\"lines\":[");
                     int count = 0;
+                    bool truncated = false;
                     while (fgets(line_buf, sizeof line_buf, fp) && count < 100) {
                         size_t len = strlen(line_buf);
                         if (len > 0 && line_buf[len - 1] == '\n') line_buf[len - 1] = '\0';
-                        if (count > 0) json_len += snprintf(json + json_len, 65536 - json_len, ",");
                         char escaped[8192];
                         http_json_escape(line_buf, escaped, sizeof escaped);
+                        /* ISS-0005: never let json_len reach 65536 — once it
+                         * does, `65536 - json_len` wraps and snprintf writes
+                         * past the heap buffer. Stop and report instead. */
+                        if (json_len + strlen(escaped) + 4 + 16 >= 65536) {
+                            truncated = true;
+                            break;
+                        }
+                        if (count > 0) json_len += snprintf(json + json_len, 65536 - json_len, ",");
                         json_len += snprintf(json + json_len, 65536 - json_len, "\"%s\"", escaped);
                         count++;
                     }
                     fclose(fp);
-                    json_len += snprintf(json + json_len, 65536 - json_len, "],\"count\":%d}", count);
-                    if (json_len < 65536) {
-                        http_send_response(client_fd, 200, "application/json", json);
-                    } else {
+                    if (truncated) {
                         http_send_response(client_fd, 200, "application/json", "{\"ok\":false,\"error\":{\"code\":\"response_too_large\"}}");
+                    } else {
+                        json_len += snprintf(json + json_len, 65536 - json_len, "],\"count\":%d}", count);
+                        http_send_response(client_fd, 200, "application/json", json);
                     }
                     free(json);
             }

@@ -4253,6 +4253,23 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         written = snprintf(result, result_cap,
             "{\"ok\":true,\"result\":{\"lines\":[");
         for (int k = 0; k < count; k++) {
+            /* ISS-0005: grow the heap result buffer before appending. An
+             * escaped line can approach 8KB and count can reach 200, far
+             * beyond the initial 16KB buffer; without this
+             * `result_cap - written` wraps and snprintf writes past the
+             * heap allocation. NOTE: RESULT_GROW only guarantees room for
+             * ~1KB, which a single escaped line can exceed, so double
+             * directly until the worst-case line fits. */
+            while ((size_t)written + 8192 + 4 >= result_cap) {
+                result_cap = result_cap * 2 + 4096;
+                char *_grow = realloc(result, result_cap);
+                if (!_grow) {
+                    for (int f = 0; f < count; f++) free(lines[f]);
+                    free(result);
+                    return strdup("{\"ok\":false,\"error\":{\"code\":\"oom\",\"message\":\"out of memory\"}}");
+                }
+                result = _grow;
+            }
             if (k > 0) written += snprintf(result + written, result_cap - written, ",");
             /* Escape the line for JSON */
             char escaped[8192] = {0};

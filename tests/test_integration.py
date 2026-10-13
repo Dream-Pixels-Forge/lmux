@@ -802,6 +802,101 @@ class TestLogsHostileRoundTrip(unittest.TestCase):
             _shutdown_isolated(daemon, home)
 
 
+class TestLogsLargeOutput(unittest.TestCase):
+    """ISS-0005: ``logs`` must not overflow its heap response buffer when
+    the log file holds more output than the initial 16KB result buffer
+    (here 30 x ~4KB lines ~= 120KB). Before the fix the handler appended
+    with unbounded ``written += snprintf(...)`` so ``result_cap - written``
+    wrapped and ``snprintf`` wrote past the heap allocation."""
+
+    def test_many_long_lines_return_complete_valid_json(self):
+        client, daemon, home = _isolated_client()
+        try:
+            data = home / ".local" / "share" / "lmux"
+            log_file = str(data / "big.log")
+            Path(log_file).write_text("")
+            client.send("config.set", {"key": "log_file", "value": log_file})
+            markers = [f"{i:04d}-" + "L" * 4000 for i in range(30)]
+            with open(log_file, "a") as fh:
+                for m in markers:
+                    fh.write(m + "\n")
+            resp = client.send("logs")
+            self.assertTrue(resp.get("ok"), f"logs failed: {str(resp)[:300]}")
+            lines = resp.get("result", {}).get("lines", [])
+            for m in markers:
+                self.assertIn(
+                    m, lines, f"long log line missing/truncated ({m[:9]}...)")
+        finally:
+            _shutdown_isolated(daemon, home)
+
+
+class TestHttpLogsMallocCheck(unittest.TestCase):
+    """ISS-0005: the /api/logs handler malloc()s a 64KB response buffer;
+    a NULL return must be handled (500) instead of snprintf() into NULL."""
+
+    def test_api_logs_response_buffer_null_checked(self):
+        repo = Path(__file__).parent.parent
+        http_c = (repo / "src" / "core" / "http_server.c").read_text()
+        malloc_pos = http_c.find("malloc(65536)")
+        self.assertNotEqual(
+            malloc_pos, -1, "expected the 64KB /api/logs response malloc")
+        tail = http_c[malloc_pos:malloc_pos + 600]
+        self.assertTrue(
+            "!json" in tail or "json == NULL" in tail
+            or "json==NULL" in tail or "NULL ==" in tail,
+            "malloc(65536) result must be NULL-checked before use",
+        )
+
+
+class TestHttpLogsLargeOutput(unittest.TestCase):
+    """ISS-0005: ``/api/logs`` must not overflow its 64KB heap response
+    buffer when the log file holds more than fits (here 100 x ~4KB lines
+    ~= 400KB, and the handler reads up to 100 lines). Before the fix the
+    handler accumulated ``json_len += snprintf(...)`` unboundedly, so
+    ``65536 - json_len`` wrapped and ``snprintf`` wrote past the heap
+    allocation. Fixed behavior: stay alive and answer valid JSON (the
+    ``response_too_large`` envelope)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.c = _ensure_daemon()
+        cls.log_file = str(
+            Path(tempfile.gettempdir()) / f"lmux-http-big-{os.getpid()}.log")
+        Path(cls.log_file).write_text("")
+        cls.c.send("config.set", {"key": "log_file", "value": cls.log_file})
+        with open(cls.log_file, "a") as fh:
+            for i in range(100):
+                fh.write(f"{i:04d}-" + "H" * 4000 + "\n")
+
+    def test_large_output_returns_valid_json_and_daemon_survives(self):
+        import urllib.request
+        try:
+            with urllib.request.urlopen(
+                "http://127.0.0.1:8080/api/logs", timeout=10
+            ) as resp:
+                body = resp.read().decode(errors="replace")
+        except Exception as exc:  # noqa: BLE001 - network faults
+            # A reset/dead server is the bug (heap overflow kills the
+            # daemon); only skip when the daemon is alive but HTTP is
+            # simply not enabled in this environment.
+            try:
+                alive = bool(self.c.send("ping").get("ok"))
+            except Exception:  # noqa: BLE001 - daemon socket is gone
+                alive = False
+            self.assertTrue(
+                alive, f"daemon died serving large /api/logs output: {exc}")
+            self.skipTest(f"HTTP log server not reachable: {exc}")
+        doc = json.loads(body)  # truncated/overflowed JSON fails here
+        self.assertTrue(
+            isinstance(doc.get("lines"), list) or doc.get("ok") is False,
+            f"expected capped lines or the response_too_large envelope: {body[:200]!r}",
+        )
+        self.assertTrue(
+            self.c.send("ping").get("ok"),
+            "daemon died while serving large /api/logs output",
+        )
+
+
 class TestTmuxCompatCli(unittest.TestCase):
     """CLI-level checks that run the binary directly.
 
