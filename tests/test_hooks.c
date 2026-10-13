@@ -432,7 +432,6 @@ static void test_hook_control_notification(void) {
             found = true;
             ASSERT(strstr(lines[i], "session-created") != NULL, "notification should mention hook name");
             ASSERT(strstr(lines[i], "session") != NULL, "notification should mention scope");
-            break;
         }
         free(lines[i]);
     }
