@@ -383,6 +383,39 @@ static void test_format_browser_pane_variables(void) {
 }
 
 /* ──────────────────────────────────────────────
+ * Integration: pane.list with formatted field
+ * ────────────────────────────────────────────── */
+
+static void test_format_pane_list_formatted(void) {
+    TEST("pane.list with format argument adds formatted field");
+    lmux_app *app = make_app();
+    lmux_workspace *ws = lmux_workspace_create(app, "test-ws");
+    lmux_surface *surf = lmux_surface_create(ws, "test-surf");
+    lmux_pane *p = lmux_pane_split(ws, surf, LMUX_SPLIT_HORIZONTAL, "my-command", false);
+    lmux_pane_focus(ws, p);
+    lmux_pane_pty_set_size(p, 100, 30);
+    
+    /* Get workspace ID via public API */
+    lmux_workspace_info ws_info;
+    lmux_workspace_get_info(ws, &ws_info);
+    lmux_id ws_id = (lmux_id)atol(ws_info.id);
+    
+    /* Dispatch pane.list with format argument */
+    char req[512];
+    snprintf(req, sizeof req,
+        "{\"cmd\":\"pane.list\",\"args\":{\"workspace_id\":\"%u\",\"format\":\"#{pane_title} [#{pane_width}x#{pane_height}]\"}}",
+        ws_id);
+    char *resp = lmux_dispatch_json(app, req);
+    ASSERT(resp != NULL, "response should not be NULL");
+    ASSERT(strstr(resp, "\"ok\":true"), "pane.list should succeed");
+    ASSERT(strstr(resp, "\"formatted\":\""), "should contain formatted field");
+    ASSERT(strstr(resp, "my-command [100x30]"), "formatted should contain expanded format");
+    free(resp);
+    
+    lmux_app_free(app); teardown(); PASS();
+}
+
+/* ──────────────────────────────────────────────
  * Main
  * ────────────────────────────────────────────── */
 
@@ -406,6 +439,7 @@ int main(void) {
     test_format_no_variables();
     test_format_mixed_content();
     test_format_browser_pane_variables();
+    test_format_pane_list_formatted();
 
     printf("\n===============================\n");
     printf("Tests: %d passed, %d failed, %d total\n\n",
