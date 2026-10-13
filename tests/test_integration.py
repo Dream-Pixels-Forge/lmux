@@ -930,6 +930,56 @@ class TestLogsFollowSseEndpoint(unittest.TestCase):
             _shutdown_isolated(daemon, home)
 
 
+class TestLogsLimitTail(unittest.TestCase):
+    """ISS-0007: ``logs`` served the oldest 200 lines and ignored the
+    ``limit`` arg the CLI already sends (main.c builds ``"limit":N``).
+    Fixed behavior: honor ``limit`` (default 200, clamp 1000) and tail
+    the file — return the NEWEST N lines."""
+
+    def test_limit_returns_newest_n_lines(self):
+        client, daemon, home = _isolated_client()
+        try:
+            data = home / ".local" / "share" / "lmux"
+            log_file = str(data / "tail.log")
+            Path(log_file).write_text("")
+            client.send("config.set", {"key": "log_file", "value": log_file})
+            with open(log_file, "a") as fh:
+                for i in range(10):
+                    fh.write(f"line-{i:02d}\n")
+            resp = client.send("logs", {"limit": 5})
+            self.assertTrue(resp.get("ok"), f"logs failed: {str(resp)[:200]}")
+            lines = resp.get("result", {}).get("lines", [])
+            self.assertEqual(
+                lines, [f"line-{i:02d}" for i in range(5, 10)],
+                f"limit=5 must return newest 5, got: {lines!r}",
+            )
+        finally:
+            _shutdown_isolated(daemon, home)
+
+
+    def test_default_returns_newest_capped_at_200(self):
+        client, daemon, home = _isolated_client()
+        try:
+            data = home / ".local" / "share" / "lmux"
+            log_file = str(data / "tail-default.log")
+            Path(log_file).write_text("")
+            client.send("config.set", {"key": "log_file", "value": log_file})
+            with open(log_file, "a") as fh:
+                for i in range(250):
+                    fh.write(f"dline-{i:03d}\n")
+            resp = client.send("logs", {})
+            self.assertTrue(resp.get("ok"), f"logs failed: {str(resp)[:200]}")
+            lines = resp.get("result", {}).get("lines", [])
+            self.assertLessEqual(
+                len(lines), 200, f"default must cap at 200, got {len(lines)}")
+            self.assertIn(
+                "dline-249", lines, "default must include the newest line")
+            self.assertNotIn(
+                "dline-000", lines, "default must tail, not serve oldest")
+        finally:
+            _shutdown_isolated(daemon, home)
+
+
 class TestTmuxCompatCli(unittest.TestCase):
     """CLI-level checks that run the binary directly.
 

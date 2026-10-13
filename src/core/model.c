@@ -2641,6 +2641,15 @@ static bool json_extract_string(const char *json, const char *key, char *out, si
     return true;
 }
 
+/* Extract a JSON integer value */
+static bool json_extract_int(const char *json, const char *key, int *out) {
+    const char *v = json_find_key(json, key);
+    if (!v) return false;
+    if (*v != '-' && (*v < '0' || *v > '9')) return false;
+    *out = (int)strtol(v, NULL, 10);
+    return true;
+}
+
 /* Extract a JSON boolean value */
 static bool json_extract_bool(const char *json, const char *key, bool *out) {
     const char *v = json_find_key(json, key);
@@ -4205,11 +4214,22 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         else if (strcmp(level_arg, "warn") == 0 || strcmp(level_arg, "warning") == 0) min_level = 2;
         else if (strcmp(level_arg, "error") == 0) min_level = 3;
 
+        /* ISS-0007: honor the "limit" arg the CLI already sends
+         * (default 200 preserves the old shape, clamp to 1000). */
+        int log_limit = 200;
+        json_extract_int(args_json, "limit", &log_limit);
+        if (log_limit <= 0) log_limit = 200;
+        if (log_limit > 1000) log_limit = 1000;
+
         /* Read log lines from the configured log file, or from the global log file path */
         char *log_file = app->config->log_file;
         int count = 0;
+        int start = 0; /* ring-buffer head: oldest kept line */
         char line_buf[4096];
-        char *lines[200]; /* array of line pointers */
+        char **lines = malloc(sizeof(char *) * (size_t)log_limit);
+        if (!lines) {
+            return strdup("{\"ok\":false,\"error\":{\"code\":\"oom\",\"message\":\"out of memory\"}}");
+        }
 
         /* If no log file configured in config, try the global log file path */
         if (!log_file[0]) {
@@ -4220,8 +4240,10 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             /* Read from log file */
             FILE *lf = fopen(log_file, "r");
             if (lf) {
-                /* Read lines from the log file */
-                while (fgets(line_buf, sizeof(line_buf), lf) != NULL && count < 200) {
+                /* Read lines from the log file, keeping only the newest
+                 * log_limit (ring buffer) — the old code returned the
+                 * oldest 200. Bounded: at most log_limit lines held. */
+                while (fgets(line_buf, sizeof(line_buf), lf) != NULL) {
                     /* Strip trailing newline */
                     size_t len = strlen(line_buf);
                     if (len > 0 && line_buf[len - 1] == '\n') {
@@ -4240,10 +4262,16 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                             continue;
                         }
                     }
-                    /* Store the line */
-                    lines[count] = strdup(line_buf);
-                    if (!lines[count]) break;
-                    count++;
+                    /* Store the line (tail: evict oldest when full) */
+                    char *dup = strdup(line_buf);
+                    if (!dup) break;
+                    if (count < log_limit) {
+                        lines[count++] = dup;
+                    } else {
+                        free(lines[start]);
+                        lines[start] = dup;
+                        start = (start + 1) % log_limit;
+                    }
                 }
                 fclose(lf);
             }
@@ -4265,6 +4293,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                 char *_grow = realloc(result, result_cap);
                 if (!_grow) {
                     for (int f = 0; f < count; f++) free(lines[f]);
+                    free(lines);
                     free(result);
                     return strdup("{\"ok\":false,\"error\":{\"code\":\"oom\",\"message\":\"out of memory\"}}");
                 }
@@ -4273,11 +4302,13 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             if (k > 0) written += snprintf(result + written, result_cap - written, ",");
             /* Escape the line for JSON */
             char escaped[8192] = {0};
-            log_json_escape(lines[k], escaped, sizeof(escaped));
+            int idx = (start + k) % log_limit;
+            log_json_escape(lines[idx], escaped, sizeof(escaped));
             written += snprintf(result + written, result_cap - written,
                 "\"%s\"", escaped);
-            free(lines[k]);
+            free(lines[idx]);
         }
+        free(lines);
         written += snprintf(result + written, result_cap - written, "]");
         /* ISS-0006: advertise the SSE stream when the caller asked to
          * follow — the CLI only streams (sse_stream_logs) while this
