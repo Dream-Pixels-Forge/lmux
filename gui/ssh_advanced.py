@@ -103,8 +103,7 @@ class SSHSessionManager:
             "-M",  # Master mode
             "-S", control_path,
             "-o", "ControlPersist=600",
-            "-o", "StrictHostKeyChecking=no",
-            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "StrictHostKeyChecking=accept-new",
             "-p", str(port)
         ]
 
@@ -362,8 +361,7 @@ class SSHDragDropHandler:
             try:
                 cmd = [
                     "scp",
-                    "-o", "StrictHostKeyChecking=no",
-                    "-o", "UserKnownHostsFile=/dev/null",
+                    "-o", "StrictHostKeyChecking=accept-new",
                     local_path,
                     f"{session.user}@{session.host}:{remote_dir}/"
                 ]
