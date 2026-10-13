@@ -770,6 +770,71 @@ class TestHttpLogServerSecurity(unittest.TestCase):
             self.assertIsInstance(
                 line, str, f"log line must be a JSON string: {line!r}")
 
+    def test_no_acao_wildcard_in_source(self):
+        """ISS-0025: same-origin only — no ACAO:* on /api/logs or SSE."""
+        self.assertNotIn(
+            "Access-Control-Allow-Origin", self.http_c,
+            "log API must not emit Access-Control-Allow-Origin: *",
+        )
+
+    def test_api_logs_has_no_acao_header(self):
+        """ISS-0025 live: /api/logs must not emit an ACAO header."""
+        import urllib.request
+        try:
+            with urllib.request.urlopen(
+                "http://127.0.0.1:8080/api/logs", timeout=10
+            ) as resp:
+                hdrs = {k.lower(): v for k, v in resp.getheaders()}
+        except Exception as exc:  # noqa: BLE001 - optional service
+            self.skipTest(f"HTTP log server not reachable: {exc}")
+        self.assertNotIn(
+            "access-control-allow-origin", hdrs,
+            f"same-origin only, got ACAO: {hdrs.get('access-control-allow-origin')!r}",
+        )
+
+    def test_sse_stream_has_no_acao_header_and_no_cr(self):
+        """ISS-0025 live: /api/logs/stream sends same-origin headers and
+        sanitizes an embedded CR in log data (bare CR would split SSE
+        frames / smuggle events)."""
+        marker = f"sse-cr-probe-{os.getpid()}"
+        with open(self.log_file, "a") as fh:
+            fh.write("before-" + marker + "\rAFTER\n")
+        try:
+            s = socket.create_connection(("127.0.0.1", 8080), timeout=5)
+        except OSError as exc:
+            self.skipTest(f"HTTP log server not reachable: {exc}")
+        try:
+            s.settimeout(4)
+            s.sendall(b"GET /api/logs/stream HTTP/1.1\r\nHost: x\r\n\r\n")
+            data = b""
+            try:
+                while marker.encode() not in data and len(data) < 65536:
+                    chunk = s.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+            except socket.timeout:
+                pass
+        finally:
+            try:
+                s.close()
+            except OSError:
+                pass
+        head, sep, body = data.partition(b"\r\n\r\n")
+        self.assertTrue(sep, f"no HTTP response head received: {data[:200]!r}")
+        self.assertNotIn(
+            b"access-control-allow-origin", head.lower(),
+            "SSE stream must not emit ACAO",
+        )
+        self.assertIn(
+            marker.encode(), body,
+            f"probe line must be streamed: {body[-500:]!r}",
+        )
+        self.assertNotIn(
+            b"\r", body,
+            "SSE event body must not contain CR",
+        )
+
 
 class TestLogsHostileRoundTrip(unittest.TestCase):
     """The ``logs`` socket command must return hostile file content

@@ -94,7 +94,6 @@ static void http_send_response(int client_fd, int status, const char *content_ty
         "Content-Type: %s\r\n"
         "Content-Length: %d\r\n"
         "Connection: close\r\n"
-        "Access-Control-Allow-Origin: *\r\n"
         "\r\n",
         status,
         status == 200 ? "OK" : (status == 404 ? "Not Found" : "Internal Server Error"),
@@ -109,15 +108,26 @@ static void http_send_sse_header(int client_fd) {
         "Content-Type: text/event-stream\r\n"
         "Cache-Control: no-cache\r\n"
         "Connection: keep-alive\r\n"
-        "Access-Control-Allow-Origin: *\r\n"
         "\r\n";
     write(client_fd, header, strlen(header));
 }
 
 static void http_send_sse_event(int client_fd, const char *data) {
+    /* ISS-0025: strip CR — log lines are untrusted input and callers only
+     * strip LF, so a bare \r would split/smuggle SSE frames. */
     char buf[HTTP_BUFFER_SIZE];
-    int len = snprintf(buf, sizeof buf, "data: %s\n\n", data);
-    write(client_fd, buf, len);
+    size_t pos = 0;
+    pos += (size_t)snprintf(buf + pos, sizeof buf - pos, "data: ");
+    for (const char *p = data; *p && pos + 3 < sizeof buf; p++) {
+        if (*p == '\r') continue;
+        buf[pos++] = *p;
+    }
+    if (pos + 2 < sizeof buf) {
+        buf[pos++] = '\n';
+        buf[pos++] = '\n';
+    }
+    buf[pos] = '\0';
+    write(client_fd, buf, pos);
 }
 
 static void *http_client_thread(void *arg) {
