@@ -305,6 +305,9 @@ struct lmux_pane {
     bool          focused;
     int           pty_fd;       /* pty master fd, -1 if not spawned */
     pid_t         child_pid;    /* child process pid, 0 if not spawned */
+    /* PTY size (set by lmux_pane_pty_set_size, for format expander) */
+    int           pty_cols;
+    int           pty_rows;
     /* Copy mode (Vi-style text selection) */
     bool          copy_mode_active;
     int           copy_cursor_row;
@@ -646,6 +649,8 @@ static lmux_pane *pane_new(lmux_workspace *ws, lmux_surface *s,
     p->focused  = false;
     p->pty_fd   = -1;
     p->child_pid = 0;
+    p->pty_cols = 80;  /* default PTY width */
+    p->pty_rows = 24;  /* default PTY height */
     return p;
 }
 
@@ -1849,12 +1854,19 @@ bool lmux_pane_get_info(lmux_pane *p, lmux_pane_info *out) {
     return true;
 }
 bool lmux_pane_pty_set_size(lmux_pane *p, int cols, int rows) {
-    if (!p || p->pty_fd < 0) return false;
-    struct winsize ws;
-    memset(&ws, 0, sizeof ws);
-    ws.ws_col = (unsigned short)(cols > 0 ? cols : 80);
-    ws.ws_row = (unsigned short)(rows > 0 ? rows : 24);
-    return ioctl(p->pty_fd, TIOCSWINSZ, &ws) == 0;
+    if (!p) return false;
+    /* Always store the requested size for format expander */
+    p->pty_cols = (cols > 0 ? cols : 80);
+    p->pty_rows = (rows > 0 ? rows : 24);
+    /* If PTY exists, also apply to the terminal */
+    if (p->pty_fd >= 0) {
+        struct winsize ws;
+        memset(&ws, 0, sizeof ws);
+        ws.ws_col = (unsigned short)p->pty_cols;
+        ws.ws_row = (unsigned short)p->pty_rows;
+        return ioctl(p->pty_fd, TIOCSWINSZ, &ws) == 0;
+    }
+    return true;
 }
 
 void lmux_pane_send_keys(lmux_pane *p, const char *keys) {
@@ -3491,7 +3503,9 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
     /* --- pane.list --- */
     if (strcmp(cmd, "pane.list") == 0) {
         char ws_id[64] = {0};
+        char format_str[512] = {0};
         json_extract_string(args_json, "workspace_id", ws_id, sizeof ws_id);
+        json_extract_string(args_json, "format", format_str, sizeof format_str);
         lmux_workspace *ws = ws_id[0] ? lmux_workspace_by_id(app, (lmux_id)atol(ws_id))
                                       : lmux_workspace_focused(app);
         if (ws) {
@@ -3503,14 +3517,29 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                     lmux_pane *p = s->panes.items[j];
                     RESULT_GROW;
                     if (!first) written += snprintf(result + written, result_cap - written, ",");
+                    
+                    /* Build pane JSON with optional formatted field */
+                    char formatted[512] = {0};
+                    bool has_formatted = false;
+                    if (format_str[0]) {
+                        char *expanded = NULL;
+                        /* Use a temporary buffer for format expansion */
+                        char fmt_buf[512];
+                        if (lmux_format_expand(app, p, format_str, fmt_buf, sizeof fmt_buf)) {
+                            snprintf(formatted, sizeof formatted, ",\"formatted\":\"%s\"", fmt_buf);
+                            has_formatted = true;
+                        }
+                    }
+                    
                     written += snprintf(result + written, result_cap - written,
                         "{\"id\":%u,\"kind\":\"%s\",\"focused\":%s,\"surface_id\":%u,"
                         "\"command_running\":%s,\"last_command_exit\":%d,"
-                        "\"last_command_duration_ms\":%ld,\"last_command_started\":%ld}",
+                        "\"last_command_duration_ms\":%ld,\"last_command_started\":%ld%s}",
                         p->id, p->kind, p->focused ? "true" : "false", s->id,
                         p->cmd_running ? "true" : "false",
                         p->last_cmd_exit, p->last_cmd_duration_ms,
-                        p->last_cmd_started_ms);
+                        p->last_cmd_started_ms,
+                        has_formatted ? formatted : "");
                     first = false;
                 }
             }

@@ -650,6 +650,43 @@ void lmux_control_format_guard(char *out, size_t cap,
                                const char *kind, long epoch,
                                unsigned seq);
 
+/* ------------------------------------------------------------------ */
+/* Format string expander                                              */
+/* ------------------------------------------------------------------ */
+
+/* Expand a format string with variables, conditionals, and loops.
+ *
+ * Supported variables (10 core):
+ *   #{pane_id}          - pane numeric ID
+ *   #{pane_title}       - pane title (command for terminal, URL for browser)
+ *   #{pane_width}       - pane width in columns
+ *   #{pane_height}      - pane height in rows
+ *   #{session_id}       - workspace/session numeric ID
+ *   #{session_name}     - workspace/session title
+ *   #{surface_id}       - surface/tab numeric ID
+ *   #{surface_title}    - surface/tab title
+ *   #{window_id}        - alias for surface_id
+ *   #{window_name}      - alias for surface_title
+ *   #{pane_focused}     - "1" if pane is focused, "0" otherwise (for conditionals)
+ *   #{window_active}    - "1" if surface is focused, "0" otherwise (for window list)
+ *
+ * Conditionals: #{?condition:true:false}
+ *   condition can be any variable; "1", "true", "yes", non-zero numbers are truthy
+ *
+ * Window list loop: #{W:format}
+ *   Iterates over all surfaces in the workspace, expanding format for each.
+ *   Inside the loop, window_active is set for the currently focused surface.
+ *
+ * @param app       The lmux application
+ * @param pane      The pane context (provides workspace/surface/pane data)
+ * @param fmt       The format string to expand
+ * @param out       Output buffer
+ * @param cap       Capacity of output buffer
+ * @return true on success, false on error (buffer too small, etc.)
+ */
+bool lmux_format_expand(lmux_app *app, lmux_pane *pane,
+                        const char *fmt, char *out, size_t cap);
+
 
 #ifdef __cplusplus
 }
