@@ -32,6 +32,7 @@ const testPrograms = [
     { name: "test_model",  sources: ["test_model.c"] },
     { name: "test_osc",    sources: ["test_osc.c"] },
     { name: "test_config", sources: ["test_config.c"] },
+    { name: "test_format", sources: ["test_format.c"] },
     { name: "test_server_rate_limit", sources: ["test_server_rate_limit.c"] },
     { name: "test_http_stop", sources: ["test_http_stop.c"] },
     { name: "test_fuzz",   sources: ["test_fuzz.c"] },

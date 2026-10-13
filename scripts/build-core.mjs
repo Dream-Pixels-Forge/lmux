@@ -48,6 +48,7 @@ const sources = [
     join(ROOT, "src", "core", "server.c"),
     join(ROOT, "src", "core", "control.c"),
     join(ROOT, "src", "core", "config.c"),
+    join(ROOT, "src", "core", "format.c"),
     join(ROOT, "src", "browser.c"),
 ];
 
