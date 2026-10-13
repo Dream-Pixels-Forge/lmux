@@ -18,6 +18,11 @@
 
 #define HTTP_MAX_CLIENTS 32
 #define HTTP_BUFFER_SIZE 8192
+/* N11 (ISS-0027): SSE streams are long-lived (one thread + one slot
+ * each, held for the life of the connection). Cap concurrent SSE
+ * streams well below HTTP_MAX_CLIENTS so a handful of forgotten
+ * browser tabs cannot starve the short-lived /api/logs API. */
+#define HTTP_MAX_SSE_CLIENTS 8
 
 typedef struct {
     lmux_app *app;
@@ -27,6 +32,7 @@ typedef struct {
     volatile bool running;
     int client_fds[HTTP_MAX_CLIENTS];
     pthread_mutex_t clients_lock;
+    int sse_count; /* concurrent /api/logs/stream holders, under clients_lock */
 } http_server_t;
 
 static http_server_t *g_http_server = NULL;
@@ -143,6 +149,8 @@ static void *http_client_thread(void *arg) {
         goto done;
     }
     buffer[bytes_read] = '\0';
+    /* N11: set when this worker holds an SSE slot; released at done:. */
+    bool holds_sse_slot = false;
 
     /* Parse request line */
     char method[16], path[256], version[16];
@@ -158,6 +166,28 @@ static void *http_client_thread(void *arg) {
             http_send_response(client_fd, 500, "text/plain", "Server not initialized");
             goto done;
         }
+
+        /* N11: cap concurrent SSE streams (fail with 503 + Retry-After
+         * so well-behaved clients back off instead of spinning). */
+        pthread_mutex_lock(&g_http_server->clients_lock);
+        if (g_http_server->sse_count >= HTTP_MAX_SSE_CLIENTS) {
+            pthread_mutex_unlock(&g_http_server->clients_lock);
+            const char *body = "Too many SSE streams";
+            char hdr[256];
+            snprintf(hdr, sizeof hdr,
+                "HTTP/1.1 503 Service Unavailable\r\n"
+                "Content-Type: text/plain\r\n"
+                "Content-Length: %zu\r\n"
+                "Retry-After: 5\r\n"
+                "Connection: close\r\n\r\n",
+                strlen(body));
+            (void)write(client_fd, hdr, strlen(hdr));
+            (void)write(client_fd, body, strlen(body));
+            goto done;
+        }
+        g_http_server->sse_count++;
+        holds_sse_slot = true;
+        pthread_mutex_unlock(&g_http_server->clients_lock);
 
         lmux_app *app = g_http_server->app;
         const char *log_path = lmux_app_get_log_file(app);
@@ -367,6 +397,11 @@ done:
         pthread_mutex_lock(&server->clients_lock);
         if (server->client_fds[slot] == client_fd) {
             server->client_fds[slot] = -1;
+        }
+        /* N11: release the SSE stream hold on the same path. */
+        if (holds_sse_slot && server->sse_count > 0) {
+            server->sse_count--;
+            holds_sse_slot = false;
         }
         pthread_mutex_unlock(&server->clients_lock);
     }

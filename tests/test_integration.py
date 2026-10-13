@@ -14,6 +14,7 @@ Usage:
 """
 
 import json
+import inspect
 import os
 import re
 import shutil
@@ -5467,6 +5468,58 @@ class TestAuthHonesty(unittest.TestCase):
         backend = auth_mod.AuthBackend()
         self.assertFalse(backend.authenticate("nonexistent-user-xyz", "x"))
         self.assertFalse(backend.is_authenticated())
+
+
+# ====================================================================
+# ISS-0027 — hardening batch (N7 TOCTOU, N10 shlex, N11 SSE caps)
+# ====================================================================
+
+class TestHardeningBatch(unittest.TestCase):
+    """Source + behavior gates for ISS-0027 hardening."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.repo = Path(__file__).resolve().parent.parent
+        sys.path.insert(0, str(cls.repo / "gui"))
+
+    def test_snapshot_no_follow_open(self):
+        """model.c snapshot load: O_NOFOLLOW|O_CLOEXEC + fstat + re-validate."""
+        src = (self.repo / "src" / "core" / "model.c").read_text()
+        self.assertIn("O_NOFOLLOW", src)
+        self.assertIn("O_CLOEXEC", src)
+        self.assertIn("snapshot_open_nofollow", src)
+        self.assertIn("/proc/self/fd/", src)
+        self.assertIn("S_ISREG", src)
+
+    def test_resume_shlex_allowlist(self):
+        """resume_command: shlex.split + binary allowlist, no .split()."""
+        from agent_sessions import parse_resume_command
+        mod_src = (self.repo / "gui" / "agent_sessions.py").read_text()
+        self.assertIn("shlex.split", mod_src)
+        self.assertIn("RESUME_BINARY_ALLOWLIST", mod_src)
+        self.assertNotIn("resume_command.split()", mod_src)
+        # quoted args survive intact
+        self.assertEqual(
+            parse_resume_command('claude --resume "my session"'),
+            ["claude", "--resume", "my session"])
+        # flag-smuggling / unknown binaries refused
+        self.assertIsNone(parse_resume_command("my-agent; rm -rf ~"))
+        self.assertIsNone(parse_resume_command("/usr/bin/evil --exec id"))
+        self.assertIsNone(parse_resume_command("claude \"unterminated"))
+
+    def test_sse_caps(self):
+        """SSE: server cap (8 + 503) and client exponential backoff."""
+        http_src = (self.repo / "src" / "core" / "http_server.c").read_text()
+        self.assertIn("HTTP_MAX_SSE_CLIENTS", http_src)
+        self.assertIn("503", http_src)
+        self.assertIn("Retry-After", http_src)
+        self.assertIn("sse_count", http_src)
+        import daemon_client as dc
+        self.assertEqual(dc.SSE_BACKOFF_INITIAL, 1.0)
+        self.assertEqual(dc.SSE_BACKOFF_MAX, 30.0)
+        src = inspect.getsource(dc.DaemonClient.send_events)
+        self.assertIn("backoff", src)
+        self.assertIn("stop.wait", src)
 
 
 # ====================================================================

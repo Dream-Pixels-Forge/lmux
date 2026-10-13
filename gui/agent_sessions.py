@@ -5,6 +5,7 @@ from gi.repository import Gtk, GLib
 import logging
 import json
 import os
+import shlex
 import signal
 import subprocess
 from pathlib import Path
@@ -14,6 +15,43 @@ from enum import Enum
 from datetime import datetime
 
 logger = logging.getLogger("lmux.agent_sessions")
+
+# N10 (ISS-0027): resume_command is parsed, not shelled — but even so,
+# only known agent binaries may be relaunched. A crafted
+# resume_command like "my-agent; rm -rf ~" (or one smuggling flags
+# like "--exec") must not turn resume() into arbitrary execution.
+RESUME_BINARY_ALLOWLIST = frozenset({
+    "lmux-agent",
+    "claude",
+    "codex",
+    "gemini",
+    "opencode",
+    "aider",
+    "sgpt",
+})
+
+
+def parse_resume_command(resume_command: str) -> Optional[list]:
+    """Split a resume command safely (N10).
+
+    Uses shlex.split so quoted arguments survive intact, then enforces
+    the binary allowlist on argv[0]'s basename. Returns the argv list
+    or None when the command must not run.
+    """
+    if not resume_command or not resume_command.strip():
+        return None
+    try:
+        argv = shlex.split(resume_command)
+    except ValueError as e:
+        logger.error(f"Error parsing resume command: {e}")
+        return None
+    if not argv:
+        return None
+    binary = os.path.basename(argv[0])
+    if binary not in RESUME_BINARY_ALLOWLIST:
+        logger.error(f"Resume binary {binary!r} not in allowlist; refusing")
+        return None
+    return argv
 
 
 class AgentState(Enum):
@@ -153,7 +191,13 @@ class AgentSessionManager:
         # Start the agent process
         if session.resume_command:
             try:
-                cmd = session.resume_command.split()
+                cmd = parse_resume_command(session.resume_command)
+                if cmd is None:
+                    logger.error(f"Refusing to resume agent {session_id}: "
+                                 f"command failed allowlist/parse gate")
+                    session.state = AgentState.ERROR
+                    self._save_sessions()
+                    return False
                 proc = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
