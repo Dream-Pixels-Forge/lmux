@@ -414,6 +414,61 @@ const lmux_feed_entry *lmux_feed_entry_at(lmux_app *app, lmux_id panel_id, size_
 bool lmux_feed_panel_clear(lmux_app *app, lmux_id panel_id);
 
 /* ------------------------------------------------------------------ */
+/* Paste buffers                                                       */
+/* ------------------------------------------------------------------ */
+
+/* Named paste buffer entry. */
+typedef struct {
+    char     name[64];           /* buffer name (buffer0001, buffer0002, etc.) */
+    char    *data;               /* buffer contents (malloc'd) */
+    size_t   size;               /* size of data in bytes */
+    time_t   created_at;         /* creation timestamp */
+} lmux_buffer;
+
+/* Set a buffer's contents. If name is NULL, auto-generates bufferNNNN name.
+ * Returns 0 on success, -1 on error (e.g., OOM). */
+int  lmux_buffer_set(lmux_app *app, const char *name, const char *data, size_t size);
+
+/* Get a buffer's contents. Returns number of bytes copied (0 if not found or empty).
+ * If out is NULL, returns the buffer size without copying. */
+size_t lmux_buffer_get(lmux_app *app, const char *name, char *out, size_t cap);
+
+/* Delete a buffer by name. Returns true if buffer existed and was deleted. */
+bool lmux_buffer_delete(lmux_app *app, const char *name);
+
+/* List all buffer names into the provided array. Returns number of names written.
+ * Caller must free each name with free(). */
+size_t lmux_buffer_list(lmux_app *app, char **out_names, size_t max_names);
+
+/* Get the total number of buffers. */
+size_t lmux_buffer_count(lmux_app *app);
+
+/* Set the maximum number of buffers (0 = unlimited). When exceeded, oldest
+ * buffers are evicted FIFO. */
+void lmux_buffer_set_limit(lmux_app *app, size_t limit);
+
+/* Get the current buffer limit. */
+size_t lmux_buffer_get_limit(lmux_app *app);
+
+/* Save a buffer to a file. Returns true on success. */
+bool lmux_buffer_save(lmux_app *app, const char *name, const char *path);
+
+/* Load a buffer from a file. Creates or overwrites buffer with given name.
+ * Returns true on success. */
+bool lmux_buffer_load(lmux_app *app, const char *name, const char *path);
+
+/* Capture pane content into a buffer. start_line/end_line specify range
+ * (negative values count from end, like tmux -S/-E). Returns 0 on success. */
+int lmux_buffer_capture_pane(lmux_app *app, lmux_pane *pane, const char *buffer_name,
+                             long start_line, long end_line);
+
+/* Check if a buffer exists. Returns true if buffer exists (even if empty). */
+bool lmux_buffer_exists(lmux_app *app, const char *name);
+
+/* Get buffer size. Returns size, or SIZE_MAX if buffer doesn't exist. */
+size_t lmux_buffer_get_size(lmux_app *app, const char *name);
+
+/* ------------------------------------------------------------------ */
 /* Event queue                                                         */
 /* ------------------------------------------------------------------ */
 
