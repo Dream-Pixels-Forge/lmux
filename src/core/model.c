@@ -421,6 +421,14 @@ static void pane_kill_pty(lmux_pane *p) {
     }
 }
 
+/* Window size policy enum (matches tmux aggressive-resize / window-size) */
+typedef enum {
+    LMUX_WINDOW_SIZE_MANUAL   = 0, /* no auto-resize (default) */
+    LMUX_WINDOW_SIZE_LARGEST  = 1, /* resize to largest pane */
+    LMUX_WINDOW_SIZE_SMALLEST = 2, /* resize to smallest pane */
+    LMUX_WINDOW_SIZE_LATEST   = 3, /* resize to most recently active pane */
+} lmux_window_size_policy;
+
 /* ----- Surface (horizontal tab) ----- */
 
 struct lmux_surface {
@@ -429,6 +437,10 @@ struct lmux_surface {
     char           title[128];
     bool           focused;
     vec_t          panes;
+    /* Synchronize panes: when true, send-keys fans input to ALL panes */
+    bool           synchronize_panes;
+    /* Window size policy: how panes should be resized on split/close/resize */
+    lmux_window_size_policy window_size_policy;
     /* Canvas layout state */
     bool           canvas_mode;
     int            canvas_pane_x[64];
@@ -1306,6 +1318,8 @@ static const char *const HOOK_NAMES[] = {
     "after-detach",
     "after-split",
     "after-resize",
+    "after-sync-panes-changed",
+    "after-window-size-changed",
     /* Monitor hooks */
     "monitor-activity",
     "monitor-bell",
@@ -1561,6 +1575,9 @@ const char *lmux_pane_get_monitor_silence_action(const lmux_pane *pane) {
     return pane->monitor_silence_action;
 }
 
+/* Forward declaration for surface_recalc_pane_sizes (used in lmux_pane_split/close) */
+static void surface_recalc_pane_sizes(lmux_surface *s);
+
 /* Record a focus change. ids may be NULL when the target has no id yet. */
 static void app_focus_changed(lmux_app *app, lmux_pane *p) {
     if (!app) return;
@@ -1573,9 +1590,11 @@ static void app_focus_changed(lmux_app *app, lmux_pane *p) {
 static lmux_surface *surface_new(lmux_workspace *ws) {
     lmux_surface *s = calloc(1, sizeof *s);
     if (!s) return NULL;
-    s->id     = ws->app->next_surface_id++;
-    s->owner  = ws;
-    s->focused = false;
+    s->id                   = ws->app->next_surface_id++;
+    s->owner                = ws;
+    s->focused              = false;
+    s->synchronize_panes    = false;
+    s->window_size_policy   = LMUX_WINDOW_SIZE_MANUAL;
     return s;
 }
 
@@ -2505,6 +2524,9 @@ lmux_pane *lmux_pane_split(lmux_workspace *ws, lmux_surface *s,
     hook_dispatch_simple(ws->app, "after-pane-created", p->id);
     hook_dispatch_simple(ws->app, "after-split", p->id);
     
+    /* Recalculate pane sizes per window-size policy */
+    surface_recalc_pane_sizes(s);
+    
     return p;
 }
 
@@ -2521,6 +2543,8 @@ void lmux_pane_close(lmux_workspace *ws, lmux_pane *p) {
                 pane_scrollback_free(p);
                 vec_remove(&s->panes, j);
                 free(p);
+                /* Recalculate pane sizes per window-size policy */
+                surface_recalc_pane_sizes(s);
                 return;
             }
         }
@@ -2559,6 +2583,12 @@ void lmux_pane_focus(lmux_workspace *ws, lmux_pane *p) {
         }
     }
     ws->app->last_focused = p;
+    /* Update last_activity_ms for "latest" window-size policy */
+    if (p) {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        p->last_activity_ms = (long)ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+    }
     /* Every focus change flows through here, so record it for
      * `focus.history`. Skip no-op refocuses of the same pane. */
     if (ws->app->focus_history.count == 0 ||
@@ -2607,12 +2637,11 @@ lmux_id lmux_pane_get_id(lmux_pane *p) {
     return p->id;
 }
 
-bool lmux_pane_pty_set_size(lmux_pane *p, int cols, int rows) {
+/* Internal: apply size to a single pane (does not fan out) */
+static bool pane_pty_set_size_one(lmux_pane *p, int cols, int rows) {
     if (!p) return false;
-    /* Always store the requested size for format expander */
     p->pty_cols = (cols > 0 ? cols : 80);
     p->pty_rows = (rows > 0 ? rows : 24);
-    /* If PTY exists, also apply to the terminal */
     if (p->pty_fd >= 0) {
         struct winsize ws;
         memset(&ws, 0, sizeof ws);
@@ -2623,10 +2652,81 @@ bool lmux_pane_pty_set_size(lmux_pane *p, int cols, int rows) {
     return true;
 }
 
-void lmux_pane_send_keys(lmux_pane *p, const char *keys) {
+/* Recalculate all pane sizes in a surface based on window_size_policy */
+static void surface_recalc_pane_sizes(lmux_surface *s) {
+    if (!s || s->window_size_policy == LMUX_WINDOW_SIZE_MANUAL || s->panes.len <= 1) {
+        return;
+    }
+    
+    int target_cols = 80, target_rows = 24;
+    
+    switch (s->window_size_policy) {
+        case LMUX_WINDOW_SIZE_LARGEST: {
+            for (size_t i = 0; i < s->panes.len; i++) {
+                lmux_pane *p = s->panes.items[i];
+                if (p->pty_cols > target_cols) target_cols = p->pty_cols;
+                if (p->pty_rows > target_rows) target_rows = p->pty_rows;
+            }
+            break;
+        }
+        case LMUX_WINDOW_SIZE_SMALLEST: {
+            target_cols = INT_MAX;
+            target_rows = INT_MAX;
+            for (size_t i = 0; i < s->panes.len; i++) {
+                lmux_pane *p = s->panes.items[i];
+                if (p->pty_cols < target_cols) target_cols = p->pty_cols;
+                if (p->pty_rows < target_rows) target_rows = p->pty_rows;
+            }
+            if (target_cols == INT_MAX) target_cols = 80;
+            if (target_rows == INT_MAX) target_rows = 24;
+            break;
+        }
+        case LMUX_WINDOW_SIZE_LATEST: {
+            /* Find most recently focused pane */
+            lmux_pane *latest = NULL;
+            long latest_time = 0;
+            for (size_t i = 0; i < s->panes.len; i++) {
+                lmux_pane *p = s->panes.items[i];
+                /* Use last activity time as proxy for focus time */
+                if (p->last_activity_ms > latest_time) {
+                    latest_time = p->last_activity_ms;
+                    latest = p;
+                }
+            }
+            if (latest) {
+                target_cols = latest->pty_cols;
+                target_rows = latest->pty_rows;
+            }
+            break;
+        }
+        default:
+            return;
+    }
+    
+    /* Apply to all panes */
+    for (size_t i = 0; i < s->panes.len; i++) {
+        pane_pty_set_size_one(s->panes.items[i], target_cols, target_rows);
+    }
+}
+
+bool lmux_pane_pty_set_size(lmux_pane *p, int cols, int rows) {
+    if (!p) return false;
+    
+    /* Apply size to the target pane first */
+    bool ok = pane_pty_set_size_one(p, cols, rows);
+    
+    /* Then recalculate all panes in the surface per policy */
+    if (p->surface) {
+        surface_recalc_pane_sizes(p->surface);
+    }
+    
+    return ok;
+}
+
+/* Internal: send keys to a single pane (does not fan out) */
+static void pane_send_keys_one(lmux_pane *p, const char *keys) {
     if (!p || !keys) return;
     if (p->pty_fd < 0) {
-        /* Attempt to spawn if not yet running */
         if (pane_spawn_pty(p) != 0) {
             lmux_log(LMUX_LOG_DEBUG, "send_keys: no pty for pane %u", p->id);
             return;
@@ -2640,6 +2740,22 @@ void lmux_pane_send_keys(lmux_pane *p, const char *keys) {
         lmux_log(LMUX_LOG_DEBUG, "send_keys: wrote %zd bytes to pane %u",
                  n, p->id);
     }
+}
+
+void lmux_pane_send_keys(lmux_pane *p, const char *keys) {
+    if (!p || !keys) return;
+    
+    /* If synchronize-panes is enabled on the surface, fan out to all panes */
+    if (p->surface && p->surface->synchronize_panes) {
+        for (size_t i = 0; i < p->surface->panes.len; i++) {
+            lmux_pane *target = p->surface->panes.items[i];
+            pane_send_keys_one(target, keys);
+        }
+        return;
+    }
+    
+    /* Normal single-pane send */
+    pane_send_keys_one(p, keys);
 }
 
 void lmux_browser_open_url(lmux_pane *p, const char *url) {
@@ -5300,6 +5416,142 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
         goto done;
     }
+
+    /* --- surface.set_sync_panes --- */
+    if (strcmp(cmd, "surface.set_sync_panes") == 0) {
+        char s_id[64] = {0}, ws_id[64] = {0};
+        bool enabled = false;
+        lmux_id sid = 0;
+        /* Try numeric id first, then string */
+        int id_val = 0;
+        if (json_extract_int(args_json, "id", &id_val)) {
+            sid = (lmux_id)id_val;
+        } else {
+            json_extract_string(args_json, "id", s_id, sizeof s_id);
+            if (s_id[0]) sid = (lmux_id)atol(s_id);
+        }
+        json_extract_string(args_json, "workspace_id", ws_id, sizeof ws_id);
+        json_extract_bool(args_json, "enabled", &enabled);
+        if (sid == 0) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing id\"}}");
+            goto done;
+        }
+        lmux_surface *found = NULL;
+        if (ws_id[0]) {
+            lmux_workspace *ws = lmux_workspace_by_id(app, (lmux_id)atol(ws_id));
+            if (ws) {
+                for (size_t i = 0; i < ws->surfaces.len; i++) {
+                    if (((lmux_surface *)ws->surfaces.items[i])->id == sid) {
+                        found = ws->surfaces.items[i];
+                        break;
+                    }
+                }
+            }
+        } else {
+            for (size_t w = 0; w < app->workspaces.len && !found; w++) {
+                lmux_workspace *ws = app->workspaces.items[w];
+                for (size_t i = 0; i < ws->surfaces.len; i++) {
+                    if (((lmux_surface *)ws->surfaces.items[i])->id == sid) {
+                        found = ws->surfaces.items[i];
+                        break;
+                    }
+                }
+            }
+        }
+        if (!found) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"surface not found\"}}");
+            goto done;
+        }
+        if (found->synchronize_panes != enabled) {
+            found->synchronize_panes = enabled;
+            /* Fire hook */
+            hook_dispatch_simple(app, "after-sync-panes-changed", found->id);
+            /* Control notification: %synchronize-panes-changed <surface-id> <0|1> */
+            {
+                char line[128];
+                snprintf(line, sizeof line, "%%synchronize-panes-changed %u %d", found->id, enabled ? 1 : 0);
+                control_emit("pane", line);
+            }
+        }
+        written = snprintf(result, result_cap,
+            "{\"ok\":true,\"result\":{\"synchronize_panes\":%s}}", enabled ? "true" : "false");
+        goto done;
+    }
+
+    /* --- surface.set_window_size --- */
+    if (strcmp(cmd, "surface.set_window_size") == 0) {
+        char s_id[64] = {0}, ws_id[64] = {0}, policy_str[32] = {0};
+        lmux_id sid = 0;
+        /* Try numeric id first, then string */
+        int id_val = 0;
+        if (json_extract_int(args_json, "id", &id_val)) {
+            sid = (lmux_id)id_val;
+        } else {
+            json_extract_string(args_json, "id", s_id, sizeof s_id);
+            if (s_id[0]) sid = (lmux_id)atol(s_id);
+        }
+        json_extract_string(args_json, "workspace_id", ws_id, sizeof ws_id);
+        json_extract_string(args_json, "policy", policy_str, sizeof policy_str);
+        if (sid == 0 || !policy_str[0]) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing id and/or policy\"}}");
+            goto done;
+        }
+        lmux_window_size_policy policy = LMUX_WINDOW_SIZE_MANUAL;
+        if (strcmp(policy_str, "largest") == 0) policy = LMUX_WINDOW_SIZE_LARGEST;
+        else if (strcmp(policy_str, "smallest") == 0) policy = LMUX_WINDOW_SIZE_SMALLEST;
+        else if (strcmp(policy_str, "latest") == 0) policy = LMUX_WINDOW_SIZE_LATEST;
+        else if (strcmp(policy_str, "manual") == 0) policy = LMUX_WINDOW_SIZE_MANUAL;
+        else {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"policy must be manual|largest|smallest|latest\"}}");
+            goto done;
+        }
+        lmux_surface *found = NULL;
+        if (ws_id[0]) {
+            lmux_workspace *ws = lmux_workspace_by_id(app, (lmux_id)atol(ws_id));
+            if (ws) {
+                for (size_t i = 0; i < ws->surfaces.len; i++) {
+                    if (((lmux_surface *)ws->surfaces.items[i])->id == sid) {
+                        found = ws->surfaces.items[i];
+                        break;
+                    }
+                }
+            }
+        } else {
+            for (size_t w = 0; w < app->workspaces.len && !found; w++) {
+                lmux_workspace *ws = app->workspaces.items[w];
+                for (size_t i = 0; i < ws->surfaces.len; i++) {
+                    if (((lmux_surface *)ws->surfaces.items[i])->id == sid) {
+                        found = ws->surfaces.items[i];
+                        break;
+                    }
+                }
+            }
+        }
+        if (!found) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"surface not found\"}}");
+            goto done;
+        }
+        if (found->window_size_policy != policy) {
+            found->window_size_policy = policy;
+            /* Fire hook */
+            hook_dispatch_simple(app, "after-window-size-changed", found->id);
+            /* Control notification: %window-size-changed <surface-id> <policy> */
+            {
+                char line[128];
+                snprintf(line, sizeof line, "%%window-size-changed %u %d", found->id, policy);
+                control_emit("pane", line);
+            }
+        }
+        written = snprintf(result, result_cap,
+            "{\"ok\":true,\"result\":{\"window_size_policy\":%d}}", policy);
+        goto done;
+    }
+
     /* --- tree --- */
     if (strcmp(cmd, "tree") == 0) {
         /* H4 fix: pre-allocate buffer based on workspace/surface/pane counts.
@@ -6059,6 +6311,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             "\"workspace.reorder\",\"workspace.refresh\","
             "\"surface.create\",\"surface.list\",\"surface.close\",\"surface.split\","
             "\"surface.focus\",\"surface.send_text\",\"surface.send_key\","
+            "\"surface.set_sync_panes\",\"surface.set_window_size\","
             "\"pane.list\",\"pane.focus\",\"pane.resize\",\"pane.focus_dir\","
             "\"notification.create\",\"notification.list\","
             "\"notification.clear\",\"notification.mark_read\","
@@ -6545,6 +6798,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             "\"workspace.reorder\",\"workspace.refresh\","
             "\"surface.create\",\"surface.list\",\"surface.close\",\"surface.split\","
             "\"surface.focus\",\"surface.send_text\",\"surface.send_key\","
+            "\"surface.set_sync_panes\",\"surface.set_window_size\","
             "\"pane.list\",\"pane.focus\",\"pane.resize\",\"pane.focus_dir\","
             "\"notification.create\",\"notification.list\","
             "\"notification.clear\",\"notification.mark_read\","
