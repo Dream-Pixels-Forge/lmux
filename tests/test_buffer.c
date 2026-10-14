@@ -320,7 +320,7 @@ static void test_buffer_notifications_deleted(void) {
     lmux_app *app = make_app();
     
     lmux_buffer_set(app, "to-delete", "data", 4);
-    lmux_event_pop(app); /* consume buffer-created */
+    free(lmux_event_pop(app)); /* consume buffer-created */
     
     lmux_buffer_delete(app, "to-delete");
     
@@ -341,7 +341,7 @@ static void test_buffer_notifications_changed(void) {
     lmux_app *app = make_app();
     
     lmux_buffer_set(app, "existing", "old", 3);
-    lmux_event_pop(app); /* consume buffer-created */
+    free(lmux_event_pop(app)); /* consume buffer-created */
     
     lmux_buffer_set(app, "existing", "new content", 11);
     
