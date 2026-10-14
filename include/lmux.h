@@ -638,7 +638,17 @@ void lmux_hibernation_check(lmux_app *app);
 typedef struct {
     char name[256];
     bool signaled;
+    unsigned wake_count;          /* number of times this channel was woken */
 } lmux_wait_point;
+
+/* Wait-for flags for the public API */
+#define LMUX_WAIT_FOR_WAKE        (1u << 0)  /* -U: wake all waiters */
+
+/* Unregister a control client slot from all wait points.
+ * Called when a control client disconnects. */
+void lmux_wait_points_unregister_slot(lmux_app *app, int slot);
+
+/* Command-error hook (fires on dispatch failure) */
 /* ------------------------------------------------------------------ */
 /* Server-internal helpers (public for embedders)                      */
 /* ------------------------------------------------------------------ */

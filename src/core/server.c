@@ -362,6 +362,7 @@ static void serve_control_client(lmux_app *app, int fd,
 
 out:
     lmux_control_set_thread_slot(-1);
+    lmux_wait_points_unregister_slot(app, slot);
     lmux_control_unregister(slot);
     close(fd);
 }
