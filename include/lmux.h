@@ -163,6 +163,7 @@ lmux_surface *lmux_surface_create(lmux_workspace *ws, const char *title);
 void          lmux_surface_close (lmux_workspace *ws, lmux_surface *s);
 size_t        lmux_surface_count (lmux_workspace *ws);
 lmux_surface *lmux_surface_focused(lmux_workspace *ws);
+lmux_surface *lmux_surface_find_by_id(lmux_workspace *ws, lmux_id id);
 bool          lmux_surface_get_info   (lmux_surface *s, lmux_surface_info *out);
 lmux_id       lmux_surface_get_id(lmux_surface *s);
 void          lmux_surface_set_title(lmux_surface *s, const char *title);
