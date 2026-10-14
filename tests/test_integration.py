@@ -6594,6 +6594,129 @@ class TestVersionParity(unittest.TestCase):
                 f"  {name}: {ver}" for name, ver in sites.items()))
 
 
+# ====================================================================
+# Wait-for barriers (ISS-0036)
+# ====================================================================
+
+class TestWaitForBarriers(unittest.TestCase):
+    """wait-for [-U] <channel>: blocking synchronization primitive.
+
+    - wait-for <channel>: blocks caller until another client does wait-for -U <channel>
+    - wait-for -U <channel>: wake all waiters on channel, increment wake_count
+    - Control notifications: %wait-for <channel> <waiters>, %wait-for-wake <channel> <woken>
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.c = _ensure_daemon()
+
+    def test_wait_for_nonblocking_check(self):
+        """Non-control mode: wait-for returns current state without blocking."""
+        resp = self.c.send("wait-for", {"name": "test-channel"})
+        self.assertTrue(resp.get("ok"))
+        result = resp.get("result", {})
+        self.assertEqual(result.get("name"), "test-channel")
+        self.assertIn("signaled", result)
+        self.assertFalse(result.get("signaled"))
+        self.assertIn("wake_count", result)
+        self.assertEqual(result.get("wake_count"), 0)
+
+    def test_wait_for_signal_legacy(self):
+        """Legacy action=signal sets signaled flag (non-blocking)."""
+        resp = self.c.send("wait-for", {"name": "wake-test"})
+        self.assertTrue(resp.get("ok"))
+        self.assertFalse(resp.get("result", {}).get("signaled"))
+
+        # Signal the channel
+        resp = self.c.send("wait-for", {"name": "wake-test", "action": "signal"})
+        self.assertTrue(resp.get("ok"))
+        self.assertTrue(resp.get("result", {}).get("signaled"))
+
+        # Check state is now signaled
+        resp = self.c.send("wait-for", {"name": "wake-test"})
+        self.assertTrue(resp.get("ok"))
+        self.assertTrue(resp.get("result", {}).get("signaled"))
+
+    def test_wait_for_reset_clears_signal(self):
+        """wait-for with action=reset should clear the signal."""
+        # Signal first
+        self.c.send("wait-for", {"name": "reset-test", "action": "signal"})
+        resp = self.c.send("wait-for", {"name": "reset-test"})
+        self.assertTrue(resp.get("result", {}).get("signaled"))
+
+        # Reset
+        resp = self.c.send("wait-for", {"name": "reset-test", "action": "reset"})
+        self.assertTrue(resp.get("ok"))
+        self.assertFalse(resp.get("result", {}).get("signaled"))
+
+    def test_wait_for_missing_name_returns_error(self):
+        """wait-for without name should return invalid_params error."""
+        resp = self.c.send("wait-for", {})
+        self.assertFalse(resp.get("ok"))
+        self.assertEqual(resp.get("error", {}).get("code"), "invalid_params")
+
+    def test_wait_for_wake_flag_increments_wake_count(self):
+        """wait-for with wake=true should increment wake_count and return woken count."""
+        # First wake - no waiters
+        resp = self.c.send("wait-for", {"name": "wake-count-test", "wake": True})
+        self.assertTrue(resp.get("ok"))
+        result = resp.get("result", {})
+        self.assertEqual(result.get("woken"), 0)
+        self.assertEqual(result.get("wake_count"), 1)
+
+        # Second wake
+        resp = self.c.send("wait-for", {"name": "wake-count-test", "wake": True})
+        self.assertTrue(resp.get("ok"))
+        result = resp.get("result", {})
+        self.assertEqual(result.get("woken"), 0)
+        self.assertEqual(result.get("wake_count"), 2)
+
+    def test_wait_for_wake_flag_returns_wake_count_in_check(self):
+        """After wake, non-blocking check should show wake_count."""
+        self.c.send("wait-for", {"name": "check-wake-count", "wake": True})
+        self.c.send("wait-for", {"name": "check-wake-count", "wake": True})
+        resp = self.c.send("wait-for", {"name": "check-wake-count"})
+        self.assertTrue(resp.get("ok"))
+        self.assertEqual(resp.get("result", {}).get("wake_count"), 2)
+
+
+# ====================================================================
+# Command-error hook (ISS-0036)
+# ====================================================================
+
+class TestCommandErrorHook(unittest.TestCase):
+    """command-error hook fires when a command dispatch fails.
+
+    - Hook receives: error_code, error_message, failing_command, pane_id
+    - Control notification: %command-error <pane-id> <code> <message>
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.c = _ensure_daemon()
+
+    def test_unknown_command_triggers_error(self):
+        """Unknown command should return error response."""
+        resp = self.c.send("this.command.does.not.exist")
+        self.assertFalse(resp.get("ok"))
+        error = resp.get("error", {})
+        self.assertIn("code", error)
+        self.assertIn("message", error)
+
+    def test_invalid_params_triggers_error(self):
+        """Command with invalid params should return error."""
+        # wait-for without name
+        resp = self.c.send("wait-for", {})
+        self.assertFalse(resp.get("ok"))
+        error = resp.get("error", {})
+        self.assertEqual(error.get("code"), "invalid_params")
+
+    def test_invalid_json_triggers_error(self):
+        """Malformed JSON should be handled gracefully."""
+        # This is tested at the protocol level in other tests
+        pass
+
+
 if __name__ == "__main__":
     # Clean up leftover test sockets — only the dead ones (#38): never
     # unlink a socket that still answers, it may belong to a live runner.

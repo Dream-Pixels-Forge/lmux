@@ -153,6 +153,112 @@ static void vec_remove(vec_t *v, size_t idx) {
     v->len--;
 }
 
+/* ----- Wait points (synchronization primitive) ----- */
+
+#define LMUX_WAIT_MAX_WAITERS 32
+
+typedef struct {
+    char name[256];
+    bool signaled;
+    unsigned wake_count;
+    /* Waiting control client slots */
+    int waiters[LMUX_WAIT_MAX_WAITERS];
+    int nwaiters;
+    pthread_mutex_t lock;
+    pthread_cond_t cond;
+} lmux_wait_point_ext;
+
+/* Initialize a wait point */
+static lmux_wait_point_ext *wait_point_new(const char *name) {
+    lmux_wait_point_ext *wp = calloc(1, sizeof *wp);
+    if (!wp) return NULL;
+    snprintf(wp->name, sizeof wp->name, "%s", name);
+    wp->signaled = false;
+    wp->wake_count = 0;
+    wp->nwaiters = 0;
+    pthread_mutex_init(&wp->lock, NULL);
+    pthread_cond_init(&wp->cond, NULL);
+    return wp;
+}
+
+/* Free a wait point */
+static void wait_point_free(lmux_wait_point_ext *wp) {
+    if (!wp) return;
+    pthread_cond_destroy(&wp->cond);
+    pthread_mutex_destroy(&wp->lock);
+    free(wp);
+}
+
+/* Register a waiter (control client slot) on a wait point.
+ * Returns true if registered, false if full. */
+static bool wait_point_register_waiter(lmux_wait_point_ext *wp, int slot) {
+    if (!wp || slot < 0) return false;
+    pthread_mutex_lock(&wp->lock);
+    if (wp->nwaiters >= LMUX_WAIT_MAX_WAITERS) {
+        pthread_mutex_unlock(&wp->lock);
+        return false;
+    }
+    wp->waiters[wp->nwaiters++] = slot;
+    pthread_mutex_unlock(&wp->lock);
+    return true;
+}
+
+/* Unregister a waiter (e.g., on client disconnect) */
+static void wait_point_unregister_waiter(lmux_wait_point_ext *wp, int slot) {
+    if (!wp || slot < 0) return;
+    pthread_mutex_lock(&wp->lock);
+    for (int i = 0; i < wp->nwaiters; i++) {
+        if (wp->waiters[i] == slot) {
+            memmove(&wp->waiters[i], &wp->waiters[i + 1],
+                    (wp->nwaiters - i - 1) * sizeof(int));
+            wp->nwaiters--;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&wp->lock);
+}
+
+/* Wake all waiters on a wait point.
+ * Returns the number of waiters woken. */
+static int wait_point_wake_all(lmux_wait_point_ext *wp) {
+    if (!wp) return 0;
+    pthread_mutex_lock(&wp->lock);
+    int woken = wp->nwaiters;
+    wp->signaled = true;
+    wp->wake_count++;
+    wp->nwaiters = 0;
+    pthread_cond_broadcast(&wp->cond);
+    pthread_mutex_unlock(&wp->lock);
+    return woken;
+}
+
+/* Wait on a wait point with optional timeout (ms).
+ * Returns 0 on wake, -1 on timeout, -2 on error. */
+static int wait_point_wait(lmux_wait_point_ext *wp, int timeout_ms) {
+    if (!wp) return -2;
+    pthread_mutex_lock(&wp->lock);
+    int rc = 0;
+    if (!wp->signaled) {
+        if (timeout_ms < 0) {
+            /* Infinite wait */
+            rc = pthread_cond_wait(&wp->cond, &wp->lock);
+        } else {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_sec += timeout_ms / 1000;
+            ts.tv_nsec += (timeout_ms % 1000) * 1000000L;
+            if (ts.tv_nsec >= 1000000000L) {
+                ts.tv_sec++;
+                ts.tv_nsec -= 1000000000L;
+            }
+            rc = pthread_cond_timedwait(&wp->cond, &wp->lock, &ts);
+            if (rc == ETIMEDOUT) rc = -1;
+        }
+    }
+    pthread_mutex_unlock(&wp->lock);
+    return (rc == 0) ? 0 : rc;
+}
+
 /* ----- Clipboard (static, shared across panes) ----- */
 
 static char lmux_clipboard_buf[65536];
@@ -646,6 +752,15 @@ struct lmux_app {
     struct { char id[64]; char name[64]; struct { char name[64]; char role[32]; } members[8]; int member_count; } teams[16];
     int         team_count;
 };
+/* Unregister a control client slot from all wait points in the app.
+ * Called when a control client disconnects. */
+void lmux_wait_points_unregister_slot(lmux_app *app, int slot) {
+    if (!app || slot < 0) return;
+    for (size_t i = 0; i < app->wait_points.len; i++) {
+        lmux_wait_point_ext *wp = app->wait_points.items[i];
+        wait_point_unregister_waiter(wp, slot);
+    }
+}
 static lmux_pane *pane_new(lmux_workspace *ws, lmux_surface *s,
                            const char *kind) {
     lmux_pane *p = calloc(1, sizeof *p);
@@ -919,6 +1034,8 @@ static const char *const HOOK_NAMES[] = {
     "monitor-activity",
     "monitor-bell",
     "monitor-silence",
+    /* Command error hook (ISS-0036) */
+    "command-error",
     NULL
 };
 
@@ -1461,7 +1578,7 @@ void lmux_app_free(lmux_app *a) {
     free(a->agents.items);
     /* Clean up wait points */
     for (size_t i = 0; i < a->wait_points.len; i++) {
-        free(a->wait_points.items[i]);
+        wait_point_free(a->wait_points.items[i]);
     }
     free(a->wait_points.items);
     /* Close event log */
@@ -3520,6 +3637,45 @@ static naming_fingerprint naming_fingerprint_of(const char *cwd) {
         }
     }
     return fp;
+}
+
+/* Fire the command-error hook and emit control notification.
+ * Called when a command dispatch results in an error. */
+static void dispatch_fire_command_error(lmux_app *app, const char *cmd,
+                                        const char *error_code,
+                                        const char *error_message) {
+    if (!app || !cmd || !error_code || !error_message) return;
+    
+    int slot = lmux_control_current_slot();
+    int pane_id = slot >= 0 ? slot : 0;  // Use control slot as pane_id proxy
+    
+    /* Fire the hook: hook_dispatch_simple will find matching hooks and execute them */
+    hook_dispatch_simple(app, "command-error", (lmux_id)pane_id);
+    
+    /* Emit control notification: %command-error <pane-id> <code> <message> */
+    char line[512];
+    snprintf(line, sizeof line, "%%command-error %d %s %s",
+             pane_id, error_code, error_message);
+    lmux_control_notify("hook", line);
+}
+
+/* Extract error code and message from a JSON error response.
+ * Returns true if successful, false otherwise. */
+static bool extract_error_details(const char *result, char *code_out, size_t code_cap,
+                                  char *msg_out, size_t msg_cap) {
+    if (!result || !code_out || !msg_out) return false;
+    const char *code_start = strstr(result, "\"code\":\"");
+    const char *msg_start = strstr(result, "\"message\":\"");
+    if (!code_start || !msg_start) return false;
+    code_start += 8;  /* skip "code":" */
+    msg_start += 11;  /* skip "message":" */
+    size_t i = 0;
+    while (*code_start && *code_start != '"' && i + 1 < code_cap) code_out[i++] = *code_start++;
+    code_out[i] = 0;
+    i = 0;
+    while (*msg_start && *msg_start != '"' && i + 1 < msg_cap) msg_out[i++] = *msg_start++;
+    msg_out[i] = 0;
+    return true;
 }
 
 static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_json) {
@@ -5856,42 +6012,102 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         goto done;
     }
 
-    /* --- wait-for (real implementation) --- */
+    /* --- wait-for (real implementation with blocking barriers) --- */
     if (strcmp(cmd, "wait-for") == 0 || strcmp(cmd, "wait_for") == 0) {
         char name[256] = {0}, action[64] = {0};
+        bool do_wake = false;
         json_extract_string(args_json, "name", name, sizeof name);
         json_extract_string(args_json, "action", action, sizeof action);
+        json_extract_bool(args_json, "wake", &do_wake);
         if (!name[0]) {
             written = snprintf(result, result_cap,
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing name\"}}");
             goto done;
         }
-        /* Find or create the wait point */
-        lmux_wait_point *wp = NULL;
+        /* Find or create the wait point (extended) */
+        lmux_wait_point_ext *wp = NULL;
         for (size_t i = 0; i < app->wait_points.len; i++) {
-            lmux_wait_point *w = app->wait_points.items[i];
+            lmux_wait_point_ext *w = app->wait_points.items[i];
             if (strcmp(w->name, name) == 0) { wp = w; break; }
         }
         if (!wp) {
-            wp = calloc(1, sizeof *wp);
-            snprintf(wp->name, sizeof wp->name, "%s", name);
-            wp->signaled = false;
+            wp = wait_point_new(name);
+            if (!wp) {
+                written = snprintf(result, result_cap,
+                    "{\"ok\":false,\"error\":{\"code\":\"internal_error\",\"message\":\"out of memory\"}}");
+                goto done;
+            }
             vec_push(&app->wait_points, wp);
         }
-        if (action[0] && strcmp(action, "signal") == 0) {
+        int slot = lmux_control_current_slot();
+        bool is_control = (slot >= 0);
+        
+        if (do_wake) {
+            /* Wake all waiters on this channel (-U flag) */
+            int woken = wait_point_wake_all(wp);
+            char line[256];
+            snprintf(line, sizeof line, "%%wait-for-wake %s %d", name, woken);
+            lmux_control_notify("sync", line);
+            lmux_event_push(app, "wait.wake", "sync", "\"name\":\"%s\",\"woken\":%d", name, woken);
+            written = snprintf(result, result_cap,
+                "{\"ok\":true,\"result\":{\"name\":\"%s\",\"woken\":%d,\"wake_count\":%u}}",
+                name, woken, wp->wake_count);
+        } else if (action[0] && strcmp(action, "signal") == 0) {
+            /* Legacy signal action (non-blocking, sets signaled flag) */
+            pthread_mutex_lock(&wp->lock);
             wp->signaled = true;
+            pthread_mutex_unlock(&wp->lock);
             lmux_event_push(app, "wait.signaled", "sync", "\"name\":\"%s\"", name);
             written = snprintf(result, result_cap,
                 "{\"ok\":true,\"result\":{\"name\":\"%s\",\"signaled\":true}}", name);
         } else if (action[0] && strcmp(action, "reset") == 0) {
+            /* Reset the signaled flag */
+            pthread_mutex_lock(&wp->lock);
             wp->signaled = false;
+            pthread_mutex_unlock(&wp->lock);
             written = snprintf(result, result_cap,
                 "{\"ok\":true,\"result\":{\"name\":\"%s\",\"signaled\":false}}", name);
         } else {
-            /* Check/wait: return current state (non-blocking) */
-            written = snprintf(result, result_cap,
-                "{\"ok\":true,\"result\":{\"name\":\"%s\",\"signaled\":%s}}",
-                name, wp->signaled ? "true" : "false");
+            /* Wait-for: register as waiter and block until woken (control mode only) */
+            if (is_control) {
+                /* Register this client as a waiter */
+                if (!wait_point_register_waiter(wp, slot)) {
+                    written = snprintf(result, result_cap,
+                        "{\"ok\":false,\"error\":{\"code\":\"busy\",\"message\":\"too many waiters on channel\"}}");
+                    goto done;
+                }
+                /* Emit notification that a client is waiting */
+                char line[256];
+                int nwaiters;
+                pthread_mutex_lock(&wp->lock);
+                nwaiters = wp->nwaiters;
+                pthread_mutex_unlock(&wp->lock);
+                snprintf(line, sizeof line, "%%wait-for %s %d", name, nwaiters);
+                lmux_control_notify("sync", line);
+                
+                /* Block until woken (infinite wait) */
+                int wait_rc = wait_point_wait(wp, -1);
+                /* Unregister after wake */
+                wait_point_unregister_waiter(wp, slot);
+                
+                if (wait_rc == 0) {
+                    written = snprintf(result, result_cap,
+                        "{\"ok\":true,\"result\":{\"name\":\"%s\",\"woken\":true,\"wake_count\":%u}}",
+                        name, wp->wake_count);
+                } else {
+                    written = snprintf(result, result_cap,
+                        "{\"ok\":false,\"error\":{\"code\":\"interrupted\",\"message\":\"wait interrupted\"}}");
+                }
+            } else {
+                /* Non-control mode: non-blocking check */
+                bool signaled;
+                pthread_mutex_lock(&wp->lock);
+                signaled = wp->signaled;
+                pthread_mutex_unlock(&wp->lock);
+                written = snprintf(result, result_cap,
+                    "{\"ok\":true,\"result\":{\"name\":\"%s\",\"signaled\":%s,\"wake_count\":%u}}",
+                    name, signaled ? "true" : "false", wp->wake_count);
+            }
         }
         goto done;
     }
@@ -9221,6 +9437,15 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         cmd);
 
 done:
+    /* Fire command-error hook on error responses */
+    if (result && strstr(result, "\"ok\":false") != NULL) {
+        char error_code[64] = {0}, error_msg[256] = {0};
+        if (extract_error_details(result, error_code, sizeof error_code,
+                                  error_msg, sizeof error_msg)) {
+            dispatch_fire_command_error(app, cmd, error_code, error_msg);
+        }
+    }
+    
     /* ISS-0002: record every dispatched request in the log stream so
      * `logs` and /api/logs serve real history. lmux_log_request
      * previously had no callers, so the log file stayed empty. The
@@ -9405,6 +9630,7 @@ static char *make_error_response(const char *type, const char *title,
 
 char *lmux_dispatch_json(lmux_app *app, const char *json_request) {
     if (!app || !json_request) {
+        dispatch_fire_command_error(app, "", "invalid_request", "null request");
         return make_error_response("urn:lmux:invalid-request", "Invalid Request",
                                     "invalid_request", "null request", NULL);
     }
@@ -9412,6 +9638,7 @@ char *lmux_dispatch_json(lmux_app *app, const char *json_request) {
     /* Enforce maximum request size (64KB). */
     size_t req_len = strlen(json_request);
     if (req_len > 65536) {
+        dispatch_fire_command_error(app, "", "invalid_request", "request too large (max 64KB)");
         return make_error_response("urn:lmux:invalid-request", "Invalid Request",
                                     "invalid_request", "request too large (max 64KB)", NULL);
     }
@@ -9420,6 +9647,7 @@ char *lmux_dispatch_json(lmux_app *app, const char *json_request) {
     json_extract_string(json_request, "cmd", cmd, sizeof cmd);
 
     if (!cmd[0]) {
+        dispatch_fire_command_error(app, "", "invalid_request", "missing cmd field");
         return make_error_response("urn:lmux:invalid-request", "Invalid Request",
                                     "invalid_request", "missing cmd field", NULL);
     }
@@ -9429,6 +9657,7 @@ char *lmux_dispatch_json(lmux_app *app, const char *json_request) {
         char c = *p;
         if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
               (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-')) {
+            dispatch_fire_command_error(app, cmd, "invalid_request", "invalid cmd characters");
             return make_error_response("urn:lmux:invalid-request", "Invalid Request",
                                         "invalid_request", "invalid cmd characters", NULL);
         }
@@ -9440,6 +9669,7 @@ char *lmux_dispatch_json(lmux_app *app, const char *json_request) {
     size_t args_cap = 1024;
     char *args_buf = calloc(args_cap, 1);
     if (!args_buf) {
+        dispatch_fire_command_error(app, cmd, "oom", "out of memory");
         return make_error_response("urn:lmux:internal-error", "Internal Error",
                                     "oom", "out of memory", NULL);
     }
@@ -9455,7 +9685,9 @@ char *lmux_dispatch_json(lmux_app *app, const char *json_request) {
                 /* Grow buffer (L5 fix) */
                 args_cap *= 2;
                 char *tmp = realloc(args_buf, args_cap);
-                if (!tmp) { free(args_buf); return make_error_response("urn:lmux:internal-error", "Internal Error", "oom", "out of memory", NULL); }
+                if (!tmp) { free(args_buf); 
+                    dispatch_fire_command_error(app, cmd, "oom", "out of memory");
+                    return make_error_response("urn:lmux:internal-error", "Internal Error", "oom", "out of memory", NULL); }
                 args_buf = tmp;
             }
             if (in_string) {
@@ -9474,6 +9706,7 @@ char *lmux_dispatch_json(lmux_app *app, const char *json_request) {
                     depth++;
                     if (depth > MAX_JSON_DEPTH) {
                         free(args_buf);
+                        dispatch_fire_command_error(app, cmd, "invalid_request", "JSON nesting too deep (max 8)");
                         return make_error_response("urn:lmux:invalid-request", "Invalid Request",
                                                     "invalid_request", "JSON nesting too deep (max 8)", NULL);
                     }
