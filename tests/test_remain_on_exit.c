@@ -206,13 +206,15 @@ static void test_monitor_activity_hook(void) {
     lmux_app_free(app); teardown(); PASS();
 }
 
+
 /* Test monitor-bell hook fires on bell character */
 static void test_monitor_bell_hook(void) {
     TEST("monitor-bell hook fires on bell character");
     lmux_app *app = make_app();
     lmux_workspace *ws = lmux_workspace_create(app, "ws");
     lmux_surface *surf = lmux_surface_create(ws, "surf");
-    lmux_pane *pane = lmux_pane_split(ws, surf, LMUX_SPLIT_HORIZONTAL, "cat", true);
+    /* Use a command that outputs a bell character */
+    lmux_pane *pane = lmux_pane_split(ws, surf, LMUX_SPLIT_HORIZONTAL, "printf '\\a'", true);
     
     /* Set monitor bell action */
     lmux_pane_set_monitor_bell_action(pane, "any");
@@ -220,10 +222,7 @@ static void test_monitor_bell_hook(void) {
     /* Register monitor-bell hook */
     lmux_hook_add(app, "monitor-bell", "echo bell detected");
     
-    /* Send bell character (ASCII 7) */
-    lmux_pane_send_keys(pane, "\x07");
-    
-    /* Wait and call tick multiple times */
+    /* Wait for the command to run and output the bell character */
     for (int i = 0; i < 20; i++) {
         usleep(50000);
         lmux_app_tick(app);
@@ -237,7 +236,6 @@ static void test_monitor_bell_hook(void) {
     
     lmux_app_free(app); teardown(); PASS();
 }
-
 /* Test monitor-silence hook fires after silence interval */
 static void test_monitor_silence_hook(void) {
     TEST("monitor-silence hook fires after silence interval");
