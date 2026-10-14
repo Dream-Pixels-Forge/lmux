@@ -204,7 +204,8 @@ static void test_control_notify_sync_panes(void) {
     lmux_control_subscribe(slot, "test", "pane", "");
     
     // Toggle synchronize-panes (surf is surface ID 2)
-    dispatch(app, "{\"cmd\":\"surface.set_sync_panes\",\"args\":{\"id\":2,\"enabled\":true}}");
+    char *resp = dispatch(app, "{\"cmd\":\"surface.set_sync_panes\",\"args\":{\"id\":2,\"enabled\":true}}");
+    free(resp);
     
     // Pop pending and verify %synchronize-panes-changed
     char *pending[16];
@@ -235,7 +236,8 @@ static void test_control_notify_window_size(void) {
     lmux_control_subscribe(slot, "test", "pane", "");
     
     // Change window-size policy (surf is surface ID 2)
-    dispatch(app, "{\"cmd\":\"surface.set_window_size\",\"args\":{\"id\":2,\"policy\":\"largest\"}}");
+    char *resp = dispatch(app, "{\"cmd\":\"surface.set_window_size\",\"args\":{\"id\":2,\"policy\":\"largest\"}}");
+    free(resp);
     
     // Pop pending and verify %window-size-changed
     char *pending[16];
@@ -264,13 +266,14 @@ static void test_resize_pane_honors_policy(void) {
     lmux_pane_split(ws, surf, LMUX_SPLIT_HORIZONTAL, "cat", false);
     
     // Set policy to largest (surf is surface ID 2)
-    dispatch(app, "{\"cmd\":\"surface.set_window_size\",\"args\":{\"id\":2,\"policy\":\"largest\"}}");
+    char *resp = dispatch(app, "{\"cmd\":\"surface.set_window_size\",\"args\":{\"id\":2,\"policy\":\"largest\"}}");
+    free(resp);
     
     // Send resize command
-    char *resp = dispatch(app, "{\"cmd\":\"pane.resize\",\"args\":{\"surface_id\":2,\"cols\":120,\"rows\":40}}");
-    ASSERT(resp != NULL, "response should not be NULL");
-    ASSERT(strstr(resp, "\"ok\":true"), "resize should succeed");
-    free(resp);
+    char *resp2 = dispatch(app, "{\"cmd\":\"pane.resize\",\"args\":{\"surface_id\":2,\"cols\":120,\"rows\":40}}");
+    ASSERT(resp2 != NULL, "response should not be NULL");
+    ASSERT(strstr(resp2, "\"ok\":true"), "resize should succeed");
+    free(resp2);
     
     lmux_app_free(app); teardown(); PASS();
 }
@@ -286,13 +289,14 @@ static void test_resize_window_honors_policy(void) {
     lmux_pane_split(ws, surf, LMUX_SPLIT_HORIZONTAL, "cat", false);
     
     // Set policy to smallest (surf is surface ID 2)
-    dispatch(app, "{\"cmd\":\"surface.set_window_size\",\"args\":{\"id\":2,\"policy\":\"smallest\"}}");
+    char *resp = dispatch(app, "{\"cmd\":\"surface.set_window_size\",\"args\":{\"id\":2,\"policy\":\"smallest\"}}");
+    free(resp);
     
     // Send resize command
-    char *resp = dispatch(app, "{\"cmd\":\"pane.resize\",\"args\":{\"surface_id\":2,\"cols\":60,\"rows\":20}}");
-    ASSERT(resp != NULL, "response should not be NULL");
-    ASSERT(strstr(resp, "\"ok\":true"), "resize should succeed");
-    free(resp);
+    char *resp2 = dispatch(app, "{\"cmd\":\"pane.resize\",\"args\":{\"surface_id\":2,\"cols\":60,\"rows\":20}}");
+    ASSERT(resp2 != NULL, "response should not be NULL");
+    ASSERT(strstr(resp2, "\"ok\":true"), "resize should succeed");
+    free(resp2);
     
     lmux_app_free(app); teardown(); PASS();
 }
@@ -306,12 +310,13 @@ static void test_split_close_triggers_resize(void) {
     (void)surf;
     
     // Set policy to largest (surf is surface ID 2)
-    dispatch(app, "{\"cmd\":\"surface.set_window_size\",\"args\":{\"id\":2,\"policy\":\"largest\"}}");
+    char *resp = dispatch(app, "{\"cmd\":\"surface.set_window_size\",\"args\":{\"id\":2,\"policy\":\"largest\"}}");
+    free(resp);
     
     // Split a new pane - should trigger recalc
-    char *resp = dispatch(app, "{\"cmd\":\"surface.split\",\"args\":{\"surface_id\":2,\"direction\":\"horizontal\"}}");
-    ASSERT(resp != NULL, "split should succeed");
-    free(resp);
+    char *resp2 = dispatch(app, "{\"cmd\":\"surface.split\",\"args\":{\"surface_id\":2,\"direction\":\"horizontal\"}}");
+    ASSERT(resp2 != NULL, "split should succeed");
+    free(resp2);
     
     // Close a pane - should trigger recalc
     resp = dispatch(app, "{\"cmd\":\"pane.focus\",\"args\":{\"id\":2}}");
