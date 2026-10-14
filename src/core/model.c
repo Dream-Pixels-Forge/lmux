@@ -429,6 +429,7 @@ struct lmux_surface {
     char           title[128];
     bool           focused;
     vec_t          panes;
+    int            ref_count;  /* reference count for linked surfaces */
     /* Canvas layout state */
     bool           canvas_mode;
     int            canvas_pane_x[64];
@@ -460,6 +461,7 @@ struct lmux_workspace {
     vec_t          surfaces;
     vec_t          env_vars;      /* array of char* in "KEY=VALUE" format */
     vec_t          auth_tokens;   /* future use */
+    lmux_id        group_id;      /* session group ID, 0 = ungrouped */
 };
 
 
@@ -540,6 +542,15 @@ static void lmux_data_root(char *buf, size_t cap) {
     if (home && home[0]) { snprintf(buf, cap, "%s/.local/share/lmux", home); return; }
     snprintf(buf, cap, "/tmp/lmux");
 }
+
+/* Session group structure */
+typedef struct {
+    lmux_id id;
+    char    name[256];
+    lmux_id synchronize_from;  /* workspace ID that is the sync source */
+    vec_t   workspace_ids;     /* vector of lmux_id */
+    int     ref_count;         /* reference count for linked surfaces */
+} lmux_session_group;
 
 /* ----- Data paths ----- */
 static void lmux_data_path(char *buf, size_t cap, const char *file) {
@@ -645,6 +656,9 @@ struct lmux_app {
     /* Agent Teams */
     struct { char id[64]; char name[64]; struct { char name[64]; char role[32]; } members[8]; int member_count; } teams[16];
     int         team_count;
+    /* Session groups */
+    vec_t       session_groups;         /* of lmux_session_group* */
+    lmux_id     next_session_group_id;  /* auto-increment session group id */
 };
 static lmux_pane *pane_new(lmux_workspace *ws, lmux_surface *s,
                            const char *kind) {
@@ -1185,6 +1199,7 @@ static lmux_surface *surface_new(lmux_workspace *ws) {
     s->id     = ws->app->next_surface_id++;
     s->owner  = ws;
     s->focused = false;
+    s->ref_count = 1;  /* initial reference from creating workspace */
     return s;
 }
 
@@ -1217,6 +1232,7 @@ lmux_app *lmux_app_new(const char *socket_path) {
     a->ssh_sessions = (vec_t){0};
     a->feed_panels = (vec_t){0};
     a->feed_entries = (vec_t){0};
+    a->session_groups = (vec_t){0};
     a->next_agent_id = 1;
     a->next_surface_id = 1;
     a->next_pane_id = 1;
@@ -1224,6 +1240,7 @@ lmux_app *lmux_app_new(const char *socket_path) {
     a->next_window_id = 1;
     a->next_ssh_session_id = 1;
     a->next_feed_panel_id = 1;
+    a->next_session_group_id = 1;
     a->hooks = (vec_t){0};
     a->next_hook_id = 1;
     a->naming_cache = (vec_t){0};
@@ -1427,13 +1444,17 @@ void lmux_app_free(lmux_app *a) {
         lmux_workspace *ws = a->workspaces.items[i];
         for (size_t j = 0; j < ws->surfaces.len; j++) {
             lmux_surface *s = ws->surfaces.items[j];
-            for (size_t k = 0; k < s->panes.len; k++) {
-                pane_kill_pty(s->panes.items[k]);
-                pane_scrollback_free(s->panes.items[k]);
-                free(s->panes.items[k]);
+            /* Decrement reference count and free if zero */
+            s->ref_count--;
+            if (s->ref_count <= 0) {
+                for (size_t k = 0; k < s->panes.len; k++) {
+                    pane_kill_pty(s->panes.items[k]);
+                    pane_scrollback_free(s->panes.items[k]);
+                    free(s->panes.items[k]);
+                }
+                free(s->panes.items);
+                free(s);
             }
-            free(s->panes.items);
-            free(s);
         }
         free(ws->surfaces.items);
         free(ws);
@@ -1827,12 +1848,24 @@ static bool ws_owns_pane(const lmux_workspace *ws, const lmux_pane *p) {
     return false;
 }
 
+/* Forward declarations for session group helpers (used in workspace_close) */
+static bool session_group_remove_workspace(lmux_app *app, lmux_id group_id, lmux_id workspace_id);
+static void session_group_destroy_if_empty(lmux_app *app, lmux_id group_id);
+static void session_group_emit_control(lmux_app *app, lmux_id group_id, const char *action);
+
 void lmux_workspace_close(lmux_app *a, lmux_workspace *ws) {
     for (size_t i = 0; i < a->workspaces.len; i++) {
         if (a->workspaces.items[i] == ws) {
             /* Fire hook before removing */
             hook_dispatch_simple(a, "session-closed", ws->id);
             hook_dispatch_simple(a, "after-session-created", ws->id); /* Note: tmux uses after-session-closed but we follow spec */
+            
+            /* Remove workspace from its session group if it belongs to one */
+            if (ws->group_id != 0) {
+                session_group_remove_workspace(a, ws->group_id, ws->id);
+                session_group_destroy_if_empty(a, ws->group_id);
+                session_group_emit_control(a, ws->group_id, "destroyed");
+            }
             
             vec_remove(&a->workspaces, i);
             /* Drop app-level pane pointers *before* freeing the panes, while
@@ -1844,13 +1877,17 @@ void lmux_workspace_close(lmux_app *a, lmux_workspace *ws) {
                 a->search_pane = NULL;
             for (size_t j = 0; j < ws->surfaces.len; j++) {
                 lmux_surface *s = ws->surfaces.items[j];
-                for (size_t k = 0; k < s->panes.len; k++) {
-                    pane_kill_pty(s->panes.items[k]);
-                    pane_scrollback_free(s->panes.items[k]);
-                    free(s->panes.items[k]);
+                /* Decrement reference count and free if zero */
+                s->ref_count--;
+                if (s->ref_count <= 0) {
+                    for (size_t k = 0; k < s->panes.len; k++) {
+                        pane_kill_pty(s->panes.items[k]);
+                        pane_scrollback_free(s->panes.items[k]);
+                        free(s->panes.items[k]);
+                    }
+                    free(s->panes.items);
+                    free(s);
                 }
-                free(s->panes.items);
-                free(s);
             }
             for (size_t ei = 0; ei < ws->env_vars.len; ei++) {
                 free(ws->env_vars.items[ei]);
@@ -2029,21 +2066,33 @@ void lmux_surface_close(lmux_workspace *ws, lmux_surface *s) {
             /* Fire hooks before closing */
             hook_dispatch_simple(ws->app, "window-closed", s->id);
             hook_dispatch_simple(ws->app, "after-window-created", s->id);
-            for (size_t k = 0; k < s->panes.len; k++) {
-                lmux_pane *p = (lmux_pane *)s->panes.items[k];
-                hook_dispatch_simple(ws->app, "pane-closed", p->id);
-                hook_dispatch_simple(ws->app, "after-pane-closed", p->id);
-                pane_kill_pty(p);
-                pane_scrollback_free(p);
-                free(p);
+            
+            /* Decrement reference count and free if zero */
+            s->ref_count--;
+            if (s->ref_count <= 0) {
+                for (size_t k = 0; k < s->panes.len; k++) {
+                    lmux_pane *p = (lmux_pane *)s->panes.items[k];
+                    hook_dispatch_simple(ws->app, "pane-closed", p->id);
+                    hook_dispatch_simple(ws->app, "after-pane-closed", p->id);
+                    pane_kill_pty(p);
+                    pane_scrollback_free(p);
+                    free(p);
+                }
+                free(s->panes.items);
+                vec_remove(&ws->surfaces, i);
+                if (s->focused && ws->surfaces.len) {
+                    lmux_surface *n = ws->surfaces.items[0];
+                    n->focused = true;
+                }
+                free(s);
+            } else {
+                /* Just remove from this workspace, don't free */
+                vec_remove(&ws->surfaces, i);
+                if (s->focused && ws->surfaces.len) {
+                    lmux_surface *n = ws->surfaces.items[0];
+                    n->focused = true;
+                }
             }
-            free(s->panes.items);
-            vec_remove(&ws->surfaces, i);
-            if (s->focused && ws->surfaces.len) {
-                lmux_surface *n = ws->surfaces.items[0];
-                n->focused = true;
-            }
-            free(s);
             return;
         }
     }
@@ -2071,6 +2120,15 @@ bool lmux_surface_get_info(lmux_surface *s, lmux_surface_info *out) {
 lmux_id lmux_surface_get_id(lmux_surface *s) {
     if (!s) return 0;
     return s->id;
+}
+
+lmux_surface *lmux_surface_find_by_id(lmux_workspace *ws, lmux_id id) {
+    if (!ws) return NULL;
+    for (size_t i = 0; i < ws->surfaces.len; i++) {
+        lmux_surface *s = ws->surfaces.items[i];
+        if (s->id == id) return s;
+    }
+    return NULL;
 }
 
 void lmux_surface_set_title(lmux_surface *s, const char *title) {
@@ -3522,6 +3580,111 @@ static naming_fingerprint naming_fingerprint_of(const char *cwd) {
     return fp;
 }
 
+/* ========================================================================= */
+/* Session Group Helpers                                                     */
+/* ========================================================================= */
+
+static lmux_session_group *session_group_find_by_id(lmux_app *app, lmux_id id) {
+    if (!app || id == 0) return NULL;
+    for (size_t i = 0; i < app->session_groups.len; i++) {
+        lmux_session_group *g = app->session_groups.items[i];
+        if (g->id == id) return g;
+    }
+    return NULL;
+}
+
+static lmux_session_group *session_group_find_by_name(lmux_app *app, const char *name) {
+    if (!app || !name || !name[0]) return NULL;
+    for (size_t i = 0; i < app->session_groups.len; i++) {
+        lmux_session_group *g = app->session_groups.items[i];
+        if (strcmp(g->name, name) == 0) return g;
+    }
+    return NULL;
+}
+
+static lmux_session_group *session_group_create(lmux_app *app, const char *name) {
+    if (!app || !name || !name[0]) return NULL;
+    
+    /* Check if group already exists */
+    lmux_session_group *existing = session_group_find_by_name(app, name);
+    if (existing) return existing;
+    
+    lmux_session_group *g = calloc(1, sizeof *g);
+    if (!g) return NULL;
+    
+    g->id = app->next_session_group_id++;
+    snprintf(g->name, sizeof g->name, "%s", name);
+    g->synchronize_from = 0;
+    g->workspace_ids = (vec_t){0};
+    g->ref_count = 0;
+    
+    vec_push(&app->session_groups, g);
+    return g;
+}
+
+static bool session_group_add_workspace(lmux_app *app, lmux_id group_id, lmux_id workspace_id) {
+    lmux_session_group *g = session_group_find_by_id(app, group_id);
+    if (!g) return false;
+    
+    /* Check if workspace already in group */
+    for (size_t i = 0; i < g->workspace_ids.len; i++) {
+        lmux_id *wid = g->workspace_ids.items[i];
+        if (*wid == workspace_id) return true;
+    }
+    
+    lmux_id *wid = malloc(sizeof *wid);
+    if (!wid) return false;
+    *wid = workspace_id;
+    vec_push(&g->workspace_ids, wid);
+    return true;
+}
+
+static bool session_group_remove_workspace(lmux_app *app, lmux_id group_id, lmux_id workspace_id) {
+    lmux_session_group *g = session_group_find_by_id(app, group_id);
+    if (!g) return false;
+    
+    for (size_t i = 0; i < g->workspace_ids.len; i++) {
+        lmux_id *wid = g->workspace_ids.items[i];
+        if (*wid == workspace_id) {
+            free(wid);
+            vec_remove(&g->workspace_ids, i);
+            return true;
+        }
+    }
+    return false;
+}
+
+static void session_group_destroy_if_empty(lmux_app *app, lmux_id group_id) {
+    lmux_session_group *g = session_group_find_by_id(app, group_id);
+    if (!g) return;
+    
+    if (g->workspace_ids.len == 0) {
+        /* Remove from app's session_groups vector */
+        for (size_t i = 0; i < app->session_groups.len; i++) {
+            if (app->session_groups.items[i] == g) {
+                vec_remove(&app->session_groups, i);
+                free(g->workspace_ids.items);
+                free(g);
+                return;
+            }
+        }
+    }
+}
+
+/* Emit session group control notification */
+static void session_group_emit_control(lmux_app *app, lmux_id group_id, const char *action) {
+    char line[256];
+    snprintf(line, sizeof line, "%%session-group-changed %u %s", group_id, action);
+    control_emit("session", line);
+}
+
+/* Emit window link/unlink control notification */
+static void window_link_emit_control(lmux_app *app, lmux_id surface_id, lmux_id target_ws_id, bool is_link) {
+    char line[256];
+    snprintf(line, sizeof line, "%%window-%s %u %u", is_link ? "linked" : "unlinked", surface_id, target_ws_id);
+    control_emit("window", line);
+}
+
 static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_json) {
     size_t result_cap = 16384;
     char *result = malloc(result_cap);
@@ -3546,9 +3709,22 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
     /* --- workspace.create --- */
     if (strcmp(cmd, "workspace.create") == 0) {
         char title[256] = "Workspace";
+        char group[256] = {0};
         json_extract_string(args_json, "title", title, sizeof title);
+        json_extract_string(args_json, "group", group, sizeof group);
+        
         lmux_workspace *ws = lmux_workspace_create(app, title);
         if (ws) {
+            /* If group specified, add workspace to session group */
+            if (group[0]) {
+                lmux_session_group *g = session_group_create(app, group);
+                if (g) {
+                    ws->group_id = g->id;
+                    session_group_add_workspace(app, g->id, ws->id);
+                    session_group_emit_control(app, g->id, "created");
+                }
+            }
+            
             written = snprintf(result, result_cap,
                 "{\"ok\":true,\"result\":{\"id\":%u,\"title\":\"%s\"}}",
                 ws->id, JESC(ws->title));
@@ -3564,6 +3740,21 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             written = snprintf(result, result_cap,
                 "{\"ok\":false,\"error\":{\"code\":\"create_failed\",\"message\":\"failed to create workspace\"}}");
         }
+        goto done;
+    }
+
+    /* --- session.group.list --- */
+    if (strcmp(cmd, "session.group.list") == 0) {
+        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{\"groups\":[");
+        for (size_t i = 0; i < app->session_groups.len; i++) {
+            lmux_session_group *g = app->session_groups.items[i];
+            RESULT_GROW;
+            if (i > 0) written += snprintf(result + written, result_cap - written, ",");
+            written += snprintf(result + written, result_cap - written,
+                "{\"id\":%u,\"name\":\"%s\",\"workspace_count\":%zu,\"synchronize_from\":%u}",
+                g->id, JESC(g->name), g->workspace_ids.len, g->synchronize_from);
+        }
+        written += snprintf(result + written, result_cap - written, "]}}");
         goto done;
     }
 
@@ -3738,15 +3929,144 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                 RESULT_GROW;
                 char _se[512];
                 if (i > 0) written += snprintf(result + written, result_cap - written, ",");
+                /* Count how many workspaces this surface is linked to */
+                int linked_count = 1;  /* at least the current workspace */
+                for (size_t j = 0; j < app->workspaces.len; j++) {
+                    lmux_workspace *other_ws = app->workspaces.items[j];
+                    if (other_ws == ws) continue;
+                    for (size_t k = 0; k < other_ws->surfaces.len; k++) {
+                        if (other_ws->surfaces.items[k] == s) {
+                            linked_count++;
+                            break;
+                        }
+                    }
+                }
                 written += snprintf(result + written, result_cap - written,
-                    "{\"id\":%u,\"title\":\"%s\",\"focused\":%s}",
-                    s->id, json_escape_str(_se, sizeof _se, s->title), s->focused ? "true" : "false");
+                    "{\"id\":%u,\"title\":\"%s\",\"focused\":%s,\"linked_count\":%d}",
+                    s->id, json_escape_str(_se, sizeof _se, s->title), s->focused ? "true" : "false", linked_count);
             }
             written += snprintf(result + written, result_cap - written, "]}}");
         } else {
             written = snprintf(result, result_cap,
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no workspaces\"}}");
         }
+        goto done;
+    }
+
+    /* --- surface.link --- */
+    if (strcmp(cmd, "surface.link") == 0) {
+        int surface_id = 0, target_ws_id = 0;
+        json_extract_int(args_json, "surface_id", &surface_id);
+        json_extract_int(args_json, "target_workspace_id", &target_ws_id);
+        
+        if (surface_id == 0 || target_ws_id == 0) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing surface_id or target_workspace_id\"}}");
+            goto done;
+        }
+        
+        /* Find the surface in any workspace using the public API */
+        lmux_surface *surf = NULL;
+        lmux_workspace *source_ws = NULL;
+        for (size_t i = 0; i < app->workspaces.len; i++) {
+            lmux_workspace *ws = app->workspaces.items[i];
+            lmux_surface *s = lmux_surface_find_by_id(ws, (lmux_id)surface_id);
+            if (s) {
+                surf = s;
+                source_ws = ws;
+                break;
+            }
+        }
+        
+        if (!surf) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"surface not found\"}}");
+            goto done;
+        }
+        
+        lmux_workspace *target_ws = lmux_workspace_by_id(app, (lmux_id)target_ws_id);
+        if (!target_ws) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"target workspace not found\"}}");
+            goto done;
+        }
+        
+        /* Check if both workspaces are in the same group */
+        if (source_ws->group_id == 0 || target_ws->group_id == 0 || 
+            source_ws->group_id != target_ws->group_id) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"workspaces must be in the same session group\"}}");
+            goto done;
+        }
+        
+        /* Check if surface is already linked to target workspace */
+        for (size_t i = 0; i < target_ws->surfaces.len; i++) {
+            if (target_ws->surfaces.items[i] == surf) {
+                written = snprintf(result, result_cap,
+                    "{\"ok\":true,\"result\":{}}");  /* Already linked, idempotent */
+                goto done;
+            }
+        }
+        
+        /* Link the surface to target workspace */
+        vec_push(&target_ws->surfaces, surf);
+        surf->ref_count++;  /* Increment reference count */
+        
+        /* Emit control notification */
+        window_link_emit_control(app, (lmux_id)surface_id, (lmux_id)target_ws_id, true);
+        
+        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+        goto done;
+    }
+
+    /* --- surface.unlink --- */
+    if (strcmp(cmd, "surface.unlink") == 0) {
+        int surface_id = 0, ws_id = 0;
+        json_extract_int(args_json, "surface_id", &surface_id);
+        json_extract_int(args_json, "workspace_id", &ws_id);
+        
+        if (surface_id == 0 || ws_id == 0) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing surface_id or workspace_id\"}}");
+            goto done;
+        }
+        
+        lmux_workspace *ws = lmux_workspace_by_id(app, (lmux_id)ws_id);
+        if (!ws) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"workspace not found\"}}");
+            goto done;
+        }
+        
+        /* Find and remove the surface from this workspace's surfaces vector */
+        for (size_t i = 0; i < ws->surfaces.len; i++) {
+            lmux_surface *s = ws->surfaces.items[i];
+            if (s->id == (lmux_id)surface_id) {
+                vec_remove(&ws->surfaces, i);
+                
+                /* Decrement reference count and free if zero */
+                s->ref_count--;
+                if (s->ref_count <= 0) {
+                    /* Free the surface and its panes */
+                    for (size_t k = 0; k < s->panes.len; k++) {
+                        pane_kill_pty(s->panes.items[k]);
+                        pane_scrollback_free(s->panes.items[k]);
+                        free(s->panes.items[k]);
+                    }
+                    free(s->panes.items);
+                    free(s);
+                }
+                
+                /* Emit control notification */
+                window_link_emit_control(app, (lmux_id)surface_id, (lmux_id)ws_id, false);
+                
+                written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+                goto done;
+            }
+        }
+        
+        written = snprintf(result, result_cap,
+            "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"surface not linked to this workspace\"}}");
         goto done;
     }
 
