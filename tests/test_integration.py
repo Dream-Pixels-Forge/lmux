@@ -3955,198 +3955,209 @@ class TestCopyMode(unittest.TestCase):
     def test_enter_exit_copy_mode(self):
         """Enter copy mode, verify active, exit, verify inactive."""
         ws = self._make_ws_with_pane()
+        ws_id = ws["id"]
         # Enter copy mode
-        res = self.c.pane_copy_mode_enter()
+        res = self.c.pane_copy_mode_enter(ws_id=ws_id)
         self.assertTrue(res["active"])
         self.assertIn("pane_id", res)
 
         # Exit copy mode
-        res = self.c.pane_copy_mode_exit()
+        res = self.c.pane_copy_mode_exit(ws_id=ws_id)
         self.assertTrue(res["was_active"])
         self.c.workspace_close(ws["id"])
 
     def test_exit_without_enter(self):
         """Exit copy mode when not active should report was_active=false."""
         ws = self._make_ws_with_pane()
+        ws_id = ws["id"]
         # Ensure copy mode is not active (fresh pane)
-        res = self.c.pane_copy_mode_exit()
+        res = self.c.pane_copy_mode_exit(ws_id=ws_id)
         self.assertFalse(res["was_active"])
         self.c.workspace_close(ws["id"])
 
     def test_movement_keys(self):
         """Test Vi movement keys (h, j, k, l)."""
         ws = self._make_ws_with_pane()
-        self.c.pane_copy_mode_enter()
+        ws_id = ws["id"]
+        self.c.pane_copy_mode_enter(ws_id=ws_id)
 
         # Start at (0, 0)
-        res = self.c.pane_copy_mode_move("l")
+        res = self.c.pane_copy_mode_move("l", ws_id=ws_id)
         self.assertEqual(res["row"], 0)
         self.assertEqual(res["col"], 1)
 
-        res = self.c.pane_copy_mode_move("l")
+        res = self.c.pane_copy_mode_move("l", ws_id=ws_id)
         self.assertEqual(res["col"], 2)
 
-        res = self.c.pane_copy_mode_move("j")
+        res = self.c.pane_copy_mode_move("j", ws_id=ws_id)
         self.assertEqual(res["row"], 1)
         self.assertEqual(res["col"], 2)
 
-        res = self.c.pane_copy_mode_move("k")
+        res = self.c.pane_copy_mode_move("k", ws_id=ws_id)
         self.assertEqual(res["row"], 0)
 
-        res = self.c.pane_copy_mode_move("h")
+        res = self.c.pane_copy_mode_move("h", ws_id=ws_id)
         self.assertEqual(res["col"], 1)
 
-        self.c.pane_copy_mode_exit()
+        self.c.pane_copy_mode_exit(ws_id=ws_id)
         self.c.workspace_close(ws["id"])
 
     def test_movement_word_jump(self):
         """Test w/b word jumps."""
         ws = self._make_ws_with_pane()
-        self.c.pane_copy_mode_enter()
+        ws_id = ws["id"]
+        self.c.pane_copy_mode_enter(ws_id=ws_id)
 
-        res = self.c.pane_copy_mode_move("w")
+        res = self.c.pane_copy_mode_move("w", ws_id=ws_id)
         self.assertEqual(res["col"], 5)
 
-        res = self.c.pane_copy_mode_move("b")
+        res = self.c.pane_copy_mode_move("b", ws_id=ws_id)
         self.assertEqual(res["col"], 0)
 
-        self.c.pane_copy_mode_exit()
+        self.c.pane_copy_mode_exit(ws_id=ws_id)
         self.c.workspace_close(ws["id"])
 
     def test_movement_line_start_end(self):
         """Test 0 and $ for line start/end."""
         ws = self._make_ws_with_pane()
-        self.c.pane_copy_mode_enter()
+        ws_id = ws["id"]
+        self.c.pane_copy_mode_enter(ws_id=ws_id)
 
         # Move somewhere
-        self.c.pane_copy_mode_move("l")
-        self.c.pane_copy_mode_move("l")
-        self.c.pane_copy_mode_move("l")
+        self.c.pane_copy_mode_move("l", ws_id=ws_id)
+        self.c.pane_copy_mode_move("l", ws_id=ws_id)
+        self.c.pane_copy_mode_move("l", ws_id=ws_id)
 
         # $ goes to end
-        res = self.c.pane_copy_mode_move("$")
+        res = self.c.pane_copy_mode_move("$", ws_id=ws_id)
         self.assertEqual(res["col"], 9999)
 
         # 0 goes to start
-        res = self.c.pane_copy_mode_move("0")
+        res = self.c.pane_copy_mode_move("0", ws_id=ws_id)
         self.assertEqual(res["col"], 0)
 
-        self.c.pane_copy_mode_exit()
+        self.c.pane_copy_mode_exit(ws_id=ws_id)
         self.c.workspace_close(ws["id"])
 
     def test_movement_document_start_end(self):
         """Test gg and G for document start/end."""
         ws = self._make_ws_with_pane()
-        self.c.pane_copy_mode_enter()
+        ws_id = ws["id"]
+        self.c.pane_copy_mode_enter(ws_id=ws_id)
 
         # Move somewhere
-        self.c.pane_copy_mode_move("j")
-        self.c.pane_copy_mode_move("j")
-        self.c.pane_copy_mode_move("l")
+        self.c.pane_copy_mode_move("j", ws_id=ws_id)
+        self.c.pane_copy_mode_move("j", ws_id=ws_id)
+        self.c.pane_copy_mode_move("l", ws_id=ws_id)
 
         # G goes to bottom
-        res = self.c.pane_copy_mode_move("G")
+        res = self.c.pane_copy_mode_move("G", ws_id=ws_id)
         self.assertEqual(res["row"], 9999)
 
         # gg goes to top
-        res = self.c.pane_copy_mode_move("gg")
+        res = self.c.pane_copy_mode_move("gg", ws_id=ws_id)
         self.assertEqual(res["row"], 0)
         self.assertEqual(res["col"], 0)
 
-        self.c.pane_copy_mode_exit()
+        self.c.pane_copy_mode_exit(ws_id=ws_id)
         self.c.workspace_close(ws["id"])
 
     def test_movement_clamp_at_zero(self):
         """Movement should clamp at (0,0), not go negative."""
         ws = self._make_ws_with_pane()
-        self.c.pane_copy_mode_enter()
+        ws_id = ws["id"]
+        self.c.pane_copy_mode_enter(ws_id=ws_id)
 
         # Already at (0,0)
-        res = self.c.pane_copy_mode_move("h")
+        res = self.c.pane_copy_mode_move("h", ws_id=ws_id)
         self.assertEqual(res["col"], 0)
         self.assertEqual(res["row"], 0)
 
-        res = self.c.pane_copy_mode_move("k")
+        res = self.c.pane_copy_mode_move("k", ws_id=ws_id)
         self.assertEqual(res["row"], 0)
 
-        self.c.pane_copy_mode_exit()
+        self.c.pane_copy_mode_exit(ws_id=ws_id)
         self.c.workspace_close(ws["id"])
 
     def test_select_start_end(self):
         """Test visual selection (v to start, move, v to end)."""
         ws = self._make_ws_with_pane()
-        self.c.pane_copy_mode_enter()
+        ws_id = ws["id"]
+        self.c.pane_copy_mode_enter(ws_id=ws_id)
 
         # Move to position
-        self.c.pane_copy_mode_move("l")
-        self.c.pane_copy_mode_move("l")
+        self.c.pane_copy_mode_move("l", ws_id=ws_id)
+        self.c.pane_copy_mode_move("l", ws_id=ws_id)
 
         # Start selection
-        res = self.c.pane_copy_mode_select_start()
+        res = self.c.pane_copy_mode_select_start(ws_id=ws_id)
         self.assertTrue(res["selecting"])
         self.assertEqual(res["start_row"], 0)
         self.assertEqual(res["start_col"], 2)
 
         # Move cursor
-        self.c.pane_copy_mode_move("l")
-        self.c.pane_copy_mode_move("l")
-        self.c.pane_copy_mode_move("j")
+        self.c.pane_copy_mode_move("l", ws_id=ws_id)
+        self.c.pane_copy_mode_move("l", ws_id=ws_id)
+        self.c.pane_copy_mode_move("j", ws_id=ws_id)
 
         # End selection
-        res = self.c.pane_copy_mode_select_end()
+        res = self.c.pane_copy_mode_select_end(ws_id=ws_id)
         self.assertFalse(res["selecting"])
         self.assertEqual(res["start_row"], 0)
         self.assertEqual(res["start_col"], 2)
         self.assertEqual(res["end_row"], 1)
         self.assertEqual(res["end_col"], 4)
 
-        self.c.pane_copy_mode_exit()
+        self.c.pane_copy_mode_exit(ws_id=ws_id)
         self.c.workspace_close(ws["id"])
 
     def test_yank(self):
         """Test yank copies selected text to clipboard."""
         ws = self._make_ws_with_pane()
-        self.c.pane_copy_mode_enter()
+        ws_id = ws["id"]
+        self.c.pane_copy_mode_enter(ws_id=ws_id)
 
         # Select region
-        self.c.pane_copy_mode_select_start()
-        self.c.pane_copy_mode_move("l")
-        self.c.pane_copy_mode_move("l")
-        self.c.pane_copy_mode_select_end()
+        self.c.pane_copy_mode_select_start(ws_id=ws_id)
+        self.c.pane_copy_mode_move("l", ws_id=ws_id)
+        self.c.pane_copy_mode_move("l", ws_id=ws_id)
+        self.c.pane_copy_mode_select_end(ws_id=ws_id)
 
         # Yank
-        res = self.c.pane_copy_mode_yank()
+        res = self.c.pane_copy_mode_yank(ws_id=ws_id)
         self.assertTrue(res["yanked"])
         self.assertIn("len", res)
         self.assertGreater(res["len"], 0)
 
-        self.c.pane_copy_mode_exit()
+        self.c.pane_copy_mode_exit(ws_id=ws_id)
         self.c.workspace_close(ws["id"])
 
     def test_paste(self):
         """Test paste reads from clipboard."""
         ws = self._make_ws_with_pane()
-        self.c.pane_copy_mode_enter()
+        ws_id = ws["id"]
+        self.c.pane_copy_mode_enter(ws_id=ws_id)
 
         # Yank something first
-        self.c.pane_copy_mode_select_start()
-        self.c.pane_copy_mode_move("l")
-        self.c.pane_copy_mode_move("l")
-        self.c.pane_copy_mode_select_end()
-        self.c.pane_copy_mode_yank()
+        self.c.pane_copy_mode_select_start(ws_id=ws_id)
+        self.c.pane_copy_mode_move("l", ws_id=ws_id)
+        self.c.pane_copy_mode_move("l", ws_id=ws_id)
+        self.c.pane_copy_mode_select_end(ws_id=ws_id)
+        self.c.pane_copy_mode_yank(ws_id=ws_id)
 
         # Paste
-        res = self.c.pane_copy_mode_paste()
+        res = self.c.pane_copy_mode_paste(ws_id=ws_id)
         self.assertTrue(res["pasted"])
         self.assertGreater(res["len"], 0)
 
-        self.c.pane_copy_mode_exit()
+        self.c.pane_copy_mode_exit(ws_id=ws_id)
         self.c.workspace_close(ws["id"])
 
     def test_move_without_copy_mode_fails(self):
         """Movement when copy mode is not active should fail."""
         ws = self._make_ws_with_pane()
-        resp = self.c.send("pane.copy_mode.move", {"key": "l"})
+        ws_id = ws["id"]
+        resp = self.c.send("pane.copy_mode.move", {"key": "l", "workspace_id": str(ws_id)})
         self.assertFalse(resp.get("ok", True))
         error = resp.get("error", {})
         self.assertEqual(error.get("code"), "invalid_state")
@@ -4155,12 +4166,239 @@ class TestCopyMode(unittest.TestCase):
     def test_invalid_key_fails(self):
         """Unknown key should fail."""
         ws = self._make_ws_with_pane()
-        self.c.pane_copy_mode_enter()
-        resp = self.c.send("pane.copy_mode.move", {"key": "x"})
+        ws_id = ws["id"]
+        self.c.pane_copy_mode_enter(ws_id=ws_id)
+        resp = self.c.send("pane.copy_mode.move", {"key": "x", "workspace_id": str(ws_id)})
         self.assertFalse(resp.get("ok", True))
         error = resp.get("error", {})
         self.assertEqual(error.get("code"), "invalid_params")
-        self.c.pane_copy_mode_exit()
+        self.c.pane_copy_mode_exit(ws_id=ws_id)
+        self.c.workspace_close(ws["id"])
+
+    # ── Extended copy mode tests (ISS-0032) ────────────────────────
+
+    def test_movement_screen_position(self):
+        """Test H/M/L for top/middle/bottom of screen."""
+        ws = self._make_ws_with_pane()
+        ws_id = ws["id"]
+        self.c.pane_copy_mode_enter(ws_id=ws_id)
+
+        # H - top of screen (row 0)
+        res = self.c.pane_copy_mode_move("H", ws_id=ws_id)
+        self.assertEqual(res["row"], 0)
+
+        # Move down
+        for _ in range(10):
+            self.c.pane_copy_mode_move("j", ws_id=ws_id)
+
+        # M - middle of screen
+        res = self.c.pane_copy_mode_move("M", ws_id=ws_id)
+        self.assertGreaterEqual(res["row"], 5)
+        self.assertLessEqual(res["row"], 15)
+
+        # L - bottom of screen
+        res = self.c.pane_copy_mode_move("L", ws_id=ws_id)
+        self.assertGreaterEqual(res["row"], 20)
+
+        self.c.pane_copy_mode_exit(ws_id=ws_id)
+        self.c.workspace_close(ws["id"])
+
+    def test_search_forward_backward(self):
+        """Test / (forward) and ? (backward) search."""
+        ws = self._make_ws_with_pane()
+        ws_id = ws["id"]
+        self.c.pane_copy_mode_enter(ws_id=ws_id)
+
+        # Search forward for "test"
+        res = self.c.pane_copy_mode_search("test", ws_id=ws_id)
+        self.assertIn("matches", res)
+
+        # Search backward for "test"
+        res = self.c.pane_copy_mode_search("test", backward=True, ws_id=ws_id)
+        self.assertIn("matches", res)
+
+        self.c.pane_copy_mode_exit(ws_id=ws_id)
+        self.c.workspace_close(ws["id"])
+
+    def test_search_next_prev(self):
+        """Test n/N for next/previous search match."""
+        ws = self._make_ws_with_pane()
+        ws_id = ws["id"]
+        self.c.pane_copy_mode_enter(ws_id=ws_id)
+
+        # Search for something
+        self.c.pane_copy_mode_search("test", ws_id=ws_id)
+
+        # Next match
+        res = self.c.pane_copy_mode_search_next(ws_id=ws_id)
+        self.assertIn("row", res)
+
+        # Previous match
+        res = self.c.pane_copy_mode_search_prev(ws_id=ws_id)
+        self.assertIn("row", res)
+
+        self.c.pane_copy_mode_exit(ws_id=ws_id)
+        self.c.workspace_close(ws["id"])
+
+    def test_goto_line(self):
+        """Test : (goto-line) command."""
+        ws = self._make_ws_with_pane()
+        ws_id = ws["id"]
+        self.c.pane_copy_mode_enter(ws_id=ws_id)
+
+        # Go to line 10
+        res = self.c.pane_copy_mode_goto_line(10, ws_id=ws_id)
+        self.assertEqual(res["row"], 10)
+
+        # Go to line 0
+        res = self.c.pane_copy_mode_goto_line(0, ws_id=ws_id)
+        self.assertEqual(res["row"], 0)
+
+        self.c.pane_copy_mode_exit(ws_id=ws_id)
+        self.c.workspace_close(ws["id"])
+
+    def test_rectangle_toggle(self):
+        """Test v/V for rectangle selection toggle."""
+        ws = self._make_ws_with_pane()
+        ws_id = ws["id"]
+        self.c.pane_copy_mode_enter(ws_id=ws_id)
+
+        # Start selection
+        self.c.pane_copy_mode_select_start(ws_id=ws_id)
+
+        # Toggle rectangle mode
+        res = self.c.pane_copy_mode_rectangle_toggle(ws_id=ws_id)
+        self.assertTrue(res.get("rectangle", False))
+
+        # Toggle back
+        res = self.c.pane_copy_mode_rectangle_toggle(ws_id=ws_id)
+        self.assertFalse(res.get("rectangle", False))
+
+        self.c.pane_copy_mode_exit(ws_id=ws_id)
+        self.c.workspace_close(ws["id"])
+
+    def test_copy_pipe(self):
+        """Test y (copy-pipe) to external command."""
+        ws = self._make_ws_with_pane()
+        ws_id = ws["id"]
+        self.c.pane_copy_mode_enter(ws_id=ws_id)
+
+        # Select region
+        self.c.pane_copy_mode_select_start(ws_id=ws_id)
+        self.c.pane_copy_mode_move("l", ws_id=ws_id)
+        self.c.pane_copy_mode_move("l", ws_id=ws_id)
+        self.c.pane_copy_mode_select_end(ws_id=ws_id)
+
+        # Copy to external command
+        res = self.c.pane_copy_mode_copy_pipe("cat > /tmp/test_copy.txt", ws_id=ws_id)
+        self.assertTrue(res.get("piped", False))
+
+        self.c.pane_copy_mode_exit(ws_id=ws_id)
+        self.c.workspace_close(ws["id"])
+
+    def test_select_space_enter(self):
+        """Test Space (begin selection) and Enter (copy selection)."""
+        ws = self._make_ws_with_pane()
+        ws_id = ws["id"]
+        self.c.pane_copy_mode_enter(ws_id=ws_id)
+
+        # Move cursor
+        self.c.pane_copy_mode_move("l", ws_id=ws_id)
+        self.c.pane_copy_mode_move("l", ws_id=ws_id)
+
+        # Space begins selection
+        res = self.c.pane_copy_mode_select_space(ws_id=ws_id)
+        self.assertTrue(res.get("selecting", False))
+
+        # Move to extend selection
+        self.c.pane_copy_mode_move("l", ws_id=ws_id)
+        self.c.pane_copy_mode_move("l", ws_id=ws_id)
+
+        # Enter copies selection
+        res = self.c.pane_copy_mode_copy_selection(ws_id=ws_id)
+        self.assertTrue(res.get("copied", False))
+
+        self.c.pane_copy_mode_exit(ws_id=ws_id)
+        self.c.workspace_close(ws["id"])
+
+    def test_copy_selection_and_cancel(self):
+        """Test Space+Enter (copy selection and cancel copy mode)."""
+        ws = self._make_ws_with_pane()
+        ws_id = ws["id"]
+        self.c.pane_copy_mode_enter(ws_id=ws_id)
+
+        # Move cursor
+        self.c.pane_copy_mode_move("l", ws_id=ws_id)
+        self.c.pane_copy_mode_move("l", ws_id=ws_id)
+
+        # Space begins selection
+        self.c.pane_copy_mode_select_space(ws_id=ws_id)
+
+        # Move to extend selection
+        self.c.pane_copy_mode_move("l", ws_id=ws_id)
+        self.c.pane_copy_mode_move("l", ws_id=ws_id)
+
+        # Copy selection and cancel (Space+Enter equivalent)
+        res = self.c.pane_copy_mode_copy_selection_and_cancel(ws_id=ws_id)
+        self.assertTrue(res.get("copied", False))
+        self.assertTrue(res.get("exited", False))
+
+        # Verify copy mode is exited
+        # Try to move - should fail
+        resp = self.c.send("pane.copy_mode.move", {"key": "l", "workspace_id": str(ws_id)})
+        self.assertFalse(resp.get("ok", True))
+
+        self.c.workspace_close(ws["id"])
+
+    def test_format_variables(self):
+        """Test #{copy_mode}, #{copy_cursor_row}, #{copy_cursor_col} format variables."""
+        ws = self._make_ws_with_pane()
+        ws_id = ws["id"]
+
+        # Before copy mode
+        fmt = self.c.send("format", {"template": "#{copy_mode} #{copy_cursor_row} #{copy_cursor_col}", "workspace_id": str(ws_id)})
+        self.assertEqual(fmt["result"]["formatted"], "0 0 0")
+
+        # Enter copy mode
+        self.c.pane_copy_mode_enter(ws_id=ws_id)
+        fmt = self.c.send("format", {"template": "#{copy_mode} #{copy_cursor_row} #{copy_cursor_col}", "workspace_id": str(ws_id)})
+        self.assertEqual(fmt["result"]["formatted"], "1 0 0")
+
+        # Move cursor
+        self.c.pane_copy_mode_move("j", ws_id=ws_id)
+        self.c.pane_copy_mode_move("j", ws_id=ws_id)
+        self.c.pane_copy_mode_move("l", ws_id=ws_id)
+        self.c.pane_copy_mode_move("l", ws_id=ws_id)
+        fmt = self.c.send("format", {"template": "#{copy_mode} #{copy_cursor_row} #{copy_cursor_col}", "workspace_id": str(ws_id)})
+        self.assertEqual(fmt["result"]["formatted"], "1 2 2")
+
+        self.c.pane_copy_mode_exit(ws_id=ws_id)
+        fmt = self.c.send("format", {"template": "#{copy_mode} #{copy_cursor_row} #{copy_cursor_col}", "workspace_id": str(ws_id)})
+        self.assertEqual(fmt["result"]["formatted"], "0 2 2")
+
+        self.c.workspace_close(ws["id"])
+
+    def test_notifications_copy_mode_changed(self):
+        """Test %copy-mode-changed notification."""
+        ws = self._make_ws_with_pane()
+        ws_id = ws["id"]
+        # TODO: Implement notification capture
+        self.c.pane_copy_mode_enter(ws_id=ws_id)
+        # Would check for %copy-mode-changed notification
+        self.c.pane_copy_mode_exit(ws_id=ws_id)
+        self.c.workspace_close(ws["id"])
+
+    def test_notifications_selection_changed(self):
+        """Test %selection-changed notification."""
+        ws = self._make_ws_with_pane()
+        ws_id = ws["id"]
+        # TODO: Implement notification capture
+        self.c.pane_copy_mode_enter(ws_id=ws_id)
+        self.c.pane_copy_mode_select_start(ws_id=ws_id)
+        self.c.pane_copy_mode_move("l", ws_id=ws_id)
+        self.c.pane_copy_mode_select_end(ws_id=ws_id)
+        # Would check for %selection-changed notification
+        self.c.pane_copy_mode_exit(ws_id=ws_id)
         self.c.workspace_close(ws["id"])
 
 
