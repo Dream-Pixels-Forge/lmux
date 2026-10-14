@@ -189,6 +189,16 @@ void       lmux_pane_focus_dir(lmux_workspace *ws,
 bool lmux_pane_get_info(lmux_pane *p, lmux_pane_info *out);
 lmux_id  lmux_pane_get_id(lmux_pane *p);
 
+/* Remain-on-exit: keep pane scrollback and allow respawn after child exits */
+bool lmux_pane_set_remain_on_exit(lmux_pane *pane, bool enabled);
+bool lmux_pane_get_remain_on_exit(const lmux_pane *pane);
+
+/* Respawn pane with its original command */
+bool lmux_pane_respawn(lmux_pane *pane);
+
+/* Capture pane scrollback content */
+char *lmux_pane_capture(lmux_pane *pane, long start_line, long end_line);
+
 /* Send keystrokes to a terminal pane. Text is interpreted as
  * key-name syntax: literal chars, C-X for Ctrl-X, M-x for Alt-x. */
 void lmux_pane_send_keys(lmux_pane *p, const char *keys);
@@ -297,6 +307,10 @@ typedef struct {
 #define LMUX_HOOK_MONITOR_ACTIVITY     "monitor-activity"
 #define LMUX_HOOK_MONITOR_BELL         "monitor-bell"
 #define LMUX_HOOK_MONITOR_SILENCE      "monitor-silence"
+
+/* Pane lifecycle hooks */
+#define LMUX_HOOK_PANE_DIED            "pane-died"
+#define LMUX_HOOK_PANE_EXITED          "pane-exited"
 
 /* Monitor actions (mirror tmux activity-action/bell-action) */
 #define LMUX_MONITOR_ACTION_ANY        "any"
