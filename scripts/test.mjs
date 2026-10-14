@@ -37,6 +37,7 @@ const testPrograms = [
     { name: "test_http_stop", sources: ["test_http_stop.c"] },
     { name: "test_fuzz",   sources: ["test_fuzz.c"] },
     { name: "test_hooks",  sources: ["test_hooks.c"] },
+    { name: "test_sync_panes", sources: ["test_sync_panes.c"] },
 ];
 
 /* ── Compile and run each test ─────────────── */
