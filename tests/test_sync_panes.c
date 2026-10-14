@@ -213,7 +213,6 @@ static void test_control_notify_sync_panes(void) {
     for (size_t i = 0; i < n; i++) {
         if (strstr(pending[i], "%synchronize-panes-changed") != NULL) {
             found = 1;
-            break;
         }
         free(pending[i]);
     }
@@ -245,7 +244,6 @@ static void test_control_notify_window_size(void) {
     for (size_t i = 0; i < n; i++) {
         if (strstr(pending[i], "%window-size-changed") != NULL) {
             found = 1;
-            break;
         }
         free(pending[i]);
     }
