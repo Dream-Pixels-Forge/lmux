@@ -563,6 +563,7 @@ static void lmux_data_path(char *buf, size_t cap, const char *file) {
         else snprintf(buf, cap, "/tmp/lmux/%s", file);
     }
 }
+
 struct lmux_app {
     char        socket_path[256];
     int         listen_fd;        /* unix socket */
@@ -639,6 +640,10 @@ struct lmux_app {
     char        clipboard[100][2048]; /* clipboard text entries */
     int         clipboard_count;      /* number of entries */
     int         clipboard_head;       /* circular buffer head */
+    /* Paste buffers (named buffers with persistence) */
+    vec_t       buffers;              /* of lmux_buffer* */
+    size_t      buffer_limit;         /* max buffers, 0 = unlimited */
+    uint32_t    next_buffer_num;      /* for auto-naming bufferNNNN */
     /* Workspace templates */
     char        templates[32][64];    /* template names */
     int         template_count;       /* number of templates */
@@ -658,6 +663,392 @@ struct lmux_app {
     struct { char id[64]; char name[64]; struct { char name[64]; char role[32]; } members[8]; int member_count; } teams[16];
     int         team_count;
 };
+ 
+
+/* Forward declarations for functions used by buffer code */
+static void pane_scrollback_append(lmux_pane *p, const char *data, size_t n);
+static void pane_osc133_feed(lmux_pane *p, const char *data, size_t n);
+static void control_emit(const char *cls, const char *line);
+
+/* Scrollback limits (moved here for buffer code) */
+#define LMUX_SCROLLBACK_MAX ((size_t)64 * 1024)
+#define LMUX_CAPTURE_MAX    ((size_t)8 * 1024)
+#define LMUX_PTY_DRAIN_MAX  ((size_t)256 * 1024)
+/* ----- Paste Buffers (named buffers per-app) ----- */
+ 
+/* Find buffer by name, returns index or -1 */
+static int buffer_find_index(lmux_app *app, const char *name) {
+    if (!app || !name) return -1;
+    for (size_t i = 0; i < app->buffers.len; i++) {
+        lmux_buffer *b = app->buffers.items[i];
+        if (strcmp(b->name, name) == 0) return (int)i;
+    }
+    return -1;
+}
+ 
+/* Get buffer by name, returns pointer or NULL */
+static lmux_buffer *buffer_find(lmux_app *app, const char *name) {
+    int idx = buffer_find_index(app, name);
+    return idx >= 0 ? app->buffers.items[idx] : NULL;
+}
+ 
+/* Generate next auto-name (buffer0001, buffer0002, ...) */
+static void buffer_next_auto_name(lmux_app *app, char *out, size_t cap) {
+    if (!app) return;
+    for (;;) {
+        snprintf(out, cap, "buffer%04u", app->next_buffer_num++);
+        if (buffer_find(app, out) == NULL) break;
+        /* Wrap around if we somehow exhausted all 9999 names */
+        if (app->next_buffer_num > 9999) app->next_buffer_num = 1;
+    }
+}
+ 
+/* Evict oldest buffer (FIFO) when limit exceeded */
+static void buffer_evict_oldest(lmux_app *app) {
+    if (!app || app->buffers.len == 0) return;
+    if (app->buffer_limit == 0) return; /* unlimited */
+    if (app->buffers.len < app->buffer_limit) return;
+    
+    /* Find oldest by created_at */
+    size_t oldest_idx = 0;
+    time_t oldest_time = ((lmux_buffer *)app->buffers.items[0])->created_at;
+    for (size_t i = 1; i < app->buffers.len; i++) {
+        lmux_buffer *b = app->buffers.items[i];
+        if (b->created_at < oldest_time) {
+            oldest_time = b->created_at;
+            oldest_idx = i;
+        }
+    }
+    
+    /* Emit buffer-deleted notification before freeing */
+    lmux_buffer *oldest = app->buffers.items[oldest_idx];
+    char line[256];
+    snprintf(line, sizeof line, "%%buffer-deleted %s", oldest->name);
+    control_emit("buffer", line);
+    
+    /* Push event to queue */
+    char event_json[512];
+    snprintf(event_json, sizeof event_json,
+             "{\"event\":\"buffer-deleted\",\"name\":\"%s\"}", oldest->name);
+    lmux_event_push(app, "buffer-deleted", "buffer", "%s", event_json);
+    
+    /* Free and remove */
+    free(oldest->data);
+    free(oldest);
+    vec_remove(&app->buffers, oldest_idx);
+}
+ 
+/* Emit buffer-created notification */
+static void buffer_emit_created(lmux_app *app, const char *name) {
+    char line[256];
+    snprintf(line, sizeof line, "%%buffer-created %s", name);
+    control_emit("buffer", line);
+    
+    char event_json[512];
+    snprintf(event_json, sizeof event_json,
+             "{\"event\":\"buffer-created\",\"name\":\"%s\"}", name);
+    lmux_event_push(app, "buffer-created", "buffer", "%s", event_json);
+}
+ 
+/* Emit buffer-changed notification */
+static void buffer_emit_changed(lmux_app *app, const char *name) {
+    char line[256];
+    snprintf(line, sizeof line, "%%buffer-changed %s", name);
+    control_emit("buffer", line);
+    
+    char event_json[512];
+    snprintf(event_json, sizeof event_json,
+             "{\"event\":\"buffer-changed\",\"name\":\"%s\"}", name);
+    lmux_event_push(app, "buffer-changed", "buffer", "%s", event_json);
+}
+ 
+/* Public API: Set buffer contents */
+int lmux_buffer_set(lmux_app *app, const char *name, const char *data, size_t size) {
+    if (!app || !data) return -1;
+    
+    char buffer_name[64];
+    bool is_new = false;
+    lmux_buffer *buf = NULL;
+    
+    if (name && name[0]) {
+        /* Explicit name */
+        buf = buffer_find(app, name);
+        if (!buf) {
+            is_new = true;
+        }
+    } else {
+        /* Auto-generate name */
+        buffer_next_auto_name(app, buffer_name, sizeof buffer_name);
+        name = buffer_name;
+        is_new = true;
+    }
+    
+    if (is_new) {
+        /* Check limit and evict if needed */
+        buffer_evict_oldest(app);
+        
+        buf = calloc(1, sizeof *buf);
+        if (!buf) return -1;
+        snprintf(buf->name, sizeof buf->name, "%s", name);
+        buf->created_at = time(NULL);
+        vec_push(&app->buffers, buf);
+    }
+    
+    /* Free old data if any */
+    if (buf->data) free(buf->data);
+    
+    /* Allocate and copy new data */
+    buf->data = malloc(size + 1);
+    if (!buf->data) return -1;
+    memcpy(buf->data, data, size);
+    buf->data[size] = '\0';
+    buf->size = size;
+    
+    /* Emit notification */
+    if (is_new) {
+        buffer_emit_created(app, name);
+    } else {
+        buffer_emit_changed(app, name);
+    }
+    
+    return 0;
+}
+ 
+/* Public API: Get buffer contents */
+size_t lmux_buffer_get(lmux_app *app, const char *name, char *out, size_t cap) {
+    if (!app || !name) return 0;
+    
+    lmux_buffer *buf = buffer_find(app, name);
+    if (!buf || !buf->data) return 0;
+    
+    if (!out) return buf->size;
+    
+    size_t n = buf->size < cap ? buf->size : cap;
+    memcpy(out, buf->data, n);
+    if (n < cap) out[n] = '\0';
+    return n;
+}
+ 
+/* Public API: Delete buffer by name */
+bool lmux_buffer_delete(lmux_app *app, const char *name) {
+    if (!app || !name) return false;
+    
+    int idx = buffer_find_index(app, name);
+    if (idx < 0) return false;
+    
+    lmux_buffer *buf = app->buffers.items[idx];
+    
+    /* Emit buffer-deleted notification */
+    char line[256];
+    snprintf(line, sizeof line, "%%buffer-deleted %s", buf->name);
+    control_emit("buffer", line);
+    
+    char event_json[512];
+    snprintf(event_json, sizeof event_json,
+             "{\"event\":\"buffer-deleted\",\"name\":\"%s\"}", buf->name);
+    lmux_event_push(app, "buffer-deleted", "buffer", "%s", event_json);
+    
+    /* Free and remove */
+    free(buf->data);
+    free(buf);
+    vec_remove(&app->buffers, idx);
+    return true;
+}
+ 
+/* Public API: List all buffer names */
+size_t lmux_buffer_list(lmux_app *app, char **out_names, size_t max_names) {
+    if (!app || !out_names || max_names == 0) return 0;
+    
+    size_t count = 0;
+    for (size_t i = 0; i < app->buffers.len && count < max_names; i++) {
+        lmux_buffer *buf = app->buffers.items[i];
+        out_names[count] = strdup(buf->name);
+        if (out_names[count]) count++;
+    }
+    return count;
+}
+ 
+/* Public API: Get buffer count */
+size_t lmux_buffer_count(lmux_app *app) {
+    if (!app) return 0;
+    return app->buffers.len;
+}
+ 
+/* Public API: Set buffer limit */
+void lmux_buffer_set_limit(lmux_app *app, size_t limit) {
+    if (!app) return;
+    app->buffer_limit = limit;
+    /* Evict excess buffers */
+    while (app->buffers.len > limit && limit > 0) {
+        buffer_evict_oldest(app);
+    }
+}
+ 
+/* Public API: Get buffer limit */
+size_t lmux_buffer_get_limit(lmux_app *app) {
+    if (!app) return 0;
+    return app->buffer_limit;
+}
+ 
+/* Public API: Save buffer to file */
+bool lmux_buffer_save(lmux_app *app, const char *name, const char *path) {
+    if (!app || !name || !path) return false;
+    
+    lmux_buffer *buf = buffer_find(app, name);
+    if (!buf || !buf->data) return false;
+    
+    FILE *f = fopen(path, "w");
+    if (!f) return false;
+    
+    size_t written = fwrite(buf->data, 1, buf->size, f);
+    fclose(f);
+    
+    return written == buf->size;
+}
+ 
+/* Public API: Load buffer from file */
+bool lmux_buffer_load(lmux_app *app, const char *name, const char *path) {
+    if (!app || !name || !path) return false;
+    
+    FILE *f = fopen(path, "r");
+    if (!f) return false;
+    
+    /* Get file size */
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (fsize < 0) { fclose(f); return false; }
+    
+    /* Read file */
+    char *data = malloc(fsize + 1);
+    if (!data) { fclose(f); return false; }
+    size_t read = fread(data, 1, fsize, f);
+    fclose(f);
+    data[read] = '\0';
+    
+    /* Set buffer (will create or overwrite) */
+    int rc = lmux_buffer_set(app, name, data, read);
+    free(data);
+    
+    return rc == 0;
+}
+ 
+/* Public API: Capture pane content into a buffer.
+ * start_line/end_line specify range (negative values count from end, like tmux -S/-E).
+ * -S 0 means from first line, -S -10 means last 10 lines.
+ * -E -1 means to end, -E 5 means up to line 5.
+ * Returns 0 on success, -1 on error. */
+int lmux_buffer_capture_pane(lmux_app *app, lmux_pane *pane, const char *buffer_name,
+                             long start_line, long end_line) {
+    if (!app || !pane || !buffer_name) return -1;
+    
+    /* Ensure pane has a pty and scrollback is up to date */
+    if (pane->pty_fd < 0) {
+        if (pane_spawn_pty(pane) != 0) {
+            return -1;
+        }
+    }
+    
+    /* Drain any pending pty output into scrollback */
+    char chunk[4096];
+    int flags = fcntl(pane->pty_fd, F_GETFL, 0);
+    fcntl(pane->pty_fd, F_SETFL, flags | O_NONBLOCK);
+    size_t drained = 0;
+    ssize_t r;
+    while ((r = read(pane->pty_fd, chunk, sizeof chunk)) > 0) {
+        pane_scrollback_append(pane, chunk, (size_t)r);
+        pane_osc133_feed(pane, chunk, (size_t)r);
+        drained += (size_t)r;
+        if (drained >= LMUX_PTY_DRAIN_MAX) break;
+    }
+    fcntl(pane->pty_fd, F_SETFL, flags);
+    
+    /* Get scrollback content */
+    if (!pane->sb || pane->sb_len == 0) {
+        /* Empty scrollback - create empty buffer */
+        return lmux_buffer_set(app, buffer_name, "", 0);
+    }
+    
+    /* Parse scrollback into lines */
+    char *sb = pane->sb;
+    size_t sb_len = pane->sb_len;
+    
+    /* Count lines and record line start offsets */
+    size_t line_count = 0;
+    size_t *line_starts = NULL;
+    size_t line_starts_cap = 0;
+    
+    for (size_t i = 0; i < sb_len; i++) {
+        if (i == 0 || sb[i - 1] == '\n') {
+            if (line_count >= line_starts_cap) {
+                line_starts_cap = line_starts_cap ? line_starts_cap * 2 : 128;
+                size_t *new_starts = realloc(line_starts, line_starts_cap * sizeof(size_t));
+                if (!new_starts) { free(line_starts); return -1; }
+                line_starts = new_starts;
+            }
+            line_starts[line_count++] = i;
+        }
+    }
+    
+    /* Handle negative indices (count from end) */
+    long start_idx = start_line;
+    long end_idx = end_line;
+    
+    if (start_idx < 0) start_idx = (long)line_count + start_idx;
+    if (end_idx < 0) end_idx = (long)line_count + end_idx + 1;  /* +1 because end is inclusive in tmux */
+    
+    /* Clamp to valid range */
+    if (start_idx < 0) start_idx = 0;
+    if (end_idx < 0) end_idx = 0;
+    if (start_idx >= (long)line_count) start_idx = line_count - 1;
+    if (end_idx >= (long)line_count) end_idx = line_count - 1;
+    if (start_idx > end_idx) { free(line_starts); return -1; }
+    
+    /* Build output from selected lines */
+    size_t total_size = 0;
+    for (long i = start_idx; i <= end_idx; i++) {
+        size_t line_start = line_starts[i];
+        size_t line_end = (i + 1 < (long)line_count) ? line_starts[i + 1] : sb_len;
+        total_size += line_end - line_start;
+    }
+    
+    char *output = malloc(total_size + 1);
+    if (!output) { free(line_starts); return -1; }
+    
+    size_t pos = 0;
+    for (long i = start_idx; i <= end_idx; i++) {
+        size_t line_start = line_starts[i];
+        size_t line_end = (i + 1 < (long)line_count) ? line_starts[i + 1] : sb_len;
+        size_t line_len = line_end - line_start;
+        memcpy(output + pos, sb + line_start, line_len);
+        pos += line_len;
+    }
+    output[pos] = '\0';
+    
+    free(line_starts);
+    
+    /* Store in buffer */
+    int rc = lmux_buffer_set(app, buffer_name, output, pos);
+    free(output);
+    
+    return rc;
+}
+ 
+
+/* Public API: Check if a buffer exists */
+bool lmux_buffer_exists(lmux_app *app, const char *name) {
+    if (!app || !name) return false;
+    return buffer_find(app, name) != NULL;
+}
+
+/* Public API: Get buffer size (returns SIZE_MAX if not found) */
+size_t lmux_buffer_get_size(lmux_app *app, const char *name) {
+    if (!app || !name) return SIZE_MAX;
+    lmux_buffer *buf = buffer_find(app, name);
+    if (!buf || !buf->data) return SIZE_MAX;
+    return buf->size;
+}
+
 static lmux_pane *pane_new(lmux_workspace *ws, lmux_surface *s,
                            const char *kind) {
     lmux_pane *p = calloc(1, sizeof *p);
@@ -1236,6 +1627,7 @@ lmux_app *lmux_app_new(const char *socket_path) {
     a->ssh_sessions = (vec_t){0};
     a->feed_panels = (vec_t){0};
     a->feed_entries = (vec_t){0};
+    a->buffers = (vec_t){0};
     a->next_agent_id = 1;
     a->next_surface_id = 1;
     a->next_pane_id = 1;
@@ -1243,6 +1635,8 @@ lmux_app *lmux_app_new(const char *socket_path) {
     a->next_window_id = 1;
     a->next_ssh_session_id = 1;
     a->next_feed_panel_id = 1;
+    a->next_buffer_num = 1;
+    a->buffer_limit = 0;
     a->hooks = (vec_t){0};
     a->next_hook_id = 1;
     a->naming_cache = (vec_t){0};
@@ -1490,6 +1884,16 @@ void lmux_app_free(lmux_app *a) {
     lmux_config_free(a->config);
     hooks_free_all(a);
     naming_cache_free_all(a);
+    /* Free buffers */
+    for (size_t i = 0; i < a->buffers.len; i++) {
+        lmux_buffer *buf = a->buffers.items[i];
+        free(buf->data);
+        free(buf);
+    }
+    free(a->buffers.items);
+    a->buffers.items = NULL;
+    a->buffers.len = 0;
+    a->buffers.cap = 0;
     pthread_rwlock_destroy(&a->rw_lock);
     pthread_mutex_destroy(&a->event_lock);
     free(a);
@@ -4229,6 +4633,229 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         int tail = snprintf(result + written, result_cap - (size_t)written, "\"}}");
         if (tail > 0) written += tail;
         result[written] = 0;
+        goto done;
+    }
+
+    /* --- buffer commands --- */
+    /* buffer.set - set buffer contents */
+    if (strcmp(cmd, "buffer.set") == 0) {
+        char name[64] = {0}, data[65536] = {0};
+        json_extract_string(args_json, "name", name, sizeof name);
+        json_extract_string(args_json, "data", data, sizeof data);
+        
+        int rc = lmux_buffer_set(app, name[0] ? name : NULL, data, strlen(data));
+        if (rc == 0) {
+            written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+        } else {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"set_failed\",\"message\":\"failed to set buffer\"}}");
+        }
+        goto done;
+    }
+
+    /* buffer.get - get buffer contents */
+    if (strcmp(cmd, "buffer.get") == 0) {
+        char name[64] = {0};
+        json_extract_string(args_json, "name", name, sizeof name);
+        if (!name[0]) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing name\"}}");
+            goto done;
+        }
+        
+        size_t size = lmux_buffer_get(app, name, NULL, 0);
+        char *data = malloc(size + 1);
+        if (!data) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"oom\",\"message\":\"out of memory\"}}");
+            goto done;
+        }
+        lmux_buffer_get(app, name, data, size + 1);
+        
+        /* Escape for JSON */
+        char escaped[65536];
+        size_t esc_len = 0;
+        for (size_t i = 0; i < size && esc_len < sizeof escaped - 6; i++) {
+            char c = data[i];
+            switch (c) {
+                case '\\': escaped[esc_len++] = '\\'; escaped[esc_len++] = '\\'; break;
+                case '"':  escaped[esc_len++] = '\\'; escaped[esc_len++] = '"';  break;
+                case '\n': escaped[esc_len++] = '\\'; escaped[esc_len++] = 'n';  break;
+                case '\r': escaped[esc_len++] = '\\'; escaped[esc_len++] = 'r';  break;
+                case '\t': escaped[esc_len++] = '\\'; escaped[esc_len++] = 't';  break;
+                default:
+                    if ((unsigned char)c >= 32) escaped[esc_len++] = c;
+                    break;
+            }
+        }
+        escaped[esc_len] = '\0';
+        free(data);
+        
+        written = snprintf(result, result_cap,
+            "{\"ok\":true,\"result\":{\"name\":\"%s\",\"data\":\"%s\",\"size\":%zu}}",
+            name, escaped, size);
+        goto done;
+    }
+
+    /* buffer.list - list all buffers */
+    if (strcmp(cmd, "buffer.list") == 0) {
+        char *names[256];
+        size_t count = lmux_buffer_list(app, names, 256);
+        
+        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{\"buffers\":[");
+        for (size_t i = 0; i < count; i++) {
+            lmux_buffer *buf = buffer_find(app, names[i]);
+            RESULT_GROW;
+            if (i > 0) written += snprintf(result + written, result_cap - written, ",");
+            written += snprintf(result + written, result_cap - written,
+                "{\"name\":\"%s\",\"size\":%zu}", names[i], buf ? buf->size : 0);
+            free(names[i]);
+        }
+        written += snprintf(result + written, result_cap - written, "]}}");
+        goto done;
+    }
+
+    /* buffer.delete - delete a buffer */
+    if (strcmp(cmd, "buffer.delete") == 0) {
+        char name[64] = {0};
+        json_extract_string(args_json, "name", name, sizeof name);
+        if (!name[0]) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing name\"}}");
+            goto done;
+        }
+        
+        bool rc = lmux_buffer_delete(app, name);
+        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{\"deleted\":%s}}", rc ? "true" : "false");
+        goto done;
+    }
+
+    /* buffer.save - save buffer to file */
+    if (strcmp(cmd, "buffer.save") == 0) {
+        char name[64] = {0}, path[512] = {0};
+        json_extract_string(args_json, "name", name, sizeof name);
+        json_extract_string(args_json, "path", path, sizeof path);
+        if (!name[0] || !path[0]) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing name or path\"}}");
+            goto done;
+        }
+        
+        bool rc = lmux_buffer_save(app, name, path);
+        written = snprintf(result, result_cap, "{\"ok\":%s,\"result\":{}}", rc ? "true" : "false");
+        if (!rc) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"save_failed\",\"message\":\"failed to save buffer\"}}");
+        }
+        goto done;
+    }
+
+    /* buffer.load - load buffer from file */
+    if (strcmp(cmd, "buffer.load") == 0) {
+        char name[64] = {0}, path[512] = {0};
+        json_extract_string(args_json, "name", name, sizeof name);
+        json_extract_string(args_json, "path", path, sizeof path);
+        if (!name[0] || !path[0]) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing name or path\"}}");
+            goto done;
+        }
+        
+        bool rc = lmux_buffer_load(app, name, path);
+        written = snprintf(result, result_cap, "{\"ok\":%s,\"result\":{}}", rc ? "true" : "false");
+        if (!rc) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"load_failed\",\"message\":\"failed to load buffer\"}}");
+        }
+        goto done;
+    }
+
+    /* buffer.capture_pane - capture pane content into buffer */
+    if (strcmp(cmd, "buffer.capture_pane") == 0) {
+        char ws_id[64] = {0}, s_id[64] = {0}, buf_name[64] = {0};
+        char start_str[32] = {0}, end_str[32] = {0};
+        json_extract_string(args_json, "workspace_id", ws_id, sizeof ws_id);
+        json_extract_string(args_json, "surface_id", s_id, sizeof s_id);
+        json_extract_string(args_json, "buffer_name", buf_name, sizeof buf_name);
+        json_extract_string(args_json, "start_line", start_str, sizeof start_str);
+        json_extract_string(args_json, "end_line", end_str, sizeof end_str);
+        
+        if (!buf_name[0]) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing buffer_name\"}}");
+            goto done;
+        }
+        
+        lmux_workspace *ws = ws_id[0] ? lmux_workspace_by_id(app, (lmux_id)atol(ws_id))
+                                      : lmux_workspace_focused(app);
+        if (!ws) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"workspace not found\"}}");
+            goto done;
+        }
+        
+        lmux_surface *s = NULL;
+        if (s_id[0]) {
+            lmux_id sid = (lmux_id)atol(s_id);
+            for (size_t i = 0; i < ws->surfaces.len; i++) {
+                if (((lmux_surface *)ws->surfaces.items[i])->id == sid) {
+                    s = ws->surfaces.items[i];
+                    break;
+                }
+            }
+        } else {
+            s = lmux_surface_focused(ws);
+        }
+        if (!s) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"surface not found\"}}");
+            goto done;
+        }
+        
+        lmux_pane *p = NULL;
+        for (size_t i = 0; i < s->panes.len; i++) {
+            lmux_pane *cp = s->panes.items[i];
+            if (cp->focused) { p = cp; break; }
+        }
+        if (!p && s->panes.len > 0) p = s->panes.items[0];
+        if (!p) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no pane to capture\"}}");
+            goto done;
+        }
+        
+        long start_line = start_str[0] ? atol(start_str) : 0;
+        long end_line = end_str[0] ? atol(end_str) : -1;
+        
+        int rc = lmux_buffer_capture_pane(app, p, buf_name, start_line, end_line);
+        if (rc == 0) {
+            written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{\"buffer_name\":\"%s\"}}", buf_name);
+        } else {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"capture_failed\",\"message\":\"failed to capture pane\"}}");
+        }
+        goto done;
+    }
+
+    /* buffer.limit - set/get buffer limit */
+    if (strcmp(cmd, "buffer.limit") == 0) {
+        char limit_str[32] = {0};
+        json_extract_string(args_json, "limit", limit_str, sizeof limit_str);
+        
+        if (limit_str[0]) {
+            size_t limit = (size_t)atol(limit_str);
+            lmux_buffer_set_limit(app, limit);
+        }
+        
+        size_t limit = lmux_buffer_get_limit(app);
+        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{\"limit\":%zu}}", limit);
+        goto done;
+    }
+
+    /* buffer.count - get buffer count */
+    if (strcmp(cmd, "buffer.count") == 0) {
+        size_t count = lmux_buffer_count(app);
+        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{\"count\":%zu}}", count);
         goto done;
     }
 

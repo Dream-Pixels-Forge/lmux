@@ -292,6 +292,26 @@ static const char *get_variable_value(struct lmux_app *app, struct lmux_workspac
         snprintf(out, out_cap, "%s", pane->focused ? "1" : "0");
     } else if (strcmp(var_name, "window_active") == 0) {
         snprintf(out, out_cap, "%s", surf->focused ? "1" : "0");
+    } else if (strcmp(var_name, "buffer_count") == 0) {
+        snprintf(out, out_cap, "%zu", lmux_buffer_count(app));
+    } else if (strncmp(var_name, "buffer_", 7) == 0 && 
+               strlen(var_name) > 13 && 
+               strcmp(var_name + strlen(var_name) - 5, "_size") == 0) {
+        /* #{buffer_<name>_size} - extract buffer name between "buffer_" and "_size" */
+        size_t name_len = strlen(var_name) - 12; /* 7 for "buffer_" + 5 for "_size" */
+        if (name_len > 0 && name_len < 64) {
+            char buf_name[64];
+            memcpy(buf_name, var_name + 7, name_len);
+            buf_name[name_len] = '\0';
+            size_t sz = lmux_buffer_get_size(app, buf_name);
+            if (sz != SIZE_MAX) {
+                snprintf(out, out_cap, "%zu", sz);
+            } else {
+                out[0] = '\0';
+            }
+        } else {
+            out[0] = '\0';
+        }
     } else {
         /* Unknown variable - return empty string */
         out[0] = '\0';

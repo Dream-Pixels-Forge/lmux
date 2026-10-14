@@ -38,6 +38,7 @@ const testPrograms = [
     { name: "test_fuzz",   sources: ["test_fuzz.c"] },
     { name: "test_hooks",  sources: ["test_hooks.c"] },
     { name: "test_sync_panes", sources: ["test_sync_panes.c"] },
+    { name: "test_buffer", sources: ["test_buffer.c"] },
 ];
 
 /* ── Compile and run each test ─────────────── */
