@@ -606,6 +606,100 @@ static char *build_json_command(int argc, char **argv) {
             }
         }
     }
+    /* buffer.set [name] <data> */
+    else if (strcmp(cmd, "buffer.set") == 0) {
+        if (argc >= 2) {
+            /* If first arg doesn't look like a flag, treat as data with auto-name */
+            if (argv[1][0] != '-') {
+                if (argc >= 3) {
+                    /* First arg is name, rest is data */
+                    args_len = snprintf(args_buf, sizeof args_buf,
+                        "\"name\":\"%s\",\"data\":\"%s\"",
+                        (json_escape(argv[1], _esc, sizeof _esc), _esc),
+                        (json_escape(argv[2], _esc, sizeof _esc), _esc));
+                } else {
+                    /* Only data, auto-generate name */
+                    args_len = snprintf(args_buf, sizeof args_buf,
+                        "\"data\":\"%s\"", (json_escape(argv[1], _esc, sizeof _esc), _esc));
+                }
+            }
+        }
+    }
+    /* buffer.get <name> */
+    else if (strcmp(cmd, "buffer.get") == 0 && argc >= 2) {
+        args_len = snprintf(args_buf, sizeof args_buf, "\"name\":\"%s\"", (json_escape(argv[1], _esc, sizeof _esc), _esc));
+    }
+    /* buffer.list */
+    else if (strcmp(cmd, "buffer.list") == 0) {
+        /* args: {} */
+    }
+    /* buffer.delete <name> */
+    else if (strcmp(cmd, "buffer.delete") == 0 && argc >= 2) {
+        args_len = snprintf(args_buf, sizeof args_buf, "\"name\":\"%s\"", (json_escape(argv[1], _esc, sizeof _esc), _esc));
+    }
+    /* buffer.save <name> <path> */
+    else if (strcmp(cmd, "buffer.save") == 0 && argc >= 3) {
+        args_len = snprintf(args_buf, sizeof args_buf,
+            "\"name\":\"%s\",\"path\":\"%s\"",
+            (json_escape(argv[1], _esc, sizeof _esc), _esc),
+            (json_escape(argv[2], _esc, sizeof _esc), _esc));
+    }
+    /* buffer.load <name> <path> */
+    else if (strcmp(cmd, "buffer.load") == 0 && argc >= 3) {
+        args_len = snprintf(args_buf, sizeof args_buf,
+            "\"name\":\"%s\",\"path\":\"%s\"",
+            (json_escape(argv[1], _esc, sizeof _esc), _esc),
+            (json_escape(argv[2], _esc, sizeof _esc), _esc));
+    }
+    /* buffer.capture_pane [surface_id] [workspace_id] <buffer_name> [-S start] [-E end] */
+    else if (strcmp(cmd, "buffer.capture_pane") == 0) {
+        const char *buf_name = NULL;
+        const char *start_line = "0";
+        const char *end_line = "-1";
+        const char *surface_id = NULL;
+        const char *workspace_id = NULL;
+        
+        for (int i = 1; i < argc; i++) {
+            if (strcmp(argv[i], "-S") == 0 && i + 1 < argc) {
+                start_line = argv[++i];
+            } else if (strcmp(argv[i], "-E") == 0 && i + 1 < argc) {
+                end_line = argv[++i];
+            } else if (surface_id == NULL && workspace_id == NULL) {
+                /* First positional could be surface_id or buffer_name */
+                /* We'll use a simple heuristic: if more args follow, it's surface_id */
+                if (i + 1 < argc && argv[i + 1][0] != '-') {
+                    surface_id = argv[i];
+                } else {
+                    buf_name = argv[i];
+                }
+            } else if (workspace_id == NULL) {
+                workspace_id = argv[i];
+            } else if (buf_name == NULL) {
+                buf_name = argv[i];
+            }
+        }
+        
+        if (buf_name) {
+            args_len = snprintf(args_buf, sizeof args_buf, "\"buffer_name\":\"%s\"", (json_escape(buf_name, _esc, sizeof _esc), _esc));
+            if (surface_id) {
+                args_len += snprintf(args_buf + args_len, sizeof args_buf - args_len, ",\"surface_id\":\"%s\"", (json_escape(surface_id, _esc, sizeof _esc), _esc));
+            }
+            if (workspace_id) {
+                args_len += snprintf(args_buf + args_len, sizeof args_buf - args_len, ",\"workspace_id\":\"%s\"", (json_escape(workspace_id, _esc, sizeof _esc), _esc));
+            }
+            args_len += snprintf(args_buf + args_len, sizeof args_buf - args_len, ",\"start_line\":\"%s\",\"end_line\":\"%s\"", start_line, end_line);
+        }
+    }
+    /* buffer.limit [limit] */
+    else if (strcmp(cmd, "buffer.limit") == 0) {
+        if (argc >= 2) {
+            args_len = snprintf(args_buf, sizeof args_buf, "\"limit\":\"%s\"", (json_escape(argv[1], _esc, sizeof _esc), _esc));
+        }
+    }
+    /* buffer.count */
+    else if (strcmp(cmd, "buffer.count") == 0) {
+        /* args: {} */
+    }
     /* capabilities */
     else if (strcmp(cmd, "capabilities") == 0) {
         /* args: {} — args_len stays 0 */
@@ -1616,6 +1710,15 @@ static void print_usage(void) {
   printf("  workspace.refresh [ws_id]           Refresh workspace metadata\n");
   printf("  read-screen [s_id] [ws]            Read terminal screen content\n");
   printf("  capture-pane [s_id] [ws]           Alias for read-screen\n");
+    printf("  buffer.set [name] <data>          Set buffer content (auto-name if name omitted)\n");
+    printf("  buffer.get <name>                 Get buffer content\n");
+    printf("  buffer.list                       List all buffers\n");
+    printf("  buffer.delete <name>              Delete a buffer\n");
+    printf("  buffer.save <name> <path>         Save buffer to file\n");
+    printf("  buffer.load <name> <path>         Load buffer from file\n");
+    printf("  buffer.capture_pane [-S N] [-E N] [surface_id] [workspace_id] <buffer_name>  Capture pane to buffer\n");
+    printf("  buffer.limit [N]                  Set/get buffer limit (0=unlimited)\n");
+    printf("  buffer.count                      Get buffer count\n");
   printf("  session.save                       Save session to disk\n");
   printf("  session.restore                    Restore session from disk\n");
   printf("  config.get [key]                   Get config value(s)\n");
