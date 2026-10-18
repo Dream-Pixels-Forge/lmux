@@ -567,6 +567,25 @@ const char *lmux_socket_path(const lmux_app *app);
 /* For embedders that want to dispatch JSON requests directly. */
 
 /* ------------------------------------------------------------------ */
+/* Command registry                                                     */
+/* ------------------------------------------------------------------ */
+
+/* Table-driven registry of the commands the daemon can dispatch.
+ * Additive (Strangler-Fig): it describes the dispatch surface without
+ * replacing the strcmp chain in model.c. */
+typedef struct lmux_cmd_entry {
+    const char *name;       /* command name, e.g. "workspace.create"   */
+    const char *summary;    /* one-line description                    */
+} lmux_cmd_entry;
+
+/* Return the full command table (static storage). `count` is set to the
+ * number of entries when non-NULL. Never returns NULL. */
+const lmux_cmd_entry *lmux_registry_all(size_t *count);
+
+/* Look up a command by name. Returns NULL when not found. */
+const lmux_cmd_entry *lmux_registry_get(const char *name);
+
+/* ------------------------------------------------------------------ */
 /* Unix socket server                                                   */
 /* ------------------------------------------------------------------ */
 

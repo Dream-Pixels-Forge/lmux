@@ -7132,6 +7132,25 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         goto done;
     }
 
+    /* --- list-commands --- Table-driven command registry (M1a). */
+    if (strcmp(cmd, "list-commands") == 0 || strcmp(cmd, "list_commands") == 0) {
+        size_t count = 0;
+        const lmux_cmd_entry *entries = lmux_registry_all(&count);
+        written = snprintf(result, result_cap,
+            "{\"ok\":true,\"result\":{\"commands\":[");
+        for (size_t i = 0; i < count; i++) {
+            RESULT_GROW;
+            if (i > 0) written += snprintf(result + written, result_cap - written, ",");
+            char _ne[128], _se[256];
+            written += snprintf(result + written, result_cap - written,
+                "{\"name\":\"%s\",\"summary\":\"%s\"}",
+                json_escape_str(_ne, sizeof _ne, entries[i].name),
+                json_escape_str(_se, sizeof _se, entries[i].summary));
+        }
+        written += snprintf(result + written, result_cap - written, "]}}");
+        goto done;
+    }
+
     /* --- browser commands --- */
     if (strcmp(cmd, "browser.open") == 0) {
         char url[2048] = {0};

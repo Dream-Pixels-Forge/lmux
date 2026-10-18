@@ -481,6 +481,12 @@ static char *build_json_command(int argc, char **argv) {
     for (char *p = cmd_normalized; *p; p++) {
         if (*p == '-') *p = '_';
     }
+    /* `list-commands` / `list_commands` both target the registry query; the
+     * daemon's canonical name uses a hyphen, so restore it after the hyphen
+     * -> underscore normalisation above. */
+    if (strcmp(cmd_normalized, "list_commands") == 0) {
+        snprintf(cmd_normalized, sizeof cmd_normalized, "list-commands");
+    }
     const char *cmd = cmd_normalized;
     size_t args_len = 0;
     char args_buf[4096];
@@ -1742,6 +1748,7 @@ static void print_usage(void) {
     printf("  naming.suggest <dir>               Get workspace name suggestions for a directory\n");
     printf("  focus.history [count]              Show recent focus history\n");
     printf("  capabilities                       Print server capabilities\n");
+    printf("  list-commands                      List all available commands\n");
     printf("  health.live                        Check if daemon is alive\n");
     printf("  health.ready                       Check if daemon is ready\n");
     printf("  metrics                            Show server metrics\n");

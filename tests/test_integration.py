@@ -176,6 +176,35 @@ class TestPing(unittest.TestCase):
             self.assertIn(cmd, caps, f"missing capability: {cmd}")
 
 
+class TestListCommands(unittest.TestCase):
+    """The `list-commands` command (M1a command registry)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.c = _ensure_daemon()
+
+    def test_list_commands_returns_table(self):
+        resp = self.c.send("list-commands", {})
+        self.assertTrue(resp.get("ok"), resp)
+        commands = resp.get("result", {}).get("commands", [])
+        self.assertIsInstance(commands, list)
+        self.assertGreater(len(commands), 0)
+
+    def test_list_commands_contains_core_entries(self):
+        commands = self.c.send("list-commands", {}).get("result", {}).get(
+            "commands", [])
+        names = [c.get("name") for c in commands]
+        self.assertIn("workspace.create", names)
+        self.assertIn("list-commands", names)
+
+    def test_list_commands_entries_have_summaries(self):
+        commands = self.c.send("list-commands", {}).get("result", {}).get(
+            "commands", [])
+        for c in commands:
+            self.assertIn("name", c)
+            self.assertIn("summary", c)
+
+
 # ====================================================================
 # Workspace lifecycle
 # ====================================================================
