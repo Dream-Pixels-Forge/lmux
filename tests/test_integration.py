@@ -1635,8 +1635,11 @@ class TestPtyDeferralOnRestore(unittest.TestCase):
             deadline = time.time() + 30
             while time.time() < deadline and client is None:
                 time.sleep(0.25)
+                # LmuxClient() connects lazily: probe with a real ping.
                 try:
-                    client = LmuxClient(sock)
+                    probe = LmuxClient(sock)
+                    if probe.send("ping", {}).get("ok"):
+                        client = probe
                 except Exception:  # noqa: BLE001 - not up yet
                     client = None
             self.assertIsNotNone(client, "daemon did not come up")
@@ -6580,8 +6583,12 @@ class TestHarnessPtydTeardown(unittest.TestCase):
                 deadline = time.time() + 60
                 while time.time() < deadline and client is None:
                     time.sleep(0.25)
+                    # LmuxClient() connects lazily, so constructing it proves
+                    # nothing: probe with a real ping until the daemon binds.
                     try:
-                        client = LmuxClient(sock)
+                        probe = LmuxClient(sock, timeout=5.0)
+                        if probe.send("ping", {}).get("ok"):
+                            client = probe
                     except Exception:  # noqa: BLE001 - not up yet
                         client = None
                 if client is not None:
