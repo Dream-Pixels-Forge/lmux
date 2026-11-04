@@ -3196,6 +3196,22 @@ class TestConfigPersistence(unittest.TestCase):
         finally:
             _shutdown_isolated(daemon, home)
 
+    def test_group_list_reports_member_workspace_ids(self):
+        """The GUI needs each group's member IDs, not just a count."""
+        client, daemon, home = _isolated_client()
+        try:
+            name = _unique("members")
+            ws = client.send("workspace.create", {"title": "g"})["result"]["id"]
+            client.send("workspace.group.create", {"name": name})
+            client.send("workspace.group.add",
+                        {"name": name, "workspace_id": str(ws)})
+            groups = client.send("workspace.group.list")["result"]["groups"]
+            g = next(g for g in groups if g["name"] == name)
+            self.assertEqual(g["workspace_count"], 1)
+            self.assertEqual(g["workspace_ids"], [ws])
+        finally:
+            _shutdown_isolated(daemon, home)
+
     def test_group_survives_daemon_restart(self):
         """T1 at CLI level: a saved group must be readable after a restart."""
         client, daemon, home = _isolated_client()

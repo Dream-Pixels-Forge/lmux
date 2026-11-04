@@ -6776,7 +6776,16 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                 RESULT_GROW;
                 if (i > 0) written += snprintf(result + written, result_cap - written, ",");
                 written += snprintf(result + written, result_cap - written,
-                    "{\"name\":\"%s\",\"workspace_count\":%zu}", g->name, g->workspace_ids.len);
+                    "{\"name\":\"%s\",\"workspace_count\":%zu,\"workspace_ids\":[",
+                    g->name, g->workspace_ids.len);
+                for (size_t j = 0; j < g->workspace_ids.len; j++) {
+                    RESULT_GROW;
+                    lmux_id *wid = g->workspace_ids.items[j];
+                    written += snprintf(result + written, result_cap - written,
+                        "%s%u", j ? "," : "", (unsigned)*wid);
+                }
+                RESULT_GROW;
+                written += snprintf(result + written, result_cap - written, "]}");
             }
         }
         written += snprintf(result + written, result_cap - written, "]}}");

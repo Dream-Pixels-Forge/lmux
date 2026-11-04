@@ -82,6 +82,22 @@ class FileExplorerScanTests(unittest.TestCase):
 
 
 @unittest.skipUnless(HAS_DISPLAY, "needs a display for GTK")
+class WorkspaceGroupsShapeTests(unittest.TestCase):
+    def test_daemon_list_shape_is_normalised(self):
+        """workspace.group.list returns a list of {name, workspace_ids};
+        the panel used to call .items() on it and crash."""
+        from workspace_groups import normalize_groups
+        daemon = [{"name": "a", "workspace_count": 2, "workspace_ids": [1, 3]},
+                  {"name": "b", "workspace_count": 0}]
+        self.assertEqual(normalize_groups(daemon), {"a": ["1", "3"], "b": []})
+
+    def test_legacy_dict_shape_still_accepted(self):
+        from workspace_groups import normalize_groups
+        self.assertEqual(normalize_groups({"a": ["1"]}), {"a": ["1"]})
+        self.assertEqual(normalize_groups(None), {})
+
+
+@unittest.skipUnless(HAS_DISPLAY, "needs a display for GTK")
 class MainWindowStartupTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
