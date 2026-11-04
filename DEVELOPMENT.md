@@ -122,7 +122,7 @@ Errors (RFC 7807):
 
 ## CI/CD
 
-All workflows run on push to `master` and on PRs:
+All workflows run on push to `main` and on PRs:
 - **ci.yml** — build, unit tests, sanitizers, cppcheck, Debian packaging
 - **nightly.yml** — nightly build + release
 - **release.yml** — triggered by `v*` tags
