@@ -589,9 +589,11 @@ bool lmux_config_save(const lmux_config *cfg, const char *path) {
     fprintf(f, "  \"keybindings\": [\n");
     for (size_t i = 0; i < cfg->keybindings.len; i++) {
         lmux_keybinding *kb = cfg->keybindings.items[i];
+        char key_esc[2048], action_esc[2048];
+        cfg_json_escape(kb->key, key_esc, sizeof key_esc);
+        cfg_json_escape(kb->action, action_esc, sizeof action_esc);
         fprintf(f, "    {\"key\": \"%s\", \"action\": \"%s\"}%s\n",
-                cfg_json_escape(kb->key, esc_buf, sizeof esc_buf),
-                cfg_json_escape(kb->action, esc_buf, sizeof esc_buf),
+                key_esc, action_esc,
                 i + 1 < cfg->keybindings.len ? "," : "");
     }
     fprintf(f, "  ],\n");
@@ -600,11 +602,13 @@ bool lmux_config_save(const lmux_config *cfg, const char *path) {
     fprintf(f, "  \"themes\": [\n");
     for (size_t i = 0; i < cfg->themes.len; i++) {
         lmux_theme_entry *t = cfg->themes.items[i];
+        char name_esc[2048], fg_esc[2048], bg_esc[2048], cur_esc[2048];
+        cfg_json_escape(t->name, name_esc, sizeof name_esc);
+        cfg_json_escape(t->fg, fg_esc, sizeof fg_esc);
+        cfg_json_escape(t->bg, bg_esc, sizeof bg_esc);
+        cfg_json_escape(t->cursor, cur_esc, sizeof cur_esc);
         fprintf(f, "    {\"name\": \"%s\", \"fg\": \"%s\", \"bg\": \"%s\", \"cursor\": \"%s\"}%s\n",
-                cfg_json_escape(t->name, esc_buf, sizeof esc_buf),
-                cfg_json_escape(t->fg, esc_buf, sizeof esc_buf),
-                cfg_json_escape(t->bg, esc_buf, sizeof esc_buf),
-                cfg_json_escape(t->cursor, esc_buf, sizeof esc_buf),
+                name_esc, fg_esc, bg_esc, cur_esc,
                 i + 1 < cfg->themes.len ? "," : "");
     }
     fprintf(f, "  ],\n");

@@ -63,9 +63,6 @@
 static bool is_safe_path(const char *path, const char *base_dir) {
     if (!path || !path[0]) return false;
 
-    /* Reject null bytes */
-    if (strchr(path, '\0') && strchr(path, '\0') != path + strlen(path)) return false;
-
     /* Reject ".." components */
     const char *p = path;
     while (*p) {
@@ -347,6 +344,10 @@ struct lmux_pane {
     bool          remain_on_exit;
     bool          pane_died;                   /* true when child has exited but pane kept */
     int           last_exit_code;              /* exit code of last child process */
+    /* Split direction that created this pane. Must stay AFTER every field
+     * mirrored in format.c's private struct lmux_pane copy, or format
+     * expansion reads the wrong offsets. */
+    lmux_split_dir split_dir;
 };
 /* pane_new defined after lmux_workspace struct — needs ws->app dereference */
 /* Spawn a child process with a pty for this pane.
@@ -1429,39 +1430,27 @@ static void hook_fire(lmux_app *app, const char *name, lmux_hook_scope scope,
 static void hook_dispatch(lmux_app *app, const char *name,
                           lmux_hook_scope scope, lmux_id target_id) {
     if (!app || !name) return;
-    
-    fprintf(stderr, "[DEBUG] hook_dispatch: name=%s, scope=%d, target_id=%u, hooks_count=%zu\n", name, scope, (unsigned)target_id, app->hooks.len);
-    
+
     for (size_t i = 0; i < app->hooks.len; i++) {
         lmux_hook_ext *h = app->hooks.items[i];
-        fprintf(stderr, "[DEBUG] hook_dispatch: checking hook %zu: name=%s, scope=%d, target_id=%u, enabled=%d\n", i, h->name, h->scope, (unsigned)h->target_id, h->enabled);
         if (!h->enabled) continue;
         if (strcmp(h->name, name) != 0) continue;
-        
+
         /* Check scope match */
         if (h->scope != scope) continue;
-        
+
         /* Check target match (0 = global, matches any) */
         if (h->target_id != 0 && h->target_id != target_id) continue;
-        
+
         /* Fire the hook */
-        fprintf(stderr, "[DEBUG] hook_dispatch: firing hook %zu\n", i);
         hook_fire(app, name, scope, target_id, h->command);
     }
 }
 
 /* Dispatch hook with default scope based on name */
 static void hook_dispatch_simple(lmux_app *app, const char *name, lmux_id target_id) {
-    fprintf(stderr, "[DEBUG] hook_dispatch_simple: ENTRY name=%s, target_id=%u\n", name, (unsigned)target_id);
-    fflush(stderr);
-    if (!app || !name) {
-        fprintf(stderr, "[DEBUG] hook_dispatch_simple: EARLY RETURN app=%p name=%p\n", (void*)app, (void*)name);
-        fflush(stderr);
-        return;
-    }
+    if (!app || !name) return;
     lmux_hook_scope scope = hook_default_scope(name);
-    fprintf(stderr, "[DEBUG] hook_dispatch_simple: name=%s, target_id=%u, scope=%d\n", name, (unsigned)target_id, scope);
-    fflush(stderr);
     hook_dispatch(app, name, scope, target_id);
 }
 
@@ -2736,9 +2725,9 @@ void lmux_surface_set_title(lmux_surface *s, const char *title) {
 lmux_pane *lmux_pane_split(lmux_workspace *ws, lmux_surface *s,
                            lmux_split_dir dir, const char *command,
                            bool spawn_pty) {
-    (void)dir;
     if (!s) return NULL;  /* can't split without a surface */
     lmux_pane *p = pane_new(ws, s, "terminal");
+    p->split_dir = dir;
     const char *sh_cmd = command ? command : (getenv("SHELL") ? getenv("SHELL") : "/bin/sh");
     snprintf(p->command, sizeof p->command, "%s", sh_cmd);
     vec_push(&s->panes, p);
@@ -3666,7 +3655,8 @@ void lmux_event_push(lmux_app *app, const char *name, const char *category, cons
     /* ISO-8601 timestamp */
     char ts[32];
     time_t now = time(NULL);
-    struct tm *tm = localtime(&now);
+    struct tm tm_buf;
+    struct tm *tm = localtime_r(&now, &tm_buf);
     strftime(ts, sizeof ts, "%Y-%m-%dT%H:%M:%S", tm);
 
     /* Build event JSON (single allocation for queue) */
@@ -7292,7 +7282,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         }
         char *fbuf = malloc(fsize + 1);
         if (!fbuf) { fclose(fp); goto done; }
-        fread(fbuf, 1, fsize, fp);
+        if (fread(fbuf, 1, fsize, fp) != (size_t)fsize) { free(fbuf); fclose(fp); goto done; }
         fbuf[fsize] = '\0';
         fclose(fp);
 
@@ -7909,7 +7899,8 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             if (strcmp(name, app->templates[i]) == 0) {
                 /* Shift remaining templates */
                 for (int j = i; j < app->template_count - 1; j++) {
-                    snprintf(app->templates[j], sizeof app->templates[0], "%s", app->templates[j + 1]);
+                    memmove(app->templates[j], app->templates[j + 1],
+                            sizeof app->templates[0]);
                 }
                 app->template_count--;
                 found = true;
@@ -10452,7 +10443,6 @@ static bool is_readonly_cmd(const char *cmd) {
         "browser.list",
         "feed.panel.list",
         "profile.status",
-        "control.attach", "refresh-client",
     };
     for (size_t i = 0; i < sizeof ro / sizeof ro[0]; i++) {
         if (strcmp(cmd, ro[i]) == 0) return true;
