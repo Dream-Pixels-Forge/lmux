@@ -138,7 +138,10 @@ class DaemonClient:
                 if not raw:
                     result = {"ok": False, "error": "empty response"}
                 else:
-                    result = json.loads(raw.decode().strip())
+                    try:
+                        result = json.loads(raw.decode().strip())
+                    except (json.JSONDecodeError, ValueError) as e:
+                        result = {"ok": False, "error": f"invalid JSON response: {e}"}
                 break
             except PermissionError as e:
                 result = {"ok": False, "error": f"permission denied: {e}"}
@@ -214,6 +217,7 @@ class DaemonClient:
         def _run():
             backoff = SSE_BACKOFF_INITIAL
             while not stop.is_set():
+                s = None
                 try:
                     s = socket.socket(socket.AF_UNIX)
                     s.settimeout(1)
@@ -241,9 +245,14 @@ class DaemonClient:
                                         pass
                         except socket.timeout:
                             continue
-                    s.close()
                 except Exception:
                     pass
+                finally:
+                    if s is not None:
+                        try:
+                            s.close()
+                        except Exception:
+                            pass
                 if not stop.is_set():
                     # N11: exponential backoff (1s doubling to 30s max),
                     # interruptible so stop() stays prompt.

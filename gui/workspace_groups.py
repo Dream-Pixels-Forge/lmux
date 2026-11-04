@@ -51,7 +51,7 @@ class WorkspaceGroupsPanel(Gtk.Box):
 
     def __init__(self, client: DaemonClient, parent_window=None):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        self._client = client
+        self._client = client or DaemonClient()
         self._parent_window = parent_window
         self._groups: Dict[str, List[str]] = {}
 
@@ -331,7 +331,7 @@ class WorkspaceGroupsPanel(Gtk.Box):
                     resp = self._client.send("workspace.get", {"id": ws_id})
                     if resp.get("ok"):
                         return resp.get("result", {}).get("title", f"Workspace {ws_id}")
-                except:
+                except Exception:
                     pass
                 return f"Workspace {ws_id}"
 
