@@ -117,6 +117,7 @@ static char *send_request(int fd, const char *json_request) {
     char *buf = malloc(cap);
     if (!buf) {
         fprintf(stderr, "lmux: out of memory\n");
+        return NULL;
     }
     ssize_t r;
     bool found_newline = false;
@@ -212,7 +213,7 @@ static char *translate_tmux_command(int argc, char **argv) {
 
     /* new-session [-s name] [-d] [-x width] [-y height]
      * → workspace.create {"title": name} */
-    if (strcmp(tmux_cmd, "new-session") == 0 || strcmp(tmux_cmd, "new-session") == 0) {
+    if (strcmp(tmux_cmd, "new-session") == 0) {
         const char *name = NULL;
         int i = 2;
         /* Check for -s flag */
@@ -422,6 +423,7 @@ static char *translate_tmux_command(int argc, char **argv) {
         } else {
             fprintf(stderr, "lmux tmux: rename-session requires a new name\n");
             free(json);
+            json = NULL;
         }
         return json;
     }
@@ -480,6 +482,12 @@ static char *build_json_command(int argc, char **argv) {
     }
     for (char *p = cmd_normalized; *p; p++) {
         if (*p == '-') *p = '_';
+    }
+    /* `list-commands` / `list_commands` both target the registry query; the
+     * daemon's canonical name uses a hyphen, so restore it after the hyphen
+     * -> underscore normalisation above. */
+    if (strcmp(cmd_normalized, "list_commands") == 0) {
+        snprintf(cmd_normalized, sizeof cmd_normalized, "list-commands");
     }
     const char *cmd = cmd_normalized;
     size_t args_len = 0;
@@ -1656,92 +1664,15 @@ static void print_usage(void) {
     printf("  lmux help                         Show this help\n");
     printf("  lmux version                      Show version\n\n");
     printf("Commands:\n");
-    printf("  workspace.create <title>          Create a workspace\n");
-    printf("  workspace.list                    List workspaces\n");
-    printf("  workspace.close <id>              Close a workspace\n");
-    printf("  workspace.select <id>             Focus a workspace\n");
-    printf("  workspace.current                 Show focused workspace\n");
-    printf("  ssh <user@host> [port]             Create an SSH-backed workspace\n");
-    printf("  workspace.rename <id> <title>     Rename a workspace\n");
-    printf("  surface.create [ws_id] [title]    Create a surface\n");
-    printf("  surface.list                      List surfaces\n");
-    printf("  surface.close <id> [ws_id]        Close a surface\n");
-    printf("  notification.clear                       Clear all notifications\n");
-    printf("  notification.mark-read [seq]             Mark notification as read\n");
-    printf("  surface.focus <id> [ws_id]               Focus a surface\n");
-    printf("  surface.send-key <key> [s_id] [ws]       Send a single key to a surface\n");
-    printf("  workspace.reorder <from> <to>            Reorder workspace\n");
-    printf("  snapshot.save [path]               Save workspace state to file\n");
-    printf("  snapshot.load [path]               Load workspace state from file\n");
-    printf("  surface.split <dir> [s_id] [ws]   Split pane (dir: h|v)\n");
-    printf("  pane.list                         List panes\n");
-    printf("  pane.focus <id> [ws_id]           Focus a pane\n");
-    printf("  surface.send_text <text>          Send text to surface\n");
-    printf("  notification.create <text>        Send notification\n");
-    printf("  notification.list                 List notifications\n");
-    printf("  notification.ring <pane_id> [reason] Add visual ring to pane\n");
-    printf("  notification.ring.clear <pane_id>  Clear ring from pane\n");
-    printf("  notification.ring.list             List active rings\n");
-    printf("  notification.hook <event> [filter] [redirect] Add notification hook\n");
-  printf("  notification.hook.remove <event>  Remove notification hook\n");
-  printf("  notification.hook.list             List notification hooks\n");
-  printf("  window.create <title>              Create new window\n");
-  printf("  window.list                        List windows\n");
-  printf("  window.close <id>                  Close window\n");
-  printf("  window.focus <id>                  Focus window\n");
-  printf("  window.move-workspace <win_id> <ws_id> Move workspace to window\n");
-  printf("  ssh.session.create <host> [user] [key] Create SSH session\n");
-  printf("  ssh.session.list                     List SSH sessions\n");
-  printf("  ssh.session.kill <id>                Kill SSH session\n");
-  printf("  ssh.session.save [path]              Save SSH sessions\n");
-  printf("  ssh.session.restore [path]           Restore SSH sessions\n");
-  printf("  feed.panel.create <title> [filter]   Create feed panel\n");
-  printf("  feed.panel.list                      List feed panels\n");
-  printf("  feed.panel.close <id>                Close feed panel\n");
-  printf("  feed.entry.add <panel_id> <text>     Add entry to feed\n");
-  printf("  feed.entry.list <panel_id>           List feed entries\n");
-  printf("  feed.panel.clear <panel_id>          Clear feed panel\n");
-    printf("  ping                              Check connectivity\n");
-    printf("  display-message <message>          Echo a message back from the daemon\n");
-    printf("  tree                              Print workspace/surface/pane hierarchy\n");
-    printf("  pane.resize <dir> [cols] [rows] [s_id] [ws]  Resize a pane\n");
-    printf("  pane.focus-dir <dx> [dy]           Move focus in a direction\n");
-    printf("  last-pane                         Focus the last active pane\n");
-  printf("  workspace.refresh [ws_id]           Refresh workspace metadata\n");
-  printf("  read-screen [s_id] [ws]            Read terminal screen content\n");
-  printf("  capture-pane [s_id] [ws]           Alias for read-screen\n");
-    printf("  buffer.set [name] <data>          Set buffer content (auto-name if name omitted)\n");
-    printf("  buffer.get <name>                 Get buffer content\n");
-    printf("  buffer.list                       List all buffers\n");
-    printf("  buffer.delete <name>              Delete a buffer\n");
-    printf("  buffer.save <name> <path>         Save buffer to file\n");
-    printf("  buffer.load <name> <path>         Load buffer from file\n");
-    printf("  buffer.capture_pane [-S N] [-E N] [surface_id] [workspace_id] <buffer_name>  Capture pane to buffer\n");
-    printf("  buffer.limit [N]                  Set/get buffer limit (0=unlimited)\n");
-    printf("  buffer.count                      Get buffer count\n");
-  printf("  session.save                       Save session to disk\n");
-  printf("  session.restore                    Restore session from disk\n");
-  printf("  config.get [key]                   Get config value(s)\n");
-  printf("  config.set <key> <value>           Set config value\n");
-  printf("  workspace.group.create <name>       Create a workspace group\n");
-  printf("  workspace.group.list               List workspace groups\n");
-  printf("  workspace.group.add <name> <ws_id> Add workspace to group\n");
-  printf("  workspace.group.remove <name> <ws_id> Remove workspace from group\n");
-    printf("  agent.spawn <name> <command> [ws_id] Spawn an agent process\n");
-    printf("  agent.list                         List running agents\n");
-    printf("  agent.stop <id>                    Stop an agent process\n");
-    printf("  agent.hibernate <id>               Hibernate agent (kill to save RAM)\n");
-    printf("  agent.resume <id>                  Resume hibernated agent\n");
-    printf("  agent.hibernation.status           Show hibernation status\n");
-    printf("  ssh.list                           List active SSH sessions\n");
-    printf("  ssh.connect <host> [port] [user]   Connect to remote host via SSH\n");
-    printf("  ssh.disconnect <session_id>        Disconnect an SSH session\n");
-    printf("  hooks.list                         List registered hook scripts\n");
-    printf("  hooks.add <event> <script>         Register a hook script for an event\n");
-    printf("  hooks.remove <event>                Unregister a hook script\n");
-    printf("  naming.suggest <dir>               Get workspace name suggestions for a directory\n");
-    printf("  focus.history [count]              Show recent focus history\n");
-    printf("  capabilities                       Print server capabilities\n");
+
+    size_t count = 0;
+    const lmux_cmd_entry *entries = lmux_registry_all(&count);
+    for (size_t i = 0; i < count; i++) {
+        printf("  %-35s %s\n", entries[i].name, entries[i].summary);
+    }
+
+    printf("\n");
+    printf("  list-commands                      List all available commands\n");
     printf("  health.live                        Check if daemon is alive\n");
     printf("  health.ready                       Check if daemon is ready\n");
     printf("  metrics                            Show server metrics\n");
@@ -1817,6 +1748,27 @@ int main(int argc, char **argv) {
     /* Remaining args = command. */
     argc -= i;
     argv += i;
+
+    /* Check for command-specific help */
+    if (argc >= 2 && (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0)) {
+        size_t count = 0;
+        const lmux_cmd_entry *entries = lmux_registry_all(&count);
+        int found = 0;
+        for (size_t i = 0; i < count; i++) {
+            if (strcmp(entries[i].name, argv[0]) == 0) {
+                printf("lmux %s — %s\n\n", entries[i].name, entries[i].summary);
+                printf("%s\n", entries[i].help);
+                found = 1;
+                break;
+            }
+        }
+        if (!found) {
+            fprintf(stderr, "lmux: unknown command: %s\n", argv[0]);
+            fprintf(stderr, "Try 'lmux help' for a list of commands.\n");
+            return 1;
+        }
+        return 0;
+    }
 
     /* Control mode (tmux -C equivalent) handles its own dispatch. */
     if (control_mode) {

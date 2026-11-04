@@ -189,6 +189,16 @@ void       lmux_pane_focus_dir(lmux_workspace *ws,
 bool lmux_pane_get_info(lmux_pane *p, lmux_pane_info *out);
 lmux_id  lmux_pane_get_id(lmux_pane *p);
 
+/* Remain-on-exit: keep pane scrollback and allow respawn after child exits */
+bool lmux_pane_set_remain_on_exit(lmux_pane *pane, bool enabled);
+bool lmux_pane_get_remain_on_exit(const lmux_pane *pane);
+
+/* Respawn pane with its original command */
+bool lmux_pane_respawn(lmux_pane *pane);
+
+/* Capture pane scrollback content */
+char *lmux_pane_capture(lmux_pane *pane, long start_line, long end_line);
+
 /* Send keystrokes to a terminal pane. Text is interpreted as
  * key-name syntax: literal chars, C-X for Ctrl-X, M-x for Alt-x. */
 void lmux_pane_send_keys(lmux_pane *p, const char *keys);
@@ -297,6 +307,10 @@ typedef struct {
 #define LMUX_HOOK_MONITOR_ACTIVITY     "monitor-activity"
 #define LMUX_HOOK_MONITOR_BELL         "monitor-bell"
 #define LMUX_HOOK_MONITOR_SILENCE      "monitor-silence"
+
+/* Pane lifecycle hooks */
+#define LMUX_HOOK_PANE_DIED            "pane-died"
+#define LMUX_HOOK_PANE_EXITED          "pane-exited"
 
 /* Monitor actions (mirror tmux activity-action/bell-action) */
 #define LMUX_MONITOR_ACTION_ANY        "any"
@@ -551,6 +565,26 @@ bool lmux_osc_parser_pop_133(lmux_osc_parser *p, char *out_marker);
 const char *lmux_socket_path(const lmux_app *app);
 
 /* For embedders that want to dispatch JSON requests directly. */
+
+/* ------------------------------------------------------------------ */
+/* Command registry                                                     */
+/* ------------------------------------------------------------------ */
+
+/* Table-driven registry of the commands the daemon can dispatch.
+ * Additive (Strangler-Fig): it describes the dispatch surface without
+ * replacing the strcmp chain in model.c. */
+typedef struct lmux_cmd_entry {
+    const char *name;       /* command name, e.g. "workspace.create"   */
+    const char *summary;    /* one-line description                    */
+    const char *help;       /* detailed help text with schema          */
+} lmux_cmd_entry;
+
+/* Return the full command table (static storage). `count` is set to the
+ * number of entries when non-NULL. Never returns NULL. */
+const lmux_cmd_entry *lmux_registry_all(size_t *count);
+
+/* Look up a command by name. Returns NULL when not found. */
+const lmux_cmd_entry *lmux_registry_get(const char *name);
 
 /* ------------------------------------------------------------------ */
 /* Unix socket server                                                   */

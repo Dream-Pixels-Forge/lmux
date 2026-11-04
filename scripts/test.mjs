@@ -39,6 +39,8 @@ const testPrograms = [
     { name: "test_hooks",  sources: ["test_hooks.c"] },
     { name: "test_sync_panes", sources: ["test_sync_panes.c"] },
     { name: "test_buffer", sources: ["test_buffer.c"] },
+    { name: "test_remain_on_exit", sources: ["test_remain_on_exit.c"] },
+    { name: "test_registry", sources: ["test_registry.c"] },
 ];
 
 /* ── Compile and run each test ─────────────── */

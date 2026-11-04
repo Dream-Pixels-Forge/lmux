@@ -321,8 +321,10 @@ class FileExplorer(Gtk.Box):
         self._root_node = self._build_tree(path)
         self._display_tree(self._root_node)
 
-    def _build_tree(self, path: str) -> FileNode:
-        """Build file tree from path."""
+    def _build_tree(self, path: str, depth: int = 0, max_depth: int = 1) -> FileNode:
+        """Build the file tree for *path*, scanning at most *max_depth* levels
+        of subdirectories. Deeper levels load lazily on expand
+        (see _ensure_children) so startup never walks the whole disk."""
         try:
             entries = sorted(os.listdir(path), key=lambda x: (not os.path.isdir(os.path.join(path, x)), x.lower()))
         except PermissionError:
@@ -361,9 +363,11 @@ class FileExplorer(Gtk.Box):
                 git_status=status,
             )
 
-            # Recursively build subdirectories (only one level deep for performance)
-            if is_dir and not entry.startswith("."):
-                child = self._build_tree(entry_path)
+            # Recurse only up to max_depth, and never through symlinks
+            # (a link back to an ancestor would loop forever).
+            if is_dir and depth < max_depth and not os.path.islink(entry_path):
+                child = self._build_tree(entry_path, depth + 1, max_depth)
+                child.git_status = status
                 child.expanded = False  # Start collapsed
 
             node.children.append(child)
@@ -399,8 +403,10 @@ class FileExplorer(Gtk.Box):
         if isinstance(row, FileNodeItem):
             node = row.node
             if node.is_dir:
-                # Toggle expand/collapse
+                # Toggle expand/collapse, loading contents on first expand
                 node.expanded = not node.expanded
+                if node.expanded:
+                    self._ensure_children(node)
                 self._display_tree(self._root_node, filter_text=self._search_entry.get_text())
             else:
                 # Handle based on double-click action
@@ -412,6 +418,11 @@ class FileExplorer(Gtk.Box):
                 else:
                     # Default: open file
                     self._open_file(node.path)
+
+    def _ensure_children(self, node: FileNode):
+        """Lazily scan a directory node that the initial scan left empty."""
+        if node.is_dir and not node.children:
+            node.children = self._build_tree(node.path, max_depth=0).children
 
     def _open_file(self, path: str):
         """Open a file (emit signal for parent to handle)."""

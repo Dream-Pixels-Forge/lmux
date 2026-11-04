@@ -63,9 +63,6 @@
 static bool is_safe_path(const char *path, const char *base_dir) {
     if (!path || !path[0]) return false;
 
-    /* Reject null bytes */
-    if (strchr(path, '\0') && strchr(path, '\0') != path + strlen(path)) return false;
-
     /* Reject ".." components */
     const char *p = path;
     while (*p) {
@@ -341,6 +338,16 @@ struct lmux_pane {
     char          monitor_silence_action[16];  /* "any", "current", "other", "none" */
     long          last_activity_ms;            /* for activity monitoring */
     long          last_silence_ms;             /* for silence monitoring */
+    long          last_activity_notify_ms;     /* when we last fired activity hook */
+    long          last_silence_notify_ms;      /* when we last fired silence hook */
+    /* Remain-on-exit: keep scrollback and allow respawn after child exits */
+    bool          remain_on_exit;
+    bool          pane_died;                   /* true when child has exited but pane kept */
+    int           last_exit_code;              /* exit code of last child process */
+    /* Split direction that created this pane. Must stay AFTER every field
+     * mirrored in format.c's private struct lmux_pane copy, or format
+     * expansion reads the wrong offsets. */
+    lmux_split_dir split_dir;
 };
 /* pane_new defined after lmux_workspace struct — needs ws->app dereference */
 /* Spawn a child process with a pty for this pane.
@@ -352,7 +359,6 @@ static int pane_spawn_pty(lmux_pane *p) {
     int master;
     pid_t pid = forkpty(&master, NULL, NULL, NULL);
     if (pid < 0) {
-        lmux_log(LMUX_LOG_ERROR, "pty: forkpty failed for pane %u", p->id);
         return -1;
     }
 
@@ -381,8 +387,6 @@ static int pane_spawn_pty(lmux_pane *p) {
     /* Parent: store fd and pid */
     p->pty_fd = master;
     p->child_pid = pid;
-    lmux_log(LMUX_LOG_DEBUG, "pty: spawned pane %u, pid=%d, fd=%d",
-             p->id, (int)pid, master);
     return 0;
 }
 
@@ -1065,6 +1069,10 @@ static lmux_pane *pane_new(lmux_workspace *ws, lmux_surface *s,
     return p;
 }
 
+/* Forward declarations */
+static long now_mono_ms(void);
+static void hook_dispatch_simple(lmux_app *app, const char *name, lmux_id target_id);
+
 /* Scrollback limits. The buffer is bounded so a long-running pane cannot grow
  * without limit; read-screen returns at most LMUX_CAPTURE_MAX of its tail. */
 #define LMUX_SCROLLBACK_MAX ((size_t)64 * 1024)
@@ -1089,6 +1097,31 @@ static void pane_scrollback_append(lmux_pane *p, const char *data, size_t n) {
     }
     memcpy(p->sb + p->sb_len, data, n);
     p->sb_len += n;
+    
+    /* Update activity timestamp for monitoring */
+    long now = now_mono_ms();
+    p->last_activity_ms = now;
+    p->last_silence_ms = now;
+    
+    /* Check for activity monitoring: fire if interval has passed since last notification */
+    if (p->monitor_activity_interval > 0 && p->owner && p->owner->app) {
+        long since_last_notify = now - p->last_activity_notify_ms;
+        if (p->last_activity_notify_ms == 0 || since_last_notify >= p->monitor_activity_interval) {
+            hook_dispatch_simple(p->owner->app, "monitor-activity", p->id);
+            p->last_activity_notify_ms = now;
+        }
+    }
+    
+    /* Check for bell character (ASCII 7) */
+    for (size_t i = 0; i < n; i++) {
+        if (data[i] == '\x07') {
+            /* Fire monitor-bell hook */
+            if (p->owner && p->owner->app) {
+                hook_dispatch_simple(p->owner->app, "monitor-bell", p->id);
+            }
+            break;
+        }
+    }
 }
 
 /* ---- OSC 133 shell-integration telemetry (ISS-0037) ---- */
@@ -1309,6 +1342,8 @@ static const char *const HOOK_NAMES[] = {
     "pane-created",
     "pane-closed",
     "pane-focused",
+    "pane-died",
+    "pane-exited",
     /* After-* hooks */
     "after-session-created",
     "after-window-created",
@@ -1395,18 +1430,18 @@ static void hook_fire(lmux_app *app, const char *name, lmux_hook_scope scope,
 static void hook_dispatch(lmux_app *app, const char *name,
                           lmux_hook_scope scope, lmux_id target_id) {
     if (!app || !name) return;
-    
+
     for (size_t i = 0; i < app->hooks.len; i++) {
         lmux_hook_ext *h = app->hooks.items[i];
         if (!h->enabled) continue;
         if (strcmp(h->name, name) != 0) continue;
-        
+
         /* Check scope match */
         if (h->scope != scope) continue;
-        
+
         /* Check target match (0 = global, matches any) */
         if (h->target_id != 0 && h->target_id != target_id) continue;
-        
+
         /* Fire the hook */
         hook_fire(app, name, scope, target_id, h->command);
     }
@@ -1416,7 +1451,6 @@ static void hook_dispatch(lmux_app *app, const char *name,
 static void hook_dispatch_simple(lmux_app *app, const char *name, lmux_id target_id) {
     if (!app || !name) return;
     lmux_hook_scope scope = hook_default_scope(name);
-    lmux_log(LMUX_LOG_DEBUG, "hook_dispatch_simple: name=%s, target_id=%u, scope=%d", name, (unsigned)target_id, scope);
     hook_dispatch(app, name, scope, target_id);
 }
 
@@ -1573,6 +1607,94 @@ const char *lmux_pane_get_monitor_silence_action(const lmux_pane *pane) {
     if (!pane) return "none";
     if (!pane->monitor_silence_action[0]) return "none";
     return pane->monitor_silence_action;
+}
+
+/* Remain-on-exit: keep pane scrollback and allow respawn after child exits */
+bool lmux_pane_set_remain_on_exit(lmux_pane *pane, bool enabled) {
+    if (!pane) return false;
+    pane->remain_on_exit = enabled;
+    return true;
+}
+
+bool lmux_pane_get_remain_on_exit(const lmux_pane *pane) {
+    if (!pane) return false;
+    return pane->remain_on_exit;
+}
+
+/* Respawn pane with its original command */
+bool lmux_pane_respawn(lmux_pane *pane) {
+    if (!pane) return false;
+    if (!pane->command[0]) return false;
+    
+    /* Kill existing pty if any */
+    if (pane->pty_fd >= 0 || pane->child_pid > 0) {
+        pane_kill_pty(pane);
+    }
+    
+    /* Reset pane state */
+    pane->pane_died = false;
+    pane->last_exit_code = 0;
+    
+    /* Spawn new pty with same command */
+    return pane_spawn_pty(pane) == 0;
+}
+
+/* Capture pane scrollback content */
+char *lmux_pane_capture(lmux_pane *pane, long start_line, long end_line) {
+    if (!pane || !pane->sb || pane->sb_len == 0) return NULL;
+    
+    /* Count lines in scrollback */
+    size_t line_count = 0;
+    for (size_t i = 0; i < pane->sb_len; i++) {
+        if (pane->sb[i] == '\n') line_count++;
+    }
+    if (pane->sb_len > 0 && pane->sb[pane->sb_len - 1] != '\n') line_count++;
+    
+    /* Convert negative indices to positive */
+    long start = start_line;
+    long end = end_line;
+    if (start < 0) start = (long)line_count + start + 1;
+    if (end < 0) end = (long)line_count + end + 1;
+    if (start < 0) start = 0;
+    if (end < 0) end = 0;
+    if (start >= (long)line_count) start = line_count - 1;
+    if (end >= (long)line_count) end = line_count - 1;
+    if (start > end) return NULL;
+    
+    /* Find start and end positions */
+    size_t start_pos = 0;
+    size_t end_pos = pane->sb_len;
+    size_t current_line = 0;
+    bool found_start = false;
+    
+    for (size_t i = 0; i < pane->sb_len; i++) {
+        if (!found_start && current_line == (size_t)start) {
+            start_pos = i;
+            found_start = true;
+        }
+        if (pane->sb[i] == '\n') {
+            current_line++;
+            if (current_line > (size_t)end) {
+                end_pos = i + 1;
+                break;
+            }
+        }
+    }
+    
+    /* If end_line is the last line, include all remaining content */
+    if ((size_t)end >= line_count - 1) {
+        end_pos = pane->sb_len;
+    }
+    
+    if (start_pos >= end_pos) return NULL;
+    
+    size_t len = end_pos - start_pos;
+    char *result = malloc(len + 1);
+    if (!result) return NULL;
+    
+    memcpy(result, pane->sb + start_pos, len);
+    result[len] = '\0';
+    return result;
 }
 
 /* Forward declaration for surface_recalc_pane_sizes (used in lmux_pane_split/close) */
@@ -2148,8 +2270,102 @@ void lmux_app_quit(lmux_app *a, int code) {
     a->exit_code  = code;
 }
 
+/* Check if a pane's child process has exited */
+static void pane_drain_pty(lmux_pane *p);
+
+static void check_pane_child_exit(lmux_app *a, lmux_pane *p) {
+    if (!p || p->child_pid <= 0) return;
+    
+    int status;
+    pid_t r = waitpid(p->child_pid, &status, WNOHANG);
+    if (r == p->child_pid) {
+        /* Child has exited */
+        int exit_code = 0;
+        if (WIFEXITED(status)) {
+            exit_code = WEXITSTATUS(status);
+        } else if (WIFSIGNALED(status)) {
+            exit_code = 128 + WTERMSIG(status);
+        }
+        
+        p->last_exit_code = exit_code;
+        p->child_pid = 0;
+        /* Read whatever the child wrote before exiting (a short-lived
+         * command's output — e.g. a bell — is otherwise lost), then release
+         * the pty master instead of leaking it. */
+        if (p->pty_fd >= 0) {
+            pane_drain_pty(p);
+            close(p->pty_fd);
+            p->pty_fd = -1;
+        }
+        p->pane_died = true;
+        
+        /* Fire pane-died hook */
+        hook_dispatch_simple(a, "pane-died", p->id);
+        
+        /* Fire pane-exited hook with exit code */
+        hook_dispatch_simple(a, "pane-exited", p->id);
+        
+        /* If not remain-on-exit, the pane will be cleaned up by the caller */
+        if (!p->remain_on_exit) {
+            /* Mark for cleanup - the workspace close logic handles this */
+        }
+    } else if (r < 0 && errno != ECHILD) {
+        /* Error other than "no child" - log but continue */
+    }
+}
+
+/* Check activity/bell/silence monitoring for a pane */
+static void check_pane_monitoring(lmux_app *a, lmux_pane *p) {
+    if (!p) return;
+    long now = now_mono_ms();
+    
+    /* Activity monitoring is now handled in pane_scrollback_append when data arrives.
+     * Here we just handle silence monitoring. */
+    
+    /* Silence monitoring: fire if no activity for interval */
+    if (p->monitor_silence_interval > 0 && p->last_silence_ms > 0) {
+        if (now - p->last_silence_ms >= p->monitor_silence_interval) {
+            long since_last_notify = now - p->last_silence_notify_ms;
+            if (p->last_silence_notify_ms == 0 || since_last_notify >= p->monitor_silence_interval) {
+                hook_dispatch_simple(a, "monitor-silence", p->id);
+                p->last_silence_notify_ms = now;
+            }
+        }
+    }
+}
+
+/* Drain available data from a pane's pty into scrollback */
+static void pane_drain_pty(lmux_pane *p) {
+    if (!p || p->pty_fd < 0) return;
+
+    char chunk[4096];
+    int flags = fcntl(p->pty_fd, F_GETFL, 0);
+    fcntl(p->pty_fd, F_SETFL, flags | O_NONBLOCK);
+    ssize_t r;
+    while ((r = read(p->pty_fd, chunk, sizeof chunk)) > 0) {
+        pane_scrollback_append(p, chunk, (size_t)r);
+        pane_osc133_feed(p, chunk, (size_t)r);   /* ISS-0037 */
+    }
+    fcntl(p->pty_fd, F_SETFL, flags);
+}
+
 void lmux_app_tick(lmux_app *a) {
     if (!a) return;
+    
+    /* Check for dead child processes across all panes */
+    for (size_t w = 0; w < a->workspaces.len; w++) {
+        lmux_workspace *ws = a->workspaces.items[w];
+        for (size_t s = 0; s < ws->surfaces.len; s++) {
+            lmux_surface *surf = ws->surfaces.items[s];
+            for (size_t p = 0; p < surf->panes.len; p++) {
+                lmux_pane *pane = surf->panes.items[p];
+                check_pane_child_exit(a, pane);
+                pane_drain_pty(pane);  /* Drain pty to capture output for monitoring */
+                check_pane_monitoring(a, pane);
+            }
+        }
+    }
+    
     /* Auto-save if enabled */
     if (a->auto_save_interval > 0 && a->auto_save_path[0]) {
         time_t now = time(NULL);
@@ -2511,9 +2727,9 @@ void lmux_surface_set_title(lmux_surface *s, const char *title) {
 lmux_pane *lmux_pane_split(lmux_workspace *ws, lmux_surface *s,
                            lmux_split_dir dir, const char *command,
                            bool spawn_pty) {
-    (void)dir;
     if (!s) return NULL;  /* can't split without a surface */
     lmux_pane *p = pane_new(ws, s, "terminal");
+    p->split_dir = dir;
     const char *sh_cmd = command ? command : (getenv("SHELL") ? getenv("SHELL") : "/bin/sh");
     snprintf(p->command, sizeof p->command, "%s", sh_cmd);
     vec_push(&s->panes, p);
@@ -2728,17 +2944,12 @@ static void pane_send_keys_one(lmux_pane *p, const char *keys) {
     if (!p || !keys) return;
     if (p->pty_fd < 0) {
         if (pane_spawn_pty(p) != 0) {
-            lmux_log(LMUX_LOG_DEBUG, "send_keys: no pty for pane %u", p->id);
             return;
         }
     }
     ssize_t n = write(p->pty_fd, keys, strlen(keys));
     if (n < 0) {
-        lmux_log(LMUX_LOG_ERROR, "send_keys: write failed for pane %u: %s",
-                 p->id, strerror(errno));
     } else {
-        lmux_log(LMUX_LOG_DEBUG, "send_keys: wrote %zd bytes to pane %u",
-                 n, p->id);
     }
 }
 
@@ -3446,7 +3657,8 @@ void lmux_event_push(lmux_app *app, const char *name, const char *category, cons
     /* ISO-8601 timestamp */
     char ts[32];
     time_t now = time(NULL);
-    struct tm *tm = localtime(&now);
+    struct tm tm_buf;
+    struct tm *tm = localtime_r(&now, &tm_buf);
     strftime(ts, sizeof ts, "%Y-%m-%dT%H:%M:%S", tm);
 
     /* Build event JSON (single allocation for queue) */
@@ -4518,6 +4730,70 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         lmux_pane_focus_dir(ws, dx, dy);
         lmux_event_push(app, "pane.focused", "pane", "\"id\":%u", lmux_pane_focused(ws)->id);
         written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+        goto done;
+    }
+
+    /* --- pane.set_remain_on_exit --- */
+    if (strcmp(cmd, "pane.set_remain_on_exit") == 0) {
+        char ws_id[64] = {0}, p_id[64] = {0}, val_str[16] = {0};
+        json_extract_string(args_json, "workspace_id", ws_id, sizeof ws_id);
+        json_extract_string(args_json, "id", p_id, sizeof p_id);
+        json_extract_string(args_json, "value", val_str, sizeof val_str);
+        lmux_workspace *ws = ws_id[0] ? lmux_workspace_by_id(app, (lmux_id)atol(ws_id))
+                                      : lmux_workspace_focused(app);
+        if (!ws || !p_id[0] || !val_str[0]) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing id and/or value\"}}");
+            goto done;
+        }
+        lmux_id pid = (lmux_id)atol(p_id);
+        bool value = (strcmp(val_str, "true") == 0 || strcmp(val_str, "1") == 0);
+        lmux_pane *p = NULL;
+        for (size_t i = 0; i < ws->surfaces.len && !p; i++) {
+            lmux_surface *s = ws->surfaces.items[i];
+            for (size_t j = 0; j < s->panes.len; j++) {
+                lmux_pane *cp = s->panes.items[j];
+                if (cp->id == pid) { p = cp; break; }
+            }
+        }
+        if (p) {
+            lmux_pane_set_remain_on_exit(p, value);
+            written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+        } else {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"pane not found\"}}");
+        }
+        goto done;
+    }
+
+    /* --- pane.get_remain_on_exit --- */
+    if (strcmp(cmd, "pane.get_remain_on_exit") == 0) {
+        char ws_id[64] = {0}, p_id[64] = {0};
+        json_extract_string(args_json, "workspace_id", ws_id, sizeof ws_id);
+        json_extract_string(args_json, "id", p_id, sizeof p_id);
+        lmux_workspace *ws = ws_id[0] ? lmux_workspace_by_id(app, (lmux_id)atol(ws_id))
+                                      : lmux_workspace_focused(app);
+        if (!ws || !p_id[0]) {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing id\"}}");
+            goto done;
+        }
+        lmux_id pid = (lmux_id)atol(p_id);
+        lmux_pane *p = NULL;
+        for (size_t i = 0; i < ws->surfaces.len && !p; i++) {
+            lmux_surface *s = ws->surfaces.items[i];
+            for (size_t j = 0; j < s->panes.len; j++) {
+                lmux_pane *cp = s->panes.items[j];
+                if (cp->id == pid) { p = cp; break; }
+            }
+        }
+        if (p) {
+            bool value = lmux_pane_get_remain_on_exit(p);
+            written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{\"value\":%s}}", value ? "true" : "false");
+        } else {
+            written = snprintf(result, result_cap,
+                "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"pane not found\"}}");
+        }
         goto done;
     }
 
@@ -5940,9 +6216,11 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             p = lmux_pane_focused(lmux_workspace_focused(app));
         }
         if (p) {
-            pane_kill_pty(p);
+            bool ok = lmux_pane_respawn(p);
+            written = snprintf(result, result_cap, "{\"ok\":%s,\"result\":{}}", ok ? "true" : "false");
+        } else {
+            written = snprintf(result, result_cap, "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"pane not found\"}}");
         }
-        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
         goto done;
     }
 
@@ -6498,7 +6776,16 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                 RESULT_GROW;
                 if (i > 0) written += snprintf(result + written, result_cap - written, ",");
                 written += snprintf(result + written, result_cap - written,
-                    "{\"name\":\"%s\",\"workspace_count\":%zu}", g->name, g->workspace_ids.len);
+                    "{\"name\":\"%s\",\"workspace_count\":%zu,\"workspace_ids\":[",
+                    g->name, g->workspace_ids.len);
+                for (size_t j = 0; j < g->workspace_ids.len; j++) {
+                    RESULT_GROW;
+                    lmux_id *wid = g->workspace_ids.items[j];
+                    written += snprintf(result + written, result_cap - written,
+                        "%s%u", j ? "," : "", (unsigned)*wid);
+                }
+                RESULT_GROW;
+                written += snprintf(result + written, result_cap - written, "]}");
             }
         }
         written += snprintf(result + written, result_cap - written, "]}}");
@@ -6846,6 +7133,25 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         goto done;
     }
 
+    /* --- list-commands --- Table-driven command registry (M1a). */
+    if (strcmp(cmd, "list-commands") == 0 || strcmp(cmd, "list_commands") == 0) {
+        size_t count = 0;
+        const lmux_cmd_entry *entries = lmux_registry_all(&count);
+        written = snprintf(result, result_cap,
+            "{\"ok\":true,\"result\":{\"commands\":[");
+        for (size_t i = 0; i < count; i++) {
+            RESULT_GROW;
+            if (i > 0) written += snprintf(result + written, result_cap - written, ",");
+            char _ne[128], _se[256];
+            written += snprintf(result + written, result_cap - written,
+                "{\"name\":\"%s\",\"summary\":\"%s\"}",
+                json_escape_str(_ne, sizeof _ne, entries[i].name),
+                json_escape_str(_se, sizeof _se, entries[i].summary));
+        }
+        written += snprintf(result + written, result_cap - written, "]}}");
+        goto done;
+    }
+
     /* --- browser commands --- */
     if (strcmp(cmd, "browser.open") == 0) {
         char url[2048] = {0};
@@ -6987,7 +7293,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         }
         char *fbuf = malloc(fsize + 1);
         if (!fbuf) { fclose(fp); goto done; }
-        fread(fbuf, 1, fsize, fp);
+        if (fread(fbuf, 1, fsize, fp) != (size_t)fsize) { free(fbuf); fclose(fp); goto done; }
         fbuf[fsize] = '\0';
         fclose(fp);
 
@@ -7604,7 +7910,8 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             if (strcmp(name, app->templates[i]) == 0) {
                 /* Shift remaining templates */
                 for (int j = i; j < app->template_count - 1; j++) {
-                    snprintf(app->templates[j], sizeof app->templates[0], "%s", app->templates[j + 1]);
+                    memmove(app->templates[j], app->templates[j + 1],
+                            sizeof app->templates[0]);
                 }
                 app->template_count--;
                 found = true;
@@ -10147,7 +10454,6 @@ static bool is_readonly_cmd(const char *cmd) {
         "browser.list",
         "feed.panel.list",
         "profile.status",
-        "control.attach", "refresh-client",
     };
     for (size_t i = 0; i < sizeof ro / sizeof ro[0]; i++) {
         if (strcmp(cmd, ro[i]) == 0) return true;

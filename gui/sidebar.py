@@ -2,7 +2,7 @@
 import gi
 gi.require_version('Gtk', '3.0')
 gi.require_version('GLib', '2.0')
-from gi.repository import Gtk, GObject, GLib
+from gi.repository import Gtk, GObject, GLib, Gdk
 import threading
 import sys
 import os
@@ -286,10 +286,6 @@ class Sidebar(Gtk.Box):
     # ── public API ──────────────────────────────────────────
     def refresh(self):
         """Fetch workspace list from daemon and update sidebar rows."""
-        # L4 fix: skip daemon call when no workspaces exist after first check
-        if self._empty_count > 2:
-            return
-
         def _do_refresh():
             try:
                 resp = self._client.send("workspace.list")

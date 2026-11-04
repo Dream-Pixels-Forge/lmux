@@ -176,6 +176,35 @@ class TestPing(unittest.TestCase):
             self.assertIn(cmd, caps, f"missing capability: {cmd}")
 
 
+class TestListCommands(unittest.TestCase):
+    """The `list-commands` command (M1a command registry)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.c = _ensure_daemon()
+
+    def test_list_commands_returns_table(self):
+        resp = self.c.send("list-commands", {})
+        self.assertTrue(resp.get("ok"), resp)
+        commands = resp.get("result", {}).get("commands", [])
+        self.assertIsInstance(commands, list)
+        self.assertGreater(len(commands), 0)
+
+    def test_list_commands_contains_core_entries(self):
+        commands = self.c.send("list-commands", {}).get("result", {}).get(
+            "commands", [])
+        names = [c.get("name") for c in commands]
+        self.assertIn("workspace.create", names)
+        self.assertIn("list-commands", names)
+
+    def test_list_commands_entries_have_summaries(self):
+        commands = self.c.send("list-commands", {}).get("result", {}).get(
+            "commands", [])
+        for c in commands:
+            self.assertIn("name", c)
+            self.assertIn("summary", c)
+
+
 # ====================================================================
 # Workspace lifecycle
 # ====================================================================
@@ -1606,8 +1635,11 @@ class TestPtyDeferralOnRestore(unittest.TestCase):
             deadline = time.time() + 30
             while time.time() < deadline and client is None:
                 time.sleep(0.25)
+                # LmuxClient() connects lazily: probe with a real ping.
                 try:
-                    client = LmuxClient(sock)
+                    probe = LmuxClient(sock)
+                    if probe.send("ping", {}).get("ok"):
+                        client = probe
                 except Exception:  # noqa: BLE001 - not up yet
                     client = None
             self.assertIsNotNone(client, "daemon did not come up")
@@ -3112,28 +3144,32 @@ class TestSnapshotLoadConfinement(unittest.TestCase):
         self.assertEqual(resp["result"]["path"], saved)
 
 
-class TestDependencyGateTargetsMaster(unittest.TestCase):
-    """#13: trivy.yml was already fail-closed but triggered on `main` while the
-    repo's default branch is `master`, so the gate had never run."""
+class TestDependencyGateTargetsDefaultBranch(unittest.TestCase):
+    """#13: trivy.yml was fail-closed but triggered on a branch that didn't
+    exist, so the gate never ran. The default branch is now `main` (renamed
+    from `master`); every workflow trigger must follow it."""
+
+    DEFAULT_BRANCH = "main"
+    STALE_BRANCH = "master"
 
     @classmethod
     def setUpClass(cls):
         cls.trivy = Path(__file__).parent.parent / ".github" / "workflows" / "trivy.yml"
 
-    def test_no_workflow_targets_a_nonexistent_main_branch(self):
+    def test_no_workflow_targets_the_stale_branch(self):
         workflows = list(self.trivy.parent.glob("*.yml"))
         offenders = [w.name for w in workflows
-                     if "branches: [main]" in w.read_text()]
+                     if f"branches: [{self.STALE_BRANCH}]" in w.read_text()]
         self.assertEqual(offenders, [],
-                         f"these workflows target 'main' but the default "
-                         f"branch is 'master': {offenders}")
+                         f"these workflows target '{self.STALE_BRANCH}' but the "
+                         f"default branch is '{self.DEFAULT_BRANCH}': {offenders}")
 
     def test_dependency_gate_is_fail_closed(self):
         text = self.trivy.read_text()
         self.assertIn("exit-code: 1", text,
                       "the gate must stay fail-closed")
-        self.assertIn("branches: [master]", text,
-                      "the gate must trigger on master")
+        self.assertIn(f"branches: [{self.DEFAULT_BRANCH}]", text,
+                      f"the gate must trigger on {self.DEFAULT_BRANCH}")
 
 
 # ====================================================================
@@ -3164,6 +3200,22 @@ class TestConfigPersistence(unittest.TestCase):
                             "config.json should be written after a group create")
             self.assertIn(name, cfg_file.read_text(),
                           "created group should be present in config.json")
+        finally:
+            _shutdown_isolated(daemon, home)
+
+    def test_group_list_reports_member_workspace_ids(self):
+        """The GUI needs each group's member IDs, not just a count."""
+        client, daemon, home = _isolated_client()
+        try:
+            name = _unique("members")
+            ws = client.send("workspace.create", {"title": "g"})["result"]["id"]
+            client.send("workspace.group.create", {"name": name})
+            client.send("workspace.group.add",
+                        {"name": name, "workspace_id": str(ws)})
+            groups = client.send("workspace.group.list")["result"]["groups"]
+            g = next(g for g in groups if g["name"] == name)
+            self.assertEqual(g["workspace_count"], 1)
+            self.assertEqual(g["workspace_ids"], [ws])
         finally:
             _shutdown_isolated(daemon, home)
 
@@ -6060,6 +6112,23 @@ class TestPackagingEntryPoints(unittest.TestCase):
             errors, [],
             "flatpak AppStream metainfo fails validation:\n"
             + "\n".join(errors))
+    def test_flatpak_manifest_compiles_every_core_source(self):
+        """The flatpak manifest lists each core .c file by hand. When
+        src/core/registry.c was added, the manifest wasn't updated and the
+        flatpak CI job failed to link (undefined lmux_registry_all)."""
+        root = Path(__file__).parent.parent
+        manifest = (root / "packaging" / "io.github.lmux.lmux.yml").read_text()
+        missing = []
+        for src in sorted((root / "src" / "core").glob("*.c")):
+            obj = src.stem + ".o"
+            if f"src/core/{src.name}" not in manifest:
+                missing.append(f"{src.name} (not compiled)")
+            elif not re.search(rf"^\s*- ar rcs .*\b{re.escape(obj)}\b",
+                               manifest, re.MULTILINE):
+                missing.append(f"{obj} (not archived)")
+        self.assertEqual(missing, [],
+                         f"flatpak manifest is missing core sources: {missing}")
+
     def test_make_flatpak_target_references_existing_manifest(self):
         """`make flatpak` must point at a manifest that exists.
 
@@ -6514,8 +6583,12 @@ class TestHarnessPtydTeardown(unittest.TestCase):
                 deadline = time.time() + 60
                 while time.time() < deadline and client is None:
                     time.sleep(0.25)
+                    # LmuxClient() connects lazily, so constructing it proves
+                    # nothing: probe with a real ping until the daemon binds.
                     try:
-                        client = LmuxClient(sock)
+                        probe = LmuxClient(sock, timeout=5.0)
+                        if probe.send("ping", {}).get("ok"):
+                            client = probe
                     except Exception:  # noqa: BLE001 - not up yet
                         client = None
                 if client is not None:

@@ -423,7 +423,7 @@ class LmuxWindow(Gtk.Window):
         self._outer_hpaned.pack1(self._paned, True, False)
 
         # Sidebar
-        self._sidebar = Sidebar(client, parent_window=self)
+        self._sidebar = Sidebar(self._client, parent_window=self)
         self._sidebar.connect("workspace-selected", self._on_workspace_selected)
         self._sidebar.connect(
             "workspace-create-requested", self._on_workspace_create
@@ -431,7 +431,7 @@ class LmuxWindow(Gtk.Window):
         self._paned.pack1(self._sidebar, False, False)
 
         # Workspace groups panel (below sidebar)
-        self._workspace_groups_panel = WorkspaceGroupsPanel(client, parent_window=self)
+        self._workspace_groups_panel = WorkspaceGroupsPanel(self._client, parent_window=self)
         self._sidebar.pack_end(self._workspace_groups_panel, True, True, 0)
 
         # File explorer panel (below workspace groups)
@@ -444,7 +444,7 @@ class LmuxWindow(Gtk.Window):
         self._paned.pack2(self._stack, True, False)
 
         # Browser panel (hidden by default)
-        self._browser = BrowserPanel(client=client, parent_window=self)
+        self._browser = BrowserPanel(client=self._client, parent_window=self)
         self._browser_visible = False
         self._outer_hpaned.pack2(self._browser, False, False)
         self._browser.set_visible(False)
@@ -749,6 +749,7 @@ class LmuxWindow(Gtk.Window):
         accel = Gtk.AccelGroup()
         self.add_accel_group(accel)
         self._accel = accel
+        self._accel_group = accel  # used by font-size / session-reopen setup
 
         shortcuts_mgr = get_shortcuts_manager()
 
@@ -771,13 +772,15 @@ class LmuxWindow(Gtk.Window):
         # Connect accelerators from shortcuts manager
         for action, shortcut in shortcuts_mgr.get_all_shortcuts().items():
             for keyval, modifiers in shortcut.keys:
-                accel.connect(keyval, modifiers, Gtk.AccelFlags.VISIBLE, 
-                            lambda a, k, m, act=action: self._accel_handler(act))
+                # Shortcuts are stored as plain ints (JSON-serialisable);
+                # PyGObject requires a real Gdk.ModifierType here.
+                accel.connect(keyval, Gdk.ModifierType(int(modifiers)),
+                              Gtk.AccelFlags.VISIBLE,
+                              lambda a, k, m, act=action: self._accel_handler(act))
 
     def _accel_handler(self, action: str):
-        """Handle accelerator action."""
-        shortcuts_mgr = get_shortcuts_manager()
-        shortcuts_mgr.execute_action(action)
+        """Dispatch an accelerator to its registered shortcut action."""
+        get_shortcuts_manager().execute_action(action)
         return True
 
     # ── accelerator callbacks ───────────────────────────────
@@ -789,12 +792,6 @@ class LmuxWindow(Gtk.Window):
             return page
         return None
 
-    def _accel_handler(self, action: str):
-        """Handle accelerator action."""
-        shortcuts_mgr = get_shortcuts_manager()
-        shortcuts_mgr.execute_action(action)
-        return True
-
     def _on_command_selected(self, palette, command):
         """Handle command palette selection — execute via daemon."""
         def _exec():
@@ -804,7 +801,7 @@ class LmuxWindow(Gtk.Window):
                 if command in ("workspace.close", "workspace.rename", "workspace.env"):
                     view = self._active_view()
                     if view:
-                        args["id"] = view._ws_id
+                        args["id"] = view.ws_id
                 elif command in ("surface.close", "surface.focus", "surface.rename"):
                     view = self._active_view()
                     if view:
@@ -976,6 +973,15 @@ class LmuxWindow(Gtk.Window):
         self._outer_vbox.reorder_child(self._reconnect_bar, 1)  # after menu bar
         self.show_all()
 
+    def _on_daemon_autostart(self, ok):
+        """Result of the startup ensure_daemon() call (runs on the GTK thread)."""
+        if ok:
+            self._on_daemon_connected()
+            self._sidebar.refresh()
+        else:
+            self._on_daemon_disconnected()
+        return GLib.SOURCE_REMOVE
+
     def _reconnect_daemon(self):
         """Force reconnection to the daemon."""
         if self._event_stop is not None:
@@ -1036,6 +1042,14 @@ def main():
         Gtk.main_quit()
 
     win.connect("destroy", _on_destroy)
+
+    # Start the daemon if it isn't running, off the GTK thread so the window
+    # shows immediately (LMUX_NO_AUTOSTART=1 opts out).
+    def _autostart():
+        ok = win._client.ensure_daemon()
+        GLib.idle_add(win._on_daemon_autostart, ok)
+    threading.Thread(target=_autostart, daemon=True).start()
+
     Gtk.main()
 
 
