@@ -2271,6 +2271,8 @@ void lmux_app_quit(lmux_app *a, int code) {
 }
 
 /* Check if a pane's child process has exited */
+static void pane_drain_pty(lmux_pane *p);
+
 static void check_pane_child_exit(lmux_app *a, lmux_pane *p) {
     if (!p || p->child_pid <= 0) return;
     
@@ -2287,7 +2289,14 @@ static void check_pane_child_exit(lmux_app *a, lmux_pane *p) {
         
         p->last_exit_code = exit_code;
         p->child_pid = 0;
-        p->pty_fd = -1;
+        /* Read whatever the child wrote before exiting (a short-lived
+         * command's output — e.g. a bell — is otherwise lost), then release
+         * the pty master instead of leaking it. */
+        if (p->pty_fd >= 0) {
+            pane_drain_pty(p);
+            close(p->pty_fd);
+            p->pty_fd = -1;
+        }
         p->pane_died = true;
         
         /* Fire pane-died hook */
@@ -2328,17 +2337,12 @@ static void check_pane_monitoring(lmux_app *a, lmux_pane *p) {
 /* Drain available data from a pane's pty into scrollback */
 static void pane_drain_pty(lmux_pane *p) {
     if (!p || p->pty_fd < 0) return;
-    
-    fprintf(stderr, "[DEBUG] pane_drain_pty: pane %u, pty_fd=%d\n", p->id, p->pty_fd);
-    fflush(stderr);
-    
+
     char chunk[4096];
     int flags = fcntl(p->pty_fd, F_GETFL, 0);
     fcntl(p->pty_fd, F_SETFL, flags | O_NONBLOCK);
     ssize_t r;
     while ((r = read(p->pty_fd, chunk, sizeof chunk)) > 0) {
-        fprintf(stderr, "[DEBUG] pane_drain_pty: pane %u read %zd bytes\n", p->id, r);
-        fflush(stderr);
         pane_scrollback_append(p, chunk, (size_t)r);
         pane_osc133_feed(p, chunk, (size_t)r);   /* ISS-0037 */
     }
@@ -2346,8 +2350,6 @@ static void pane_drain_pty(lmux_pane *p) {
 }
 
 void lmux_app_tick(lmux_app *a) {
-    fprintf(stderr, "[DEBUG] lmux_app_tick: ENTRY\n");
-    fflush(stderr);
     if (!a) return;
     
     /* Check for dead child processes across all panes */
