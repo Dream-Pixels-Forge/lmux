@@ -973,6 +973,15 @@ class LmuxWindow(Gtk.Window):
         self._outer_vbox.reorder_child(self._reconnect_bar, 1)  # after menu bar
         self.show_all()
 
+    def _on_daemon_autostart(self, ok):
+        """Result of the startup ensure_daemon() call (runs on the GTK thread)."""
+        if ok:
+            self._on_daemon_connected()
+            self._sidebar.refresh()
+        else:
+            self._on_daemon_disconnected()
+        return GLib.SOURCE_REMOVE
+
     def _reconnect_daemon(self):
         """Force reconnection to the daemon."""
         if self._event_stop is not None:
@@ -1033,6 +1042,14 @@ def main():
         Gtk.main_quit()
 
     win.connect("destroy", _on_destroy)
+
+    # Start the daemon if it isn't running, off the GTK thread so the window
+    # shows immediately (LMUX_NO_AUTOSTART=1 opts out).
+    def _autostart():
+        ok = win._client.ensure_daemon()
+        GLib.idle_add(win._on_daemon_autostart, ok)
+    threading.Thread(target=_autostart, daemon=True).start()
+
     Gtk.main()
 
 

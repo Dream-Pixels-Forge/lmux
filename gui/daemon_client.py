@@ -1,8 +1,10 @@
 """lmux daemon client — Unix domain socket JSON-RPC."""
 import json
 import os
+import shutil
 import socket
 import stat
+import subprocess
 import threading
 import time
 
@@ -25,6 +27,28 @@ def _get_default_socket_path():
 
 
 DEFAULT_SOCKET_PATH = _get_default_socket_path()
+
+
+def find_lmux_binary():
+    """Locate the lmux CLI: $LMUX_BIN, then the source tree's build/lmux,
+    then PATH (deb / AppImage installs put it in usr/bin)."""
+    env_bin = os.environ.get("LMUX_BIN")
+    if env_bin:
+        return env_bin if os.access(env_bin, os.X_OK) else None
+    repo_bin = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "build", "lmux",
+    )
+    if os.access(repo_bin, os.X_OK):
+        return repo_bin
+    return shutil.which("lmux")
+
+
+def _daemon_log_path():
+    state = os.environ.get("XDG_STATE_HOME") or os.path.expanduser(
+        "~/.local/state"
+    )
+    return os.path.join(state, "lmux", "daemon.log")
 MAX_RESPONSE_SIZE = 16 * 1024 * 1024  # 16 MiB cap to prevent unbounded reads
 
 # N11 (ISS-0027): reconnect backoff for the events stream. A fixed
@@ -64,6 +88,56 @@ class DaemonClient:
                 )
         except FileNotFoundError:
             raise
+
+    def is_daemon_alive(self):
+        """True if something is accepting connections on our socket."""
+        try:
+            self._verify_socket()
+            s = socket.socket(socket.AF_UNIX)
+            s.settimeout(1)
+            try:
+                s.connect(self.path)
+            finally:
+                s.close()
+            return True
+        except (OSError, ValueError):
+            return False
+
+    def ensure_daemon(self, timeout=3.0):
+        """Start `lmux daemon` on our socket if none is running.
+
+        Returns True once the daemon accepts connections. Set
+        LMUX_NO_AUTOSTART=1 to disable. Daemon output goes to
+        $XDG_STATE_HOME/lmux/daemon.log. The daemon runs in its own session,
+        so it outlives the GUI (like `lmux daemon --detach`).
+        """
+        if self.is_daemon_alive():
+            return True
+        if os.environ.get("LMUX_NO_AUTOSTART") == "1":
+            return False
+        binary = find_lmux_binary()
+        if not binary:
+            return False
+        log_path = _daemon_log_path()
+        try:
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+            with open(log_path, "ab") as log:
+                subprocess.Popen(
+                    [binary, "--socket", self.path, "daemon"],
+                    stdin=subprocess.DEVNULL,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                    close_fds=True,
+                )
+        except OSError:
+            return False
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.is_daemon_alive():
+                return True
+            time.sleep(0.05)
+        return False
 
     def _connect(self):
         """Establish or re-establish persistent connection (H2 fix)."""
