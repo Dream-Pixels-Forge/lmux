@@ -6643,6 +6643,338 @@ class TestVersionParity(unittest.TestCase):
                 f"  {name}: {ver}" for name, ver in sites.items()))
 
 
+# ====================================================================
+# Daemon-owned terminals: the GUI attaches to daemon panes (fd passing),
+# children get LMUX_* env, CLI targets its own pane, events fan out.
+# ====================================================================
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_LMUX_BIN = _REPO_ROOT / "build" / "lmux"
+
+
+def _pane_attach(sock_path, pane_id, ws_id=None):
+    """Send pane.attach and return (response, fd-or-None)."""
+    args = {"pane_id": str(pane_id)}
+    if ws_id is not None:
+        args["workspace_id"] = str(ws_id)
+    s = socket.socket(socket.AF_UNIX)
+    s.settimeout(10)
+    s.connect(sock_path)
+    try:
+        s.sendall((json.dumps({"cmd": "pane.attach", "args": args}) + "\n").encode())
+        data, fds, _flags, _addr = socket.recv_fds(s, 65536, 1)
+        chunks = [data]
+        while True:
+            try:
+                more = s.recv(65536)
+            except socket.timeout:
+                break
+            if not more:
+                break
+            chunks.append(more)
+    finally:
+        s.close()
+    resp = json.loads(b"".join(chunks).decode().strip())
+    return resp, (fds[0] if fds else None)
+
+
+def _read_fd_until(fd, needle, timeout=5.0):
+    """Read from fd until needle (bytes) appears; return everything read."""
+    import select
+    buf = b""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        r, _, _ = select.select([fd], [], [], 0.1)
+        if r:
+            try:
+                chunk = os.read(fd, 65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf += chunk
+            if needle in buf:
+                return buf
+    return buf
+
+
+def _screen_until(c, args, needle, timeout=5.0):
+    text = ""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        resp = c.send("read-screen", args)
+        text = resp.get("result", {}).get("text", "") if resp.get("ok") else ""
+        if needle in text:
+            return text
+        time.sleep(0.1)
+    return text
+
+
+class _EventTap:
+    """Background events subscriber collecting decoded event dicts."""
+
+    def __init__(self, sock_path):
+        self.events = []
+        self._lock = threading.Lock()
+        self._sock = socket.socket(socket.AF_UNIX)
+        self._sock.settimeout(0.2)
+        self._sock.connect(sock_path)
+        self._sock.sendall(b'{"cmd":"events","args":{}}\n')
+        self._stop = threading.Event()
+        self._ready = threading.Event()
+        self._t = threading.Thread(target=self._run, daemon=True)
+        self._t.start()
+        self._ready.wait(5)
+
+    def _run(self):
+        buf = b""
+        while not self._stop.is_set():
+            try:
+                data = self._sock.recv(65536)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            if not data:
+                break
+            buf += data
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                try:
+                    evt = json.loads(line)
+                except ValueError:
+                    continue
+                if evt.get("type") == "ack":
+                    self._ready.set()
+                with self._lock:
+                    self.events.append(evt)
+
+    def wait_for(self, name, pred=lambda d: True, timeout=5.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with self._lock:
+                for e in self.events:
+                    if e.get("name") == name and pred(e.get("data") or {}):
+                        return e.get("data") or {}
+            time.sleep(0.05)
+        return None
+
+    def close(self):
+        self._stop.set()
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+
+
+class TestDaemonOwnedTerminals(unittest.TestCase):
+    """The daemon is the single owner of pane ptys."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.c = _ensure_daemon()
+        cls.sock = _daemon.socket_path
+
+    def _ws(self):
+        ws = self.c.workspace_create(_unique("own-ws"))
+        return int(ws["id"])
+
+    def _split(self, ws_id, direction="v", **extra):
+        # /bin/sh, not $SHELL: an empty test HOME makes zsh run its
+        # new-user wizard, which swallows the first keystroke.
+        extra.setdefault("command", "/bin/sh")
+        args = {"workspace_id": str(ws_id), "direction": direction}
+        args.update({k: str(v) for k, v in extra.items()})
+        return self.c.assert_ok("surface.split", args)
+
+    def _first_pane(self, ws_id):
+        panes = self.c.assert_ok("pane.list", {"workspace_id": str(ws_id)})["panes"]
+        return panes[0]
+
+    def test_split_result_reports_surface_and_workspace(self):
+        ws = self._ws()
+        res = self._split(ws)
+        self.assertEqual(int(res["workspace_id"]), ws)
+        sid = self._first_pane(ws)["surface_id"]
+        self.assertEqual(int(res["surface_id"]), sid)
+
+    def test_surface_create_reports_initial_pane(self):
+        ws = self._ws()
+        res = self.c.assert_ok("surface.create", {"workspace_id": str(ws)})
+        self.assertIn("pane_id", res)
+        panes = self.c.assert_ok("pane.list", {"workspace_id": str(ws)})["panes"]
+        match = [p for p in panes if p["id"] == int(res["pane_id"])]
+        self.assertEqual(len(match), 1)
+        self.assertEqual(match[0]["surface_id"], int(res["id"]))
+
+    def test_pane_child_gets_lmux_env(self):
+        ws = self._ws()
+        out = Path(tempfile.mkdtemp(prefix="lmux-env-")) / "env.txt"
+        res = self._split(ws, command=f"env > {out}; sleep 30")
+        deadline = time.time() + 5
+        while time.time() < deadline and not (out.exists() and out.stat().st_size):
+            time.sleep(0.05)
+        env = dict(l.split("=", 1) for l in out.read_text().splitlines() if "=" in l)
+        self.assertEqual(env.get("LMUX_PANE_ID"), str(res["id"]))
+        self.assertEqual(env.get("LMUX_SURFACE_ID"), str(res["surface_id"]))
+        self.assertEqual(env.get("LMUX_WORKSPACE_ID"), str(ws))
+        self.assertEqual(env.get("LMUX_SOCKET_PATH"), self.sock)
+
+    def test_attach_returns_pty_fd_shared_with_read_screen(self):
+        ws = self._ws()
+        pid = self._split(ws)["id"]
+        resp, fd = _pane_attach(self.sock, pid)
+        self.assertTrue(resp.get("ok"), resp)
+        self.assertIsNotNone(fd, "pane.attach must pass an fd via SCM_RIGHTS")
+        try:
+            self.assertTrue(os.isatty(fd))
+            os.write(fd, b"echo ATTACH_$((40+2))\n")
+            self.assertIn(b"ATTACH_42", _read_fd_until(fd, b"ATTACH_42"))
+            # The daemon still sees the output the view received.
+            self.assertIn("ATTACH_42",
+                          _screen_until(self.c, {"pane_id": str(pid)}, "ATTACH_42"))
+        finally:
+            os.close(fd)
+
+    def test_send_text_reaches_attached_view(self):
+        ws = self._ws()
+        pid = self._split(ws)["id"]
+        _resp, fd = _pane_attach(self.sock, pid)
+        try:
+            self.c.assert_ok("surface.send_text",
+                             {"pane_id": str(pid), "text": "echo VIEW_$((6*7))\n"})
+            self.assertIn(b"VIEW_42", _read_fd_until(fd, b"VIEW_42"))
+        finally:
+            os.close(fd)
+
+    def test_attach_replays_earlier_output(self):
+        ws = self._ws()
+        pid = self._split(ws, command="printf 'PRE_%s\\n' ATTACH_MARK; sleep 30")["id"]
+        _screen_until(self.c, {"pane_id": str(pid)}, "PRE_ATTACH_MARK")
+        _resp, fd = _pane_attach(self.sock, pid)
+        try:
+            self.assertIn(b"PRE_ATTACH_MARK", _read_fd_until(fd, b"PRE_ATTACH_MARK"))
+        finally:
+            os.close(fd)
+
+    def test_attach_view_resize_reaches_child(self):
+        import fcntl
+        import struct
+        import termios
+        ws = self._ws()
+        pid = self._split(ws)["id"]
+        _resp, fd = _pane_attach(self.sock, pid)
+        try:
+            fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 33, 101, 0, 0))
+            time.sleep(0.3)
+            os.write(fd, b"stty size\n")
+            self.assertIn(b"33 101", _read_fd_until(fd, b"33 101"))
+        finally:
+            os.close(fd)
+
+    def test_attach_unknown_pane_fails_without_fd(self):
+        resp, fd = _pane_attach(self.sock, 987654)
+        self.assertFalse(resp.get("ok"))
+        self.assertIsNone(fd)
+
+    def test_send_text_and_read_screen_honour_pane_id(self):
+        ws = self._ws()
+        first = self._first_pane(ws)["id"]
+        second = self._split(ws)["id"]
+        self.c.assert_ok("pane.focus", {"workspace_id": str(ws), "id": str(first)})
+        self.c.assert_ok("surface.send_text",
+                         {"pane_id": str(second), "text": "echo TARGET_$((1+1))B\n"})
+        self.assertIn("TARGET_2B",
+                      _screen_until(self.c, {"pane_id": str(second)}, "TARGET_2B"))
+        self.assertNotIn("TARGET_2B",
+                         _screen_until(self.c, {"pane_id": str(first)}, "TARGET_2B", 0.5))
+
+    def test_events_fan_out_to_every_subscriber(self):
+        a, b = _EventTap(self.sock), _EventTap(self.sock)
+        try:
+            ws = self._ws()
+            surf = self.c.assert_ok("surface.create", {"workspace_id": str(ws)})
+            sid = int(surf["id"])
+            for tap in (a, b):
+                d = tap.wait_for("surface.created", lambda d: d.get("id") == sid)
+                self.assertIsNotNone(d, "each subscriber must see surface.created")
+                self.assertEqual(d.get("workspace_id"), ws)
+                self.assertEqual(d.get("pane_id"), int(surf["pane_id"]))
+            split = self._split(ws, "h", pane_id=surf["pane_id"])
+            for tap in (a, b):
+                d = tap.wait_for("pane.created", lambda d: d.get("id") == split["id"])
+                self.assertIsNotNone(d, "each subscriber must see pane.created")
+                self.assertEqual(d.get("surface_id"), sid)
+                self.assertEqual(d.get("workspace_id"), ws)
+                self.assertEqual(d.get("target_pane_id"), int(surf["pane_id"]))
+                self.assertEqual(d.get("direction"), "h")
+        finally:
+            a.close()
+            b.close()
+
+    def test_pane_close_removes_pane_and_emits_event(self):
+        tap = _EventTap(self.sock)
+        try:
+            ws = self._ws()
+            pid = self._split(ws)["id"]
+            self.c.assert_ok("pane.close", {"id": str(pid)})
+            ids = [p["id"] for p in
+                   self.c.assert_ok("pane.list", {"workspace_id": str(ws)})["panes"]]
+            self.assertNotIn(pid, ids)
+            self.assertIsNotNone(tap.wait_for("pane.closed", lambda d: d.get("id") == pid))
+        finally:
+            tap.close()
+
+    def _cli(self, *args, env_extra):
+        env = dict(os.environ)
+        env["LMUX_SOCKET_PATH"] = self.sock
+        env.update(env_extra)
+        return subprocess.run([str(_LMUX_BIN), *args], env=env, capture_output=True,
+                              text=True, timeout=15)
+
+    def test_cli_send_keys_and_read_screen_use_pane_env(self):
+        ws = self._ws()
+        first = self._first_pane(ws)["id"]
+        mine = self._split(ws)["id"]
+        self.c.assert_ok("pane.focus", {"workspace_id": str(ws), "id": str(first)})
+        # A different workspace has focus, as it would for a background pane.
+        self._ws()
+        env = {"LMUX_PANE_ID": str(mine), "LMUX_WORKSPACE_ID": str(ws)}
+        r = self._cli("send-keys", "echo CLI_$((2+3))_OK", "Enter", env_extra=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        deadline = time.time() + 5
+        out = ""
+        while time.time() < deadline:
+            out = self._cli("read-screen", env_extra=env).stdout
+            if "CLI_5_OK" in out:
+                break
+            time.sleep(0.1)
+        self.assertIn("CLI_5_OK", out)
+
+    def test_cli_split_targets_pane_env(self):
+        tap = _EventTap(self.sock)
+        try:
+            ws = self._ws()
+            mine = self._first_pane(ws)["id"]
+            self._ws()  # move focus elsewhere
+            env = {"LMUX_PANE_ID": str(mine), "LMUX_WORKSPACE_ID": str(ws)}
+            r = self._cli("surface.split", "v", env_extra=env)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            d = tap.wait_for("pane.created", lambda d: d.get("target_pane_id") == mine)
+            self.assertIsNotNone(d)
+            self.assertEqual(d.get("workspace_id"), ws)
+            self.assertEqual(d.get("direction"), "v")
+        finally:
+            tap.close()
+
+    def test_pane_list_reports_split_direction(self):
+        ws = self._ws()
+        pid = self._split(ws, "v")["id"]
+        panes = self.c.assert_ok("pane.list", {"workspace_id": str(ws)})["panes"]
+        p = next(p for p in panes if p["id"] == pid)
+        self.assertEqual(p.get("split_dir"), "v")
+
+
 if __name__ == "__main__":
     # Clean up leftover test sockets — only the dead ones (#38): never
     # unlink a socket that still answers, it may belong to a live runner.

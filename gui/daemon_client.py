@@ -337,6 +337,49 @@ class DaemonClient:
         t = threading.Thread(target=_run, daemon=True)
         t.start()
         return stop
+    # ── pane attach (daemon-owned terminals) ──────────────
+
+    def attach_pane(self, pane_id, timeout=5.0):
+        """Attach to a daemon pane's terminal.
+
+        Sends ``pane.attach`` on a dedicated connection; the daemon answers
+        with JSON and passes a pty master fd as SCM_RIGHTS ancillary data.
+        Returns ``(result_dict, fd)``; ``fd`` is None on failure. The caller
+        owns the fd (hand it to ``Vte.Pty.new_foreign_sync``).
+        """
+        payload = json.dumps(
+            {"cmd": "pane.attach", "args": {"pane_id": str(pane_id)}}
+        ) + "\n"
+        fds = []
+        try:
+            self._verify_socket()
+            s = socket.socket(socket.AF_UNIX)
+            s.settimeout(timeout)
+            try:
+                s.connect(self.path)
+                s.sendall(payload.encode())
+                data, fds, _flags, _addr = socket.recv_fds(s, 65536, 1)
+                chunks = [data]
+                while data and not chunks[-1].endswith(b"\n"):
+                    data = s.recv(65536)
+                    if not data:
+                        break
+                    chunks.append(data)
+            finally:
+                s.close()
+            resp = json.loads(b"".join(chunks).decode().strip() or "{}")
+        except (OSError, ValueError) as e:
+            for fd in fds:
+                os.close(fd)
+            return {"ok": False, "error": str(e)}, None
+        if not resp.get("ok") or not fds:
+            for fd in fds:
+                os.close(fd)
+            return resp, None
+        for extra in fds[1:]:
+            os.close(extra)
+        return resp.get("result", {}), fds[0]
+
     # ── hook & focus tracking ─────────────────────────────
 
     def _emit_hook(self, event, **kwargs):

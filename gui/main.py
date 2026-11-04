@@ -187,11 +187,16 @@ class WorkspaceView(Gtk.Box):
     Used as a page in the main stack.
     """
 
-    def __init__(self, ws_id, title="Workspace", client=None):
+    def __init__(self, ws_id, title="Workspace", client=None, daemon_backed=False):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self.ws_id = ws_id
         self._title = title
         self._client = client
+        # When the daemon is reachable it owns every terminal: surfaces and
+        # panes are created through it, keyed by its ids, and each VTE
+        # attaches to the daemon pane's pty. Otherwise (offline) fall back to
+        # local shells with local counters.
+        self._daemon = client if (daemon_backed and client is not None) else None
         self._surface_counter = 0
 
         # Header bar with workspace name
@@ -247,23 +252,149 @@ class WorkspaceView(Gtk.Box):
 
     # ── surface / pane lifecycle ────────────────────────────
 
+    @property
+    def daemon_backed(self):
+        return self._daemon is not None
+
     def _initial_surface(self):
         """Create the first surface for this workspace."""
+        if self._daemon is not None:
+            if self.sync_from_daemon():
+                return None, None
+            # Daemon vanished between the probe and now: run offline.
+            self._daemon = None
         self._surface_counter += 1
         container, term = self._notebook.add_surface(
             surface_id=self._surface_counter, title="Shell"
         )
         return container, term
 
+    # ── daemon-owned layout ─────────────────────────────────
+
+    def sync_from_daemon(self):
+        """Mirror the daemon's surfaces and panes for this workspace.
+
+        The split tree is rebuilt from each pane's ``split_from`` /
+        ``split_dir``. Returns False if the daemon could not be queried.
+        """
+        args = {"workspace_id": str(self.ws_id)}
+        surf = self._daemon.send("surface.list", args)
+        panes = self._daemon.send("pane.list", args)
+        if not surf.get("ok") or not panes.get("ok"):
+            return False
+        surfaces = surf.get("result", {}).get("surfaces", [])
+        by_surface = {}
+        for p in panes.get("result", {}).get("panes", []):
+            by_surface.setdefault(p.get("surface_id"), []).append(p)
+        focused_sid = None
+        for sd in surfaces:
+            sid = sd.get("id")
+            plist = sorted(by_surface.get(sid, []), key=lambda p: p["id"])
+            if not plist:
+                continue
+            first = next((p for p in plist if not p.get("split_from")), plist[0])
+            container = self.add_daemon_surface(sid, first["id"], sd.get("title"))
+            pending = [p for p in plist if p is not first]
+            # Parents before children; anything orphaned tiles on the end.
+            progress = True
+            while pending and progress:
+                progress = False
+                for p in list(pending):
+                    parent = p.get("split_from")
+                    if container.has_pane(parent) or not parent:
+                        target = parent if container.has_pane(parent) else container.pane_ids()[-1]
+                        container.split_pane(target, orientation=p.get("split_dir") or "h",
+                                             new_id=p["id"])
+                        pending.remove(p)
+                        progress = True
+            for p in pending:
+                container.split_pane(container.pane_ids()[-1], new_id=p["id"])
+            for p in plist:
+                if p.get("focused"):
+                    container.focus_pane(p["id"])
+            if sd.get("focused"):
+                focused_sid = sid
+        if not self._notebook.surface_count():
+            return self.create_surface()[0] is not None
+        if focused_sid is not None:
+            self._show_surface(focused_sid)
+        return True
+
+    def add_daemon_surface(self, surface_id, pane_id, title=None):
+        """Add a tab for daemon surface ``surface_id`` (idempotent)."""
+        existing = self._notebook._pages.get(surface_id)
+        if existing is not None:
+            return existing
+        container, _term = self._notebook.add_surface(
+            surface_id=surface_id, title=title or "Shell", pane_id=pane_id,
+            daemon=self._daemon, workspace_id=self.ws_id,
+        )
+        return container
+
+    def _show_surface(self, surface_id):
+        container = self._notebook._pages.get(surface_id)
+        if container is not None:
+            n = self._notebook.page_num(container)
+            if n >= 0:
+                self._notebook.set_current_page(n)
+
+    def handle_daemon_event(self, name, data):
+        """Apply a daemon ``surface.*`` / ``pane.*`` event to this view.
+
+        Every handler is idempotent: the GUI's own requests also echo back
+        as events, and the CLI (``lmux surface.split v`` in a pane) produces
+        the same events with no GUI involvement.
+        """
+        if self._daemon is None:
+            return
+        sid = data.get("surface_id")
+        pid = data.get("id")
+        if name == "surface.created":
+            if data.get("pane_id"):
+                self.add_daemon_surface(pid, data["pane_id"])
+                self._show_surface(pid)
+        elif name == "surface.closed":
+            if pid in self._notebook._pages:
+                self._notebook.remove_surface(pid)
+        elif name == "pane.created":
+            container = self._notebook._pages.get(sid)
+            if container is None or container.has_pane(pid):
+                return
+            target = data.get("target_pane_id")
+            if not container.has_pane(target):
+                target = container._focused or container.pane_ids()[-1]
+            term = container.split_pane(target, orientation=data.get("direction") or "h",
+                                        new_id=pid)
+            if term is not None and container is self._notebook.current_container():
+                term.grab_focus_to_vte()
+        elif name == "pane.closed":
+            container = self._notebook._pages.get(sid)
+            if container is not None and container.has_pane(pid):
+                if container.pane_count() > 1:
+                    container.remove_pane(pid)
+                else:
+                    self._notebook.remove_surface(sid)
+        elif name == "pane.exited":
+            # The shell exited: close the pane (tmux/cmux behaviour) unless
+            # the pane is kept for respawn. The daemon's pane.closed /
+            # surface.closed events then update the layout.
+            if not data.get("remain_on_exit"):
+                threading.Thread(
+                    target=lambda: self._daemon.send("pane.close", {"id": str(pid)}),
+                    daemon=True,
+                ).start()
+
     def create_surface(self):
         """Add a new surface (tab) to this workspace."""
+        if self._daemon is not None:
+            resp = self._daemon.send("surface.create", {"workspace_id": str(self.ws_id)})
+            res = resp.get("result", {}) if resp.get("ok") else {}
+            if not res.get("id"):
+                return None, None
+            container = self.add_daemon_surface(res["id"], res.get("pane_id"), res.get("title"))
+            self._show_surface(res["id"])
+            return container, container.focused_terminal()
         self._surface_counter += 1
-        if self._client:
-            # Optionally create on daemon too
-            try:
-                self._client.send("surface.create", {"workspace_id": self.ws_id})
-            except Exception:
-                pass
         container, term = self._notebook.add_surface(
             surface_id=self._surface_counter, title="Shell"
         )
@@ -273,8 +404,12 @@ class WorkspaceView(Gtk.Box):
     def close_current_surface(self):
         """Close the currently visible surface tab."""
         sid, page_n = self._notebook.current_pane_ids()
-        if sid is not None and self._notebook.surface_count() > 1:
-            self._notebook.remove_surface(sid)
+        if sid is None or self._notebook.surface_count() <= 1:
+            return
+        if self._daemon is not None:
+            self._daemon.send("surface.close", {"id": str(sid),
+                                                "workspace_id": str(self.ws_id)})
+        self._notebook.remove_surface(sid)
 
     def split_pane(self, orientation="v"):
         """Split the current surface's focused pane."""
@@ -286,7 +421,17 @@ class WorkspaceView(Gtk.Box):
             focused = container._pane_order[0]
         if focused is None:
             return
-        new_id = max(container._panes.keys()) + 1 if container._panes else 1
+        if self._daemon is not None:
+            resp = self._daemon.send("surface.split", {
+                "pane_id": str(focused), "direction": orientation,
+            })
+            if not resp.get("ok"):
+                return
+            new_id = resp["result"]["id"]
+            if container.has_pane(new_id):  # the event got here first
+                return
+        else:
+            new_id = max(container._panes.keys()) + 1 if container._panes else 1
         term = container.split_pane(focused, orientation=orientation, new_id=new_id)
         if term:
             term.grab_focus_to_vte()
@@ -294,8 +439,15 @@ class WorkspaceView(Gtk.Box):
     def close_current_pane(self):
         """Close the current surface's focused pane."""
         container = self._notebook.current_container()
-        if container:
-            container.close_focused()
+        if not container:
+            return
+        if self._daemon is not None and container._focused is not None:
+            pid = container._focused
+            self._daemon.send("pane.close", {"id": str(pid)})
+            self.handle_daemon_event("pane.closed", {
+                "id": pid, "surface_id": container.surface_id})
+            return
+        container.close_focused()
 
     def focus_next_pane(self):
         container = self._notebook.current_container()
@@ -473,6 +625,9 @@ class LmuxWindow(Gtk.Window):
 
         # Initial one-shot refresh
         GLib.idle_add(lambda: self._sidebar.refresh() or GLib.SOURCE_REMOVE)
+        # Show the daemon's current workspace (its panes, attached) as soon
+        # as the window is up; _on_daemon_connected retries after autostart.
+        GLib.idle_add(self._show_current_workspace)
         # Check for updates (background)
         # Check for updates (background)
         add_update_notification(self)
@@ -900,6 +1055,9 @@ class LmuxWindow(Gtk.Window):
                             GLib.SOURCE_REMOVE,
                         )[1]
                     )
+                # Mirror daemon layout changes (incl. ones made from the CLI)
+                if name.startswith("surface.") or name.startswith("pane."):
+                    GLib.idle_add(self._route_daemon_event, name, data)
                 # Refresh sidebar on workspace/surface/pane/notification changes
                 if "workspace" in name or "surface" in name or "pane" in name or "notification" in name:
                     GLib.idle_add(
@@ -910,6 +1068,28 @@ class LmuxWindow(Gtk.Window):
             self._event_stop = self._client.send_events(callback=on_event)
         except Exception:
             pass  # daemon not yet available — reconnect will retry
+
+    def _route_daemon_event(self, name, data):
+        """GTK thread: hand a surface/pane event to its workspace view."""
+        view = self._workspace_map.get(data.get("workspace_id"))
+        if view is not None:
+            try:
+                view.handle_daemon_event(name, data)
+            except Exception:
+                logger.exception("daemon event %s failed", name)
+        return GLib.SOURCE_REMOVE
+
+    def _show_current_workspace(self):
+        """Show the daemon's current workspace if no view is up yet."""
+        if self._workspace_map:
+            return GLib.SOURCE_REMOVE
+        if not self._client.is_daemon_alive():
+            return GLib.SOURCE_REMOVE
+        resp = self._client.send("workspace.current")
+        ws_id = resp.get("result", {}).get("id") if resp.get("ok") else None
+        if ws_id:
+            self._on_workspace_selected(None, ws_id)
+        return GLib.SOURCE_REMOVE
 
     def _tick_refresh(self):
         """Periodic refresh of sidebar and workspace state. Also health-checks the daemon."""
@@ -944,6 +1124,7 @@ class LmuxWindow(Gtk.Window):
             self._reconnect_bar = None
         if self._event_stop is None:
             self._start_events()
+        self._show_current_workspace()
 
     def _on_daemon_disconnected(self):
         """Show or update the reconnect bar."""
@@ -995,7 +1176,8 @@ class LmuxWindow(Gtk.Window):
         """Switch to a workspace, creating its terminal view if needed."""
         if ws_id not in self._workspace_map:
             client = self._client
-            view = WorkspaceView(ws_id, f"Workspace {ws_id}", client)
+            view = WorkspaceView(ws_id, f"Workspace {ws_id}", client,
+                                 daemon_backed=client.is_daemon_alive())
             self._workspace_map[ws_id] = view
             self._stack.add_titled(view, str(ws_id), f"WS-{ws_id}")
         self._stack.set_visible_child(self._workspace_map[ws_id])

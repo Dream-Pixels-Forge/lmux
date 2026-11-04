@@ -454,6 +454,9 @@ static char *translate_tmux_command(int argc, char **argv) {
 /* Build a JSON command string from argc/argv.
  * Called with argv starting at the command name.
  * Returns a malloc'd string. */
+/* Socket path this invocation talks to (set in main before dispatch). */
+static const char *g_socket_path = NULL;
+
 static char *build_json_command(int argc, char **argv) {
 
     /* Normalize command name: translate hyphens to underscores */
@@ -1132,6 +1135,56 @@ static char *build_json_command(int argc, char **argv) {
     else if (strcmp(cmd, "hooks") == 0) { cmd = "hooks.list"; }
     else if (strcmp(cmd, "naming") == 0) { cmd = "naming.suggest"; }
 
+    /* send-keys <keys...>: tmux-style key list joined by spaces; the key
+     * names Enter/C-m, Tab, Space, Escape and C-c are translated. Sends to
+     * surface.send_text (and so to $LMUX_PANE_ID when run inside a pane). */
+    if (strcmp(cmd, "send_keys") == 0 && argc >= 2) {
+        char keys[2048];
+        size_t kl = 0;
+        keys[0] = 0;
+        for (int ki = 1; ki < argc; ki++) {
+            const char *a = argv[ki];
+            const char *lit = NULL;
+            bool named = true;
+            if (strcmp(a, "Enter") == 0 || strcmp(a, "C-m") == 0) lit = "\r";
+            else if (strcmp(a, "Tab") == 0) lit = "\t";
+            else if (strcmp(a, "Space") == 0) lit = " ";
+            else if (strcmp(a, "Escape") == 0) lit = "\x1b";
+            else if (strcmp(a, "C-c") == 0) lit = "\x03";
+            else { lit = a; named = false; }
+            /* Literal words are space-separated, like tmux joining args. */
+            if (!named && ki > 1 && kl > 0 && keys[kl - 1] != '\r' &&
+                keys[kl - 1] != '\t' && kl + 1 < sizeof keys)
+                keys[kl++] = ' ';
+            size_t ll = strlen(lit);
+            if (kl + ll >= sizeof keys) break;
+            memcpy(keys + kl, lit, ll);
+            kl += ll;
+            keys[kl] = 0;
+        }
+        cmd = "surface.send_text";
+        args_len = snprintf(args_buf, sizeof args_buf, "\"text\":\"%s\"",
+                            (json_escape(keys, _esc, sizeof _esc), _esc));
+    }
+
+    /* Inside a pane, target that pane by default (like tmux's $TMUX_PANE):
+     * the daemon exports LMUX_PANE_ID to every pane child. Only when no
+     * explicit surface/pane was given and we talk to that same daemon. */
+    if (strcmp(cmd, "read_screen") == 0 || strcmp(cmd, "capture_pane") == 0 ||
+        strcmp(cmd, "read-screen") == 0 || strcmp(cmd, "surface.send_text") == 0 ||
+        strcmp(cmd, "surface.split") == 0) {
+        const char *env_pane = getenv("LMUX_PANE_ID");
+        const char *env_sock = getenv("LMUX_SOCKET_PATH");
+        bool same_daemon = env_sock && (!g_socket_path || strcmp(env_sock, g_socket_path) == 0);
+        if (env_pane && env_pane[0] && same_daemon &&
+            !strstr(args_buf, "\"surface_id\"") && !strstr(args_buf, "\"pane_id\"") &&
+            args_len + 64 < sizeof args_buf) {
+            args_len += snprintf(args_buf + args_len, sizeof args_buf - args_len,
+                                 "%s\"pane_id\":\"%s\"", args_len ? "," : "",
+                                 (json_escape(env_pane, _esc, sizeof _esc), _esc));
+        }
+    }
+
     char *json = malloc(8192);
     if (args_len > 0) {
         snprintf(json, 8192, "{\"cmd\":\"%s\",\"args\":{%s}}", cmd, args_buf);
@@ -1745,6 +1798,8 @@ int main(int argc, char **argv) {
         socket_path = default_path;
     }
 
+    g_socket_path = socket_path;
+
     /* Remaining args = command. */
     argc -= i;
     argv += i;
@@ -1860,8 +1915,9 @@ int main(int argc, char **argv) {
         /* Main loop: check both app state and async exit flag. */
         while (lmux_app_is_running(app) && !daemon_should_exit) {
             lmux_app_tick(app);
-            struct timespec ts = {0, 16000000L}; /* 16ms = ~60Hz */
-            nanosleep(&ts, NULL);
+            /* Sleep until a pane pty / attached view has data (<=16ms), so
+             * relayed keystrokes are not delayed by a fixed tick. */
+            lmux_app_wait(app, 16);
         }
         /* Graceful shutdown: save snapshot, stop server, cleanup. */
         if (daemon_app_global) {

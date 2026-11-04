@@ -124,6 +124,8 @@ void lmux_app_tick(lmux_app *app);
 
 /* Blocking run loop for headless / CLI usage. Returns when quit. */
 int  lmux_app_run(lmux_app *app);
+/* Block up to timeout_ms until a pane pty or attached view is readable. */
+void lmux_app_wait(lmux_app *app, int timeout_ms);
 void lmux_app_quit(lmux_app *app, int exit_code);
 
 /* Set the running flag so the main loop will execute.
@@ -496,6 +498,10 @@ uint64_t    lmux_app_event_seq(const lmux_app *app);
 
 /* Pop and return the oldest event string. Caller must free(). */
 char *lmux_event_pop(lmux_app *app);
+/* Next replay event after *cursor (advances it); NULL when caught up. */
+char *lmux_event_next(lmux_app *app, uint64_t *cursor);
+/* pane.attach: see model.c. On success *fd_out is a pty master to send. */
+char *lmux_pane_attach_json(lmux_app *app, const char *request_json, int *fd_out);
 
 /* ------------------------------------------------------------------ */
 /* Session snapshot / restore (best-effort, atomic write)              */
