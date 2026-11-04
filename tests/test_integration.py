@@ -3141,28 +3141,32 @@ class TestSnapshotLoadConfinement(unittest.TestCase):
         self.assertEqual(resp["result"]["path"], saved)
 
 
-class TestDependencyGateTargetsMaster(unittest.TestCase):
-    """#13: trivy.yml was already fail-closed but triggered on `main` while the
-    repo's default branch is `master`, so the gate had never run."""
+class TestDependencyGateTargetsDefaultBranch(unittest.TestCase):
+    """#13: trivy.yml was fail-closed but triggered on a branch that didn't
+    exist, so the gate never ran. The default branch is now `main` (renamed
+    from `master`); every workflow trigger must follow it."""
+
+    DEFAULT_BRANCH = "main"
+    STALE_BRANCH = "master"
 
     @classmethod
     def setUpClass(cls):
         cls.trivy = Path(__file__).parent.parent / ".github" / "workflows" / "trivy.yml"
 
-    def test_no_workflow_targets_a_nonexistent_main_branch(self):
+    def test_no_workflow_targets_the_stale_branch(self):
         workflows = list(self.trivy.parent.glob("*.yml"))
         offenders = [w.name for w in workflows
-                     if "branches: [main]" in w.read_text()]
+                     if f"branches: [{self.STALE_BRANCH}]" in w.read_text()]
         self.assertEqual(offenders, [],
-                         f"these workflows target 'main' but the default "
-                         f"branch is 'master': {offenders}")
+                         f"these workflows target '{self.STALE_BRANCH}' but the "
+                         f"default branch is '{self.DEFAULT_BRANCH}': {offenders}")
 
     def test_dependency_gate_is_fail_closed(self):
         text = self.trivy.read_text()
         self.assertIn("exit-code: 1", text,
                       "the gate must stay fail-closed")
-        self.assertIn("branches: [master]", text,
-                      "the gate must trigger on master")
+        self.assertIn(f"branches: [{self.DEFAULT_BRANCH}]", text,
+                      f"the gate must trigger on {self.DEFAULT_BRANCH}")
 
 
 # ====================================================================
