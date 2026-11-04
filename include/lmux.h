@@ -576,6 +576,7 @@ const char *lmux_socket_path(const lmux_app *app);
 typedef struct lmux_cmd_entry {
     const char *name;       /* command name, e.g. "workspace.create"   */
     const char *summary;    /* one-line description                    */
+    const char *help;       /* detailed help text with schema          */
 } lmux_cmd_entry;
 
 /* Return the full command table (static storage). `count` is set to the
