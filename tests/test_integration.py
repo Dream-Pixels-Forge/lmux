@@ -3547,6 +3547,114 @@ class TestNotificationWorkspaceAssoc(unittest.TestCase):
         self.c.workspace_close(ws["id"])
 
 
+class TestNotificationAttribution(unittest.TestCase):
+    """cmux-style agent alerts: a notification raised from inside a pane is
+    tied to that pane and its workspace, the sidebar can see which workspace
+    needs attention, and opening the workspace clears it.
+
+    Before: the CLI sent no workspace/pane, workspace.list carried no unread
+    or waiting state, and `notification.ring.add <pane>` lost its argument,
+    so an agent's alert never reached the GUI.
+    """
+
+    def setUp(self):
+        self.c, self.daemon, self.home = _isolated_client()
+        self.cli = Path(__file__).parent.parent / "build" / "lmux"
+
+    def tearDown(self):
+        _shutdown_isolated(self.daemon, self.home)
+
+    def _ws_with_pane(self, title):
+        ws = self.c.workspace_create(_unique(title))["id"]
+        panes = self.c.assert_ok("pane.list", {"workspace_id": str(ws)})["panes"]
+        return ws, panes[0]["id"]
+
+    def _ws_state(self, ws_id):
+        wss = self.c.assert_ok("workspace.list")["workspaces"]
+        return next(w for w in wss if w["id"] == ws_id)
+
+    def _run_in_pane(self, pane_id, ws_id, *args):
+        env = dict(os.environ)
+        env.update({"LMUX_SOCKET_PATH": self.c.socket_path,
+                    "LMUX_PANE_ID": str(pane_id),
+                    "LMUX_WORKSPACE_ID": str(ws_id)})
+        return subprocess.run([str(self.cli), *args], env=env,
+                              capture_output=True, text=True, timeout=15)
+
+    def test_pane_id_resolves_owning_workspace(self):
+        ws, pane = self._ws_with_pane("attr")
+        self.c.assert_ok("notification.create",
+                         {"text": "needs input", "pane_id": str(pane)})
+        n = self.c.notification_list()[-1]
+        self.assertEqual(n["workspace_id"], str(ws))
+        self.assertEqual(n["pane_id"], pane)
+
+    def test_workspace_list_reports_unread_waiting_and_last_message(self):
+        ws, pane = self._ws_with_pane("unread")
+        before = self._ws_state(ws)
+        self.assertFalse(before["unread"])
+        self.assertFalse(before["waiting"])
+        self.c.assert_ok("notification.create", {
+            "text": "Agent \"done\"", "pane_id": str(pane), "waiting": True})
+        after = self._ws_state(ws)
+        self.assertTrue(after["unread"])
+        self.assertTrue(after["waiting"])
+        self.assertEqual(after["last_notify"], 'Agent "done"')
+
+    def test_mark_read_by_workspace_clears_only_that_workspace(self):
+        ws_a, pane_a = self._ws_with_pane("a")
+        ws_b, pane_b = self._ws_with_pane("b")
+        for p in (pane_a, pane_b):
+            self.c.assert_ok("notification.create",
+                             {"text": "wait", "pane_id": str(p), "waiting": True})
+        self.c.assert_ok("notification.mark_read", {"workspace_id": str(ws_a)})
+        a, b = self._ws_state(ws_a), self._ws_state(ws_b)
+        self.assertFalse(a["unread"])
+        self.assertFalse(a["waiting"], "A's own waits are cleared")
+        self.assertTrue(b["unread"], "B is untouched")
+        self.assertTrue(b["waiting"], "B's wait must not leak into A or vice versa")
+
+    def test_created_event_carries_workspace_and_pane(self):
+        ws, pane = self._ws_with_pane("evt")
+        tap = _EventTap(self.c.socket_path)
+        try:
+            self.c.assert_ok("notification.create",
+                             {"text": "hi", "pane_id": str(pane)})
+            data = tap.wait_for("notification.created")
+        finally:
+            tap.close()
+        self.assertIsNotNone(data, "no notification.created event")
+        self.assertEqual(str(data.get("workspace_id")), str(ws))
+        self.assertEqual(data.get("pane_id"), pane)
+
+    def test_cli_inside_pane_attributes_notification(self):
+        ws, pane = self._ws_with_pane("cli")
+        r = self._run_in_pane(pane, ws, "notification.create", "from agent")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        n = self.c.notification_list()[-1]
+        self.assertEqual(n["text"], "from agent")
+        self.assertEqual(n["workspace_id"], str(ws))
+        self.assertEqual(n["pane_id"], pane)
+
+    def test_cli_ring_add_takes_pane_argument_and_env_default(self):
+        ws, pane = self._ws_with_pane("ring")
+        r = self._run_in_pane(pane, ws, "notification.ring.add", str(pane), "waiting")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.c.assert_ok("notification.ring.clear", {"pane_id": str(pane)})
+        r = self._run_in_pane(pane, ws, "notification.ring.add")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        rings = self.c.assert_ok("notification.ring.list")
+        self.assertEqual(rings["count"], 1)
+
+    def test_cli_notification_list_prints_messages(self):
+        ws, pane = self._ws_with_pane("print")
+        self.c.assert_ok("notification.create",
+                         {"text": "visible text", "pane_id": str(pane)})
+        r = self._run_in_pane(pane, ws, "notification.list")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("visible text", r.stdout)
+
+
 # ====================================================================
 # Auto-naming rules
 # ====================================================================
