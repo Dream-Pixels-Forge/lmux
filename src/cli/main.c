@@ -839,6 +839,17 @@ static char *build_json_command(int argc, char **argv) {
             args_len += snprintf(args_buf + args_len, sizeof args_buf - args_len, ",\"workspace_id\":\"%s\"", (json_escape(argv[3], _esc, sizeof _esc), _esc));
         }
     }
+    /* notification.ring.add <pane_id> [reason] / notification.ring.clear <pane_id>
+     * (pane_id defaults to $LMUX_PANE_ID inside a pane, see below) */
+    else if ((strcmp(cmd, "notification.ring.add") == 0 || strcmp(cmd, "notification.ring") == 0 ||
+              strcmp(cmd, "notification.ring.clear") == 0) && argc >= 2) {
+        args_len = snprintf(args_buf, sizeof args_buf, "\"pane_id\":\"%s\"",
+                            (json_escape(argv[1], _esc, sizeof _esc), _esc));
+        if (argc >= 3 && strcmp(cmd, "notification.ring.clear") != 0) {
+            args_len += snprintf(args_buf + args_len, sizeof args_buf - args_len,
+                                 ",\"reason\":\"%s\"", (json_escape(argv[2], _esc, sizeof _esc), _esc));
+        }
+    }
     /* notification.create <text> [waiting] [workspace_id] */
     else if (strcmp(cmd, "notification.create") == 0 && argc >= 2) {
         args_len = snprintf(args_buf, sizeof args_buf, "\"text\":\"%s\"", (json_escape(argv[1], _esc, sizeof _esc), _esc));
@@ -1172,7 +1183,11 @@ static char *build_json_command(int argc, char **argv) {
      * explicit surface/pane was given and we talk to that same daemon. */
     if (strcmp(cmd, "read_screen") == 0 || strcmp(cmd, "capture_pane") == 0 ||
         strcmp(cmd, "read-screen") == 0 || strcmp(cmd, "surface.send_text") == 0 ||
-        strcmp(cmd, "surface.split") == 0) {
+        strcmp(cmd, "surface.split") == 0 ||
+        /* An agent's alert belongs to the pane it runs in (cmux-style). */
+        strcmp(cmd, "notification.create") == 0 ||
+        strcmp(cmd, "notification.ring.add") == 0 || strcmp(cmd, "notification.ring") == 0 ||
+        strcmp(cmd, "notification.ring.clear") == 0) {
         const char *env_pane = getenv("LMUX_PANE_ID");
         const char *env_sock = getenv("LMUX_SOCKET_PATH");
         bool same_daemon = env_sock && (!g_socket_path || strcmp(env_sock, g_socket_path) == 0);
@@ -1437,6 +1452,20 @@ static int exit_code_for_response(const char *response) {
     return 1;
 }
 
+/* Print a JSON string body (cursor just past the opening quote) up to the
+ * closing quote, unescaping \" \\ \n \t. */
+static void print_json_str(const char *s) {
+    while (*s && *s != '"') {
+        if (*s == '\\' && s[1]) {
+            s++;
+            putchar(*s == 'n' ? '\n' : *s == 't' ? '\t' : *s);
+            s++;
+            continue;
+        }
+        putchar(*s++);
+    }
+}
+
 static void print_response(const char *response, bool raw_json) {
     if (!response) return;
 
@@ -1550,18 +1579,18 @@ static void print_response(const char *response, bool raw_json) {
                 const char *w = strstr(arr, "\"waiting\":true");
                 const char *txt = strstr(arr, "\"text\":\"");
                 printf("  ");
+                /* Skip the full `"key":"` prefix (strlen, not a hand count:
+                 * "kind"/"text" used += 7 for an 8-char prefix and printed
+                 * nothing), and print through \" escapes. */
                 if (k && k < obj_end) {
-                    k += 7;
-                    while (*k && *k != '"') putchar(*k++);
+                    print_json_str(k + strlen("\"kind\":\""));
                     printf(" ");
                 }
                 if (t && t < obj_end) {
-                    t += 9;
-                    while (*t && *t != '"') putchar(*t++);
+                    print_json_str(t + strlen("\"title\":\""));
                 }
                 if (txt && txt < obj_end) {
-                    txt += 7;
-                    while (*txt && *txt != '"') putchar(*txt++);
+                    print_json_str(txt + strlen("\"text\":\""));
                 }
                 if (i && i < obj_end) {
                     i += 5;

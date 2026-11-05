@@ -221,6 +221,7 @@ typedef struct {
     char     workspace_id[64];/* owning workspace                    */
     bool     waiting;         /* true if agent is waiting for input  */
     time_t   created_at;      /* time of creation (time(NULL))         */
+    lmux_id  pane_id;         /* pane that raised it, 0 if unknown     */
 } lmux_notification;
 
 /* Notification ring — visual indicator that a pane needs attention */
