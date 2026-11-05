@@ -6791,6 +6791,41 @@ class _EventTap:
             pass
 
 
+class TestGuiDaemonClientBackToBack(unittest.TestCase):
+    """gui/daemon_client.DaemonClient vs the one-request-per-connection server.
+
+    The daemon answers one request per connection and then closes it. The
+    client used to keep the socket for the next request, so a quick second
+    call could be written into a closed connection and come back as
+    "empty response" — which made the GUI fall back to local shells at
+    random (flaky tests/test_gui_daemon_terminals.py).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        _ensure_daemon()
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "gui"))
+        from daemon_client import DaemonClient
+        cls.dc = DaemonClient(_daemon.socket_path)
+
+    def test_back_to_back_requests_all_succeed(self):
+        failures = []
+        for i in range(200):
+            cmd = "surface.list" if i % 2 else "pane.list"
+            resp = self.dc.send(cmd, {})
+            if not resp.get("ok"):
+                failures.append((i, cmd, resp.get("error")))
+        self.assertEqual(failures, [])
+
+    def test_large_response_is_read_completely(self):
+        ws = _client.workspace_create(_unique("big-resp"))
+        for _ in range(30):
+            _client.assert_ok("surface.create", {"workspace_id": str(ws["id"])})
+        for _ in range(20):
+            resp = self.dc.send("pane.list", {})
+            self.assertTrue(resp.get("ok"), resp.get("error"))
+
+
 class TestDaemonOwnedTerminals(unittest.TestCase):
     """The daemon is the single owner of pane ptys."""
 

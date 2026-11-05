@@ -162,7 +162,10 @@ class DaemonClient:
             self._connected = False
 
     def _recv_all(self, s):
-        """Read until the daemon closes the connection or timeout.
+        """Read until the daemon closes the connection (it shuts down its
+        write side after the reply) or timeout. Never stop on a short chunk:
+        a reply can arrive in several reads, and stopping early truncated
+        it into "invalid JSON".
 
         Caps total received bytes at MAX_RESPONSE_SIZE to prevent
         unbounded memory use from a misbehaving server.
@@ -180,14 +183,12 @@ class DaemonClient:
                         f"response exceeds {MAX_RESPONSE_SIZE} bytes"
                     )
                 chunks.append(chunk)
-                if len(chunk) < 65536:
-                    break
             except socket.timeout:
                 break
         return b"".join(chunks)
 
     def send(self, cmd, args=None):
-        """Send command with persistent connection + reconnect on failure (H2 fix).
+        """Send one command on its own connection, retrying connect failures.
         Emits hook events and tracks focus changes after successful commands."""
         if args is None:
             args = {}
@@ -202,13 +203,17 @@ class DaemonClient:
         for attempt in range(3):
             try:
                 with self._lock:
+                    # The daemon serves exactly one request per connection
+                    # and then closes it, so a reused socket would send the
+                    # next request into a dead connection ("empty
+                    # response"). Connect fresh for every request.
+                    self._disconnect()
                     s = self._connect()
                     try:
                         s.sendall(payload.encode())
                         raw = self._recv_all(s)
-                    except (socket.error, OSError):
+                    finally:
                         self._disconnect()
-                        raise
                 if not raw:
                     result = {"ok": False, "error": "empty response"}
                 else:

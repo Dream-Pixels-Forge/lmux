@@ -9,6 +9,7 @@ from gi.repository import Gtk, GLib, Gdk
 import os
 import sys
 import threading
+import time
 import logging
 
 # Set up logging for optional import warnings
@@ -259,8 +260,15 @@ class WorkspaceView(Gtk.Box):
     def _initial_surface(self):
         """Create the first surface for this workspace."""
         if self._daemon is not None:
-            if self.sync_from_daemon():
-                return None, None
+            # sync_from_daemon is idempotent, so a transient failure can be
+            # retried; going offline while the daemon is up would bring back
+            # the split-brain (local shells the daemon cannot see).
+            for attempt in range(3):
+                if self.sync_from_daemon():
+                    return None, None
+                if not self._daemon.is_daemon_alive():
+                    break
+                time.sleep(0.1 * (attempt + 1))
             # Daemon vanished between the probe and now: run offline.
             self._daemon = None
         self._surface_counter += 1
