@@ -6801,12 +6801,19 @@ class TestGuiDaemonClientBackToBack(unittest.TestCase):
     random (flaky tests/test_gui_daemon_terminals.py).
     """
 
+    # Runs on a private daemon: ~250 rapid requests on the shared one used
+    # up its 1000 req/60s per-UID budget on fast CI runners, so unrelated
+    # tests later in the suite failed with rate_limited.
     @classmethod
     def setUpClass(cls):
-        _ensure_daemon()
+        cls.client, cls.daemon, cls.home = _isolated_client()
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "gui"))
         from daemon_client import DaemonClient
-        cls.dc = DaemonClient(_daemon.socket_path)
+        cls.dc = DaemonClient(cls.client.socket_path)
+
+    @classmethod
+    def tearDownClass(cls):
+        _shutdown_isolated(cls.daemon, cls.home)
 
     def test_back_to_back_requests_all_succeed(self):
         failures = []
@@ -6818,9 +6825,9 @@ class TestGuiDaemonClientBackToBack(unittest.TestCase):
         self.assertEqual(failures, [])
 
     def test_large_response_is_read_completely(self):
-        ws = _client.workspace_create(_unique("big-resp"))
+        ws = self.client.workspace_create(_unique("big-resp"))
         for _ in range(30):
-            _client.assert_ok("surface.create", {"workspace_id": str(ws["id"])})
+            self.client.assert_ok("surface.create", {"workspace_id": str(ws["id"])})
         for _ in range(20):
             resp = self.dc.send("pane.list", {})
             self.assertTrue(resp.get("ok"), resp.get("error"))
