@@ -555,6 +555,7 @@ class LmuxWindow(Gtk.Window):
         .workspace-header { background: #333; color: #ddd; font-size: 12px; }
         .unread-indicator { color: #ffa500; font-weight: bold; }
         .waiting-indicator { color: #ff4444; font-weight: bold; }
+        .notify-preview { color: #e0a040; font-size: 11px; font-style: italic; }
         .reconnect-bar { background: #800; color: #fff; font-weight: bold; }
         """
         provider = Gtk.CssProvider()
@@ -1189,6 +1190,19 @@ class LmuxWindow(Gtk.Window):
             self._workspace_map[ws_id] = view
             self._stack.add_titled(view, str(ws_id), f"WS-{ws_id}")
         self._stack.set_visible_child(self._workspace_map[ws_id])
+        self._mark_workspace_read(ws_id)
+
+    def _mark_workspace_read(self, ws_id):
+        """Opening a workspace acknowledges its agent's notifications, so its
+        sidebar dot clears (as in cmux). Off the GTK thread; the daemon's
+        notification.read event then refreshes the sidebar."""
+        def _send():
+            try:
+                self._client.send("notification.mark_read",
+                                  {"workspace_id": str(ws_id)})
+            except Exception:  # noqa: BLE001 - daemon may be offline
+                pass
+        threading.Thread(target=_send, daemon=True).start()
 
     def _on_workspace_create(self, sidebar):
         """Create a new workspace via daemon and switch to it."""
