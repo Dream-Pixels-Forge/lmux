@@ -31,6 +31,7 @@
 #include <pthread.h>
 #include <fcntl.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <sys/un.h>
 #include <sys/stat.h>
 #include <poll.h>
@@ -229,6 +230,64 @@ static bool control_extract_cmd(const char *line, char *out, size_t cap) {
     while (*k && *k != '"' && n + 1 < cap) out[n++] = *k++;
     out[n] = 0;
     return n > 0;
+}
+
+/* pane.attach: the reply carries the view pty master as SCM_RIGHTS
+ * ancillary data on its first byte (Linux fd passing). */
+static bool request_is_pane_attach(const char *line) {
+    char cmd[128] = {0};
+    return control_extract_cmd(line, cmd, sizeof cmd) &&
+           strcmp(cmd, "pane.attach") == 0;
+}
+
+static void serve_pane_attach(lmux_app *app, int fd, const char *line) {
+    int pty_fd = -1;
+    char *response = lmux_pane_attach_json(app, line, &pty_fd);
+    lmux_metrics_inc_requests(app);
+    if (!response) {
+        if (pty_fd >= 0) close(pty_fd);
+        close(fd);
+        return;
+    }
+    size_t rlen = strlen(response);
+    char *msg = malloc(rlen + 2);
+    if (msg) {
+        memcpy(msg, response, rlen);
+        msg[rlen] = '\n';
+        msg[rlen + 1] = 0;
+        struct iovec iov = {.iov_base = msg, .iov_len = rlen + 1};
+        union {
+            char buf[CMSG_SPACE(sizeof(int))];
+            struct cmsghdr align;
+        } ctl;
+        struct msghdr mh;
+        memset(&mh, 0, sizeof mh);
+        memset(&ctl, 0, sizeof ctl);
+        mh.msg_iov = &iov;
+        mh.msg_iovlen = 1;
+        if (pty_fd >= 0) {
+            mh.msg_control = ctl.buf;
+            mh.msg_controllen = sizeof ctl.buf;
+            struct cmsghdr *cm = CMSG_FIRSTHDR(&mh);
+            cm->cmsg_level = SOL_SOCKET;
+            cm->cmsg_type = SCM_RIGHTS;
+            cm->cmsg_len = CMSG_LEN(sizeof(int));
+            memcpy(CMSG_DATA(cm), &pty_fd, sizeof(int));
+        }
+        ssize_t w = sendmsg(fd, &mh, MSG_NOSIGNAL);
+        if (w >= 0 && (size_t)w < rlen + 1) {
+            /* Ancillary data went with the first chunk; finish the line. */
+            ssize_t _w = send(fd, msg + w, rlen + 1 - (size_t)w, MSG_NOSIGNAL);
+            (void)_w;
+        }
+        free(msg);
+    }
+    /* The client now holds its own copy of the master (or never got one, in
+     * which case the daemon sees EOF on the view and detaches it). */
+    if (pty_fd >= 0) close(pty_fd);
+    free(response);
+    shutdown(fd, SHUT_WR);
+    close(fd);
 }
 
 static bool control_is_attach(const char *line) {
@@ -437,13 +496,22 @@ static void serve_client(lmux_app *app, int client_fd) {
         serve_control_client(app, client_fd, p);
         return;
     }
+    if (request_is_pane_attach(p)) {
+        serve_pane_attach(app, client_fd, p);
+        return;
+    }
     char *response = lmux_dispatch_json(app, buf);
     lmux_metrics_inc_requests(app);
 
     /* Check for event streaming response. */
     int is_events = response && strstr(response, "\"stream\":\"events\"") != NULL;
     char name_filter[128] = {0}, cat_filter[128] = {0};
+    /* Each subscriber reads the replay ring through its own cursor: start
+     * after everything already published, or after an explicit after_seq. */
+    uint64_t ev_cursor = lmux_app_event_seq(app);
     if (is_events && response) {
+        const char *as = strstr(response, "\"after_seq\":");
+        if (as) ev_cursor = strtoull(as + 12, NULL, 10);
         /* Extract filter values from the response JSON */
         const char *nf = strstr(response, "\"name_filter\":\"");
         if (nf) {
@@ -509,7 +577,7 @@ static void serve_client(lmux_app *app, int client_fd) {
 
                 /* Send pending events */
                 for (;;) {
-                    char *ev = lmux_event_pop(app);
+                    char *ev = lmux_event_next(app, &ev_cursor);
                     if (!ev) break;
                     /* Check filter before sending */
                     if ((name_filter[0] || cat_filter[0])) {

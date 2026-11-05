@@ -162,7 +162,10 @@ class DaemonClient:
             self._connected = False
 
     def _recv_all(self, s):
-        """Read until the daemon closes the connection or timeout.
+        """Read until the daemon closes the connection (it shuts down its
+        write side after the reply) or timeout. Never stop on a short chunk:
+        a reply can arrive in several reads, and stopping early truncated
+        it into "invalid JSON".
 
         Caps total received bytes at MAX_RESPONSE_SIZE to prevent
         unbounded memory use from a misbehaving server.
@@ -180,14 +183,12 @@ class DaemonClient:
                         f"response exceeds {MAX_RESPONSE_SIZE} bytes"
                     )
                 chunks.append(chunk)
-                if len(chunk) < 65536:
-                    break
             except socket.timeout:
                 break
         return b"".join(chunks)
 
     def send(self, cmd, args=None):
-        """Send command with persistent connection + reconnect on failure (H2 fix).
+        """Send one command on its own connection, retrying connect failures.
         Emits hook events and tracks focus changes after successful commands."""
         if args is None:
             args = {}
@@ -202,13 +203,17 @@ class DaemonClient:
         for attempt in range(3):
             try:
                 with self._lock:
+                    # The daemon serves exactly one request per connection
+                    # and then closes it, so a reused socket would send the
+                    # next request into a dead connection ("empty
+                    # response"). Connect fresh for every request.
+                    self._disconnect()
                     s = self._connect()
                     try:
                         s.sendall(payload.encode())
                         raw = self._recv_all(s)
-                    except (socket.error, OSError):
+                    finally:
                         self._disconnect()
-                        raise
                 if not raw:
                     result = {"ok": False, "error": "empty response"}
                 else:
@@ -337,6 +342,49 @@ class DaemonClient:
         t = threading.Thread(target=_run, daemon=True)
         t.start()
         return stop
+    # ── pane attach (daemon-owned terminals) ──────────────
+
+    def attach_pane(self, pane_id, timeout=5.0):
+        """Attach to a daemon pane's terminal.
+
+        Sends ``pane.attach`` on a dedicated connection; the daemon answers
+        with JSON and passes a pty master fd as SCM_RIGHTS ancillary data.
+        Returns ``(result_dict, fd)``; ``fd`` is None on failure. The caller
+        owns the fd (hand it to ``Vte.Pty.new_foreign_sync``).
+        """
+        payload = json.dumps(
+            {"cmd": "pane.attach", "args": {"pane_id": str(pane_id)}}
+        ) + "\n"
+        fds = []
+        try:
+            self._verify_socket()
+            s = socket.socket(socket.AF_UNIX)
+            s.settimeout(timeout)
+            try:
+                s.connect(self.path)
+                s.sendall(payload.encode())
+                data, fds, _flags, _addr = socket.recv_fds(s, 65536, 1)
+                chunks = [data]
+                while data and not chunks[-1].endswith(b"\n"):
+                    data = s.recv(65536)
+                    if not data:
+                        break
+                    chunks.append(data)
+            finally:
+                s.close()
+            resp = json.loads(b"".join(chunks).decode().strip() or "{}")
+        except (OSError, ValueError) as e:
+            for fd in fds:
+                os.close(fd)
+            return {"ok": False, "error": str(e)}, None
+        if not resp.get("ok") or not fds:
+            for fd in fds:
+                os.close(fd)
+            return resp, None
+        for extra in fds[1:]:
+            os.close(extra)
+        return resp.get("result", {}), fds[0]
+
     # ── hook & focus tracking ─────────────────────────────
 
     def _emit_hook(self, event, **kwargs):
