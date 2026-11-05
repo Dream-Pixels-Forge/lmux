@@ -1635,8 +1635,11 @@ class TestPtyDeferralOnRestore(unittest.TestCase):
             deadline = time.time() + 30
             while time.time() < deadline and client is None:
                 time.sleep(0.25)
+                # LmuxClient() connects lazily: probe with a real ping.
                 try:
-                    client = LmuxClient(sock)
+                    probe = LmuxClient(sock)
+                    if probe.send("ping", {}).get("ok"):
+                        client = probe
                 except Exception:  # noqa: BLE001 - not up yet
                     client = None
             self.assertIsNotNone(client, "daemon did not come up")
@@ -6109,6 +6112,23 @@ class TestPackagingEntryPoints(unittest.TestCase):
             errors, [],
             "flatpak AppStream metainfo fails validation:\n"
             + "\n".join(errors))
+    def test_flatpak_manifest_compiles_every_core_source(self):
+        """The flatpak manifest lists each core .c file by hand. When
+        src/core/registry.c was added, the manifest wasn't updated and the
+        flatpak CI job failed to link (undefined lmux_registry_all)."""
+        root = Path(__file__).parent.parent
+        manifest = (root / "packaging" / "io.github.lmux.lmux.yml").read_text()
+        missing = []
+        for src in sorted((root / "src" / "core").glob("*.c")):
+            obj = src.stem + ".o"
+            if f"src/core/{src.name}" not in manifest:
+                missing.append(f"{src.name} (not compiled)")
+            elif not re.search(rf"^\s*- ar rcs .*\b{re.escape(obj)}\b",
+                               manifest, re.MULTILINE):
+                missing.append(f"{obj} (not archived)")
+        self.assertEqual(missing, [],
+                         f"flatpak manifest is missing core sources: {missing}")
+
     def test_make_flatpak_target_references_existing_manifest(self):
         """`make flatpak` must point at a manifest that exists.
 
@@ -6563,8 +6583,12 @@ class TestHarnessPtydTeardown(unittest.TestCase):
                 deadline = time.time() + 60
                 while time.time() < deadline and client is None:
                     time.sleep(0.25)
+                    # LmuxClient() connects lazily, so constructing it proves
+                    # nothing: probe with a real ping until the daemon binds.
                     try:
-                        client = LmuxClient(sock)
+                        probe = LmuxClient(sock, timeout=5.0)
+                        if probe.send("ping", {}).get("ok"):
+                            client = probe
                     except Exception:  # noqa: BLE001 - not up yet
                         client = None
                 if client is not None:
