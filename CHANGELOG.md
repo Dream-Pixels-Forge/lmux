@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Fixed a stack buffer overflow in the daemon's JSON string parser: a
+  `\uXXXX` escape landing at the end of a field's buffer wrote past it, so a
+  single request could crash `lmuxd` (and every terminal it owns). A string
+  ending in a lone backslash also read past the end of the request.
+- Event-stream payloads (`notification.created`, `workspace.created`,
+  `surface.renamed`, `agent.*`, `browser.*`, buffer/hook events, ...) now
+  JSON-escape user text; a quote in a title or notification could break or
+  forge events for every subscriber. Same for `pane.list` `formatted`.
+- Request fields are only matched as real JSON keys, never as text inside a
+  value, and `cmd`/`args` only at the top level of the request.
+- Socket auth compares the peer to the daemon's own UID instead of
+  `stat()`ing the socket path; concurrent connections are capped (256).
+
+### Fixed
+
+- Emoji and other non-BMP characters (`\ud83d\ude00` pairs) decode
+  correctly instead of becoming U+FFFD.
+- `buffer-*`, `hook-fired`, `window.created`, `ssh.session_created`,
+  `feed.panel_created` and `weather.refreshed` events carried
+  `"data":{{...}}`, which is not valid JSON.
+- HTTP log server: an early read failure could release an SSE slot it never
+  took (uninitialized flag); writes now retry short writes; the heartbeat
+  timer is per connection instead of shared across threads.
+- `#{...}` format expansion no longer truncates long URLs to 255 bytes and no
+  longer has a shared static fallback buffer.
+- Build is warning-free under `-Wall -Wextra -Wpedantic`.
+
+### Added
+
+- `src/core/json.c` / `include/lmux_json.h`: the shared JSON field helpers
+  used by the dispatcher, server and config loader.
+- `tests/test_json_fuzz.c`: regressions plus fuzzing of the JSON layer and
+  dispatcher, asserting every response and event stays valid JSON.
+
 ## [1.2.0] - 2026-10-13
 
 ### Changed

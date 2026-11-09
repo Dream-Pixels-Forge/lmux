@@ -36,7 +36,12 @@ const testPrograms = [
     { name: "test_server_rate_limit", sources: ["test_server_rate_limit.c"] },
     { name: "test_http_stop", sources: ["test_http_stop.c"] },
     { name: "test_fuzz",   sources: ["test_fuzz.c"] },
+    { name: "test_json_fuzz", sources: ["test_json_fuzz.c"] },
     { name: "test_hooks",  sources: ["test_hooks.c"] },
+    { name: "test_sync_panes", sources: ["test_sync_panes.c"] },
+    { name: "test_buffer", sources: ["test_buffer.c"] },
+    { name: "test_remain_on_exit", sources: ["test_remain_on_exit.c"] },
+    { name: "test_registry", sources: ["test_registry.c"] },
 ];
 
 /* ── Compile and run each test ─────────────── */
@@ -85,3 +90,4 @@ try {
 
 console.log("\n" + (overallResult === 0 ? "✓ All tests passed" : "✗ Some tests failed"));
 process.exit(overallResult);
+// CI retrigger

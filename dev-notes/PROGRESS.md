@@ -2,8 +2,44 @@
 
 **Project:** lmux
 **Started:** 2026-09-06
-**Current Phase:** Phase 3 — Engineer (Milestone 9: Config Round-Trip Integrity)
-**Status:** Complete — goal-met audit MET (34/34 checks)
+**Current Phase:** Phase 3 — Engineer (Milestone 10: tmux-parity maturity program)
+**Status:** IN PROGRESS — goal `dev-notes/GOAL_MATURITY.md` registered, awaiting dispatch
+**Mode:** Full (GitHub Issues + PRs; `gh` authenticated, remote `Dream-Pixels-Forge/lmux`)
+
+---
+
+## Milestone 10: Production Readiness & Multiplexer Maturity (2026-10-18)
+
+Goal: `dev-notes/GOAL_MATURITY.md`. Reference target: tmux source at `Dev/cli/tmux`
+(reverse-engineered). Prior phases 0–5 and milestones 1–9 are complete; this program
+targets the **multiplexer-core maturity gap** only (agent features are done).
+
+### Grounded gap corrections (verified against source, not README)
+- `src/core/format.c` **already exists** (`#{var}`, `#{?cond:t:f}`, `#{W:}` loops, 10 vars)
+  → M4 is *extend*, not greenfield.
+- Real P0 gap: command dispatch in `src/cli/main.c` is a hand-written `strcmp` chain
+  (~100 branches), no table registry, no `list-commands`, no `--help` schema.
+
+### Milestone → issue map & dispatch order
+
+| Milestone | Scope | Priority | Depends on |
+|-----------|-------|----------|------------|
+| M1 | Command registry + `list-commands` + `--help` schema | P0 | — |
+| M2 | Runtime key tables (`bind-key`/`unbind-key`/`list-keys`) | P0 | M1 |
+| M3 | Typed option system (`set-option`/`show-options`, inheritance) | P0 | M1 |
+| M4 | Extend `format.c` + wire into `list-*`/status | P1 | M1 |
+| M5 | `monitor-silence` + environment (`set/show-environment`) | P1 | M1 |
+| M6 | `command-prompt`/`confirm-before`/`display-menu` (control mode) | P2 | M1, M2 |
+| M7 | Status line (`status-left/right`) + preset layouts + `docs/lmux.1` | P2 | M3, M4 |
+| M8 | Emacs copy mode (optional) | P3 | M2 |
+
+**Parallel groups:** M1 → {M2, M3, M4, M5} in parallel → {M6, M7} → M8.
+All milestones are Strangler-Fig: additive registry/table beside existing dispatch, no
+big-bang rewrite of `main.c`/`model.c`. Protocol changes are additive only.
+
+### Milestone 9 recap (COMPLETE)
+Config round-trip integrity. Goal `dev-notes/FEATURE_GOAL.md`; audit MET (34/34).
+See below for the defect table (B1–B5) and verification.
 
 ---
 

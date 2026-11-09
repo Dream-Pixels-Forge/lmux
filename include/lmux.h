@@ -124,6 +124,8 @@ void lmux_app_tick(lmux_app *app);
 
 /* Blocking run loop for headless / CLI usage. Returns when quit. */
 int  lmux_app_run(lmux_app *app);
+/* Block up to timeout_ms until a pane pty or attached view is readable. */
+void lmux_app_wait(lmux_app *app, int timeout_ms);
 void lmux_app_quit(lmux_app *app, int exit_code);
 
 /* Set the running flag so the main loop will execute.
@@ -189,6 +191,16 @@ void       lmux_pane_focus_dir(lmux_workspace *ws,
 bool lmux_pane_get_info(lmux_pane *p, lmux_pane_info *out);
 lmux_id  lmux_pane_get_id(lmux_pane *p);
 
+/* Remain-on-exit: keep pane scrollback and allow respawn after child exits */
+bool lmux_pane_set_remain_on_exit(lmux_pane *pane, bool enabled);
+bool lmux_pane_get_remain_on_exit(const lmux_pane *pane);
+
+/* Respawn pane with its original command */
+bool lmux_pane_respawn(lmux_pane *pane);
+
+/* Capture pane scrollback content */
+char *lmux_pane_capture(lmux_pane *pane, long start_line, long end_line);
+
 /* Send keystrokes to a terminal pane. Text is interpreted as
  * key-name syntax: literal chars, C-X for Ctrl-X, M-x for Alt-x. */
 void lmux_pane_send_keys(lmux_pane *p, const char *keys);
@@ -209,6 +221,7 @@ typedef struct {
     char     workspace_id[64];/* owning workspace                    */
     bool     waiting;         /* true if agent is waiting for input  */
     time_t   created_at;      /* time of creation (time(NULL))         */
+    lmux_id  pane_id;         /* pane that raised it, 0 if unknown     */
 } lmux_notification;
 
 /* Notification ring — visual indicator that a pane needs attention */
@@ -297,6 +310,10 @@ typedef struct {
 #define LMUX_HOOK_MONITOR_ACTIVITY     "monitor-activity"
 #define LMUX_HOOK_MONITOR_BELL         "monitor-bell"
 #define LMUX_HOOK_MONITOR_SILENCE      "monitor-silence"
+
+/* Pane lifecycle hooks */
+#define LMUX_HOOK_PANE_DIED            "pane-died"
+#define LMUX_HOOK_PANE_EXITED          "pane-exited"
 
 /* Monitor actions (mirror tmux activity-action/bell-action) */
 #define LMUX_MONITOR_ACTION_ANY        "any"
@@ -414,6 +431,61 @@ const lmux_feed_entry *lmux_feed_entry_at(lmux_app *app, lmux_id panel_id, size_
 bool lmux_feed_panel_clear(lmux_app *app, lmux_id panel_id);
 
 /* ------------------------------------------------------------------ */
+/* Paste buffers                                                       */
+/* ------------------------------------------------------------------ */
+
+/* Named paste buffer entry. */
+typedef struct {
+    char     name[64];           /* buffer name (buffer0001, buffer0002, etc.) */
+    char    *data;               /* buffer contents (malloc'd) */
+    size_t   size;               /* size of data in bytes */
+    time_t   created_at;         /* creation timestamp */
+} lmux_buffer;
+
+/* Set a buffer's contents. If name is NULL, auto-generates bufferNNNN name.
+ * Returns 0 on success, -1 on error (e.g., OOM). */
+int  lmux_buffer_set(lmux_app *app, const char *name, const char *data, size_t size);
+
+/* Get a buffer's contents. Returns number of bytes copied (0 if not found or empty).
+ * If out is NULL, returns the buffer size without copying. */
+size_t lmux_buffer_get(lmux_app *app, const char *name, char *out, size_t cap);
+
+/* Delete a buffer by name. Returns true if buffer existed and was deleted. */
+bool lmux_buffer_delete(lmux_app *app, const char *name);
+
+/* List all buffer names into the provided array. Returns number of names written.
+ * Caller must free each name with free(). */
+size_t lmux_buffer_list(lmux_app *app, char **out_names, size_t max_names);
+
+/* Get the total number of buffers. */
+size_t lmux_buffer_count(lmux_app *app);
+
+/* Set the maximum number of buffers (0 = unlimited). When exceeded, oldest
+ * buffers are evicted FIFO. */
+void lmux_buffer_set_limit(lmux_app *app, size_t limit);
+
+/* Get the current buffer limit. */
+size_t lmux_buffer_get_limit(lmux_app *app);
+
+/* Save a buffer to a file. Returns true on success. */
+bool lmux_buffer_save(lmux_app *app, const char *name, const char *path);
+
+/* Load a buffer from a file. Creates or overwrites buffer with given name.
+ * Returns true on success. */
+bool lmux_buffer_load(lmux_app *app, const char *name, const char *path);
+
+/* Capture pane content into a buffer. start_line/end_line specify range
+ * (negative values count from end, like tmux -S/-E). Returns 0 on success. */
+int lmux_buffer_capture_pane(lmux_app *app, lmux_pane *pane, const char *buffer_name,
+                             long start_line, long end_line);
+
+/* Check if a buffer exists. Returns true if buffer exists (even if empty). */
+bool lmux_buffer_exists(lmux_app *app, const char *name);
+
+/* Get buffer size. Returns size, or SIZE_MAX if buffer doesn't exist. */
+size_t lmux_buffer_get_size(lmux_app *app, const char *name);
+
+/* ------------------------------------------------------------------ */
 /* Event queue                                                         */
 /* ------------------------------------------------------------------ */
 
@@ -427,6 +499,10 @@ uint64_t    lmux_app_event_seq(const lmux_app *app);
 
 /* Pop and return the oldest event string. Caller must free(). */
 char *lmux_event_pop(lmux_app *app);
+/* Next replay event after *cursor (advances it); NULL when caught up. */
+char *lmux_event_next(lmux_app *app, uint64_t *cursor);
+/* pane.attach: see model.c. On success *fd_out is a pty master to send. */
+char *lmux_pane_attach_json(lmux_app *app, const char *request_json, int *fd_out);
 
 /* ------------------------------------------------------------------ */
 /* Session snapshot / restore (best-effort, atomic write)              */
@@ -496,6 +572,26 @@ bool lmux_osc_parser_pop_133(lmux_osc_parser *p, char *out_marker);
 const char *lmux_socket_path(const lmux_app *app);
 
 /* For embedders that want to dispatch JSON requests directly. */
+
+/* ------------------------------------------------------------------ */
+/* Command registry                                                     */
+/* ------------------------------------------------------------------ */
+
+/* Table-driven registry of the commands the daemon can dispatch.
+ * Additive (Strangler-Fig): it describes the dispatch surface without
+ * replacing the strcmp chain in model.c. */
+typedef struct lmux_cmd_entry {
+    const char *name;       /* command name, e.g. "workspace.create"   */
+    const char *summary;    /* one-line description                    */
+    const char *help;       /* detailed help text with schema          */
+} lmux_cmd_entry;
+
+/* Return the full command table (static storage). `count` is set to the
+ * number of entries when non-NULL. Never returns NULL. */
+const lmux_cmd_entry *lmux_registry_all(size_t *count);
+
+/* Look up a command by name. Returns NULL when not found. */
+const lmux_cmd_entry *lmux_registry_get(const char *name);
 
 /* ------------------------------------------------------------------ */
 /* Unix socket server                                                   */

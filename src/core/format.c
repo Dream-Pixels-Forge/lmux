@@ -236,7 +236,7 @@ static bool format_expand_recursive(struct lmux_app *app, struct lmux_workspace 
             var_name[var_len] = '\0';
             p++; /* Skip } */
             
-            char var_value[256] = {0};
+            char var_value[1024] = {0};   /* pane->url is up to 1023 */
             const char *val = get_variable_value(app, ws, surf, pane, var_name, var_value, sizeof var_value);
             
             size_t n = strlen(val);
@@ -260,9 +260,11 @@ static bool format_expand_recursive(struct lmux_app *app, struct lmux_workspace 
 static const char *get_variable_value(struct lmux_app *app, struct lmux_workspace *ws,
                                        struct lmux_surface *surf, struct lmux_pane *pane,
                                        const char *var_name, char *buf, size_t cap) {
-    static char static_buf[256];
-    char *out = buf ? buf : static_buf;
-    size_t out_cap = cap ? cap : sizeof static_buf;
+    /* Callers always supply the buffer: a shared static fallback would race
+     * under the dispatcher's read lock, where lookups run concurrently. */
+    if (!buf || cap == 0) return "";
+    char *out = buf;
+    size_t out_cap = cap;
     
     (void)app; /* Unused for now, but kept for future extensibility */
     
@@ -301,6 +303,26 @@ static const char *get_variable_value(struct lmux_app *app, struct lmux_workspac
         snprintf(out, out_cap, "%d", pane->copy_cursor_row);
     } else if (strcmp(var_name, "copy_cursor_col") == 0) {
         snprintf(out, out_cap, "%d", pane->copy_cursor_col);
+    } else if (strcmp(var_name, "buffer_count") == 0) {
+        snprintf(out, out_cap, "%zu", lmux_buffer_count(app));
+    } else if (strncmp(var_name, "buffer_", 7) == 0 && 
+               strlen(var_name) > 13 && 
+               strcmp(var_name + strlen(var_name) - 5, "_size") == 0) {
+        /* #{buffer_<name>_size} - extract buffer name between "buffer_" and "_size" */
+        size_t name_len = strlen(var_name) - 12; /* 7 for "buffer_" + 5 for "_size" */
+        if (name_len > 0 && name_len < 64) {
+            char buf_name[64];
+            memcpy(buf_name, var_name + 7, name_len);
+            buf_name[name_len] = '\0';
+            size_t sz = lmux_buffer_get_size(app, buf_name);
+            if (sz != SIZE_MAX) {
+                snprintf(out, out_cap, "%zu", sz);
+            } else {
+                out[0] = '\0';
+            }
+        } else {
+            out[0] = '\0';
+        }
     } else {
         /* Unknown variable - return empty string */
         out[0] = '\0';

@@ -2,7 +2,7 @@
 import gi
 gi.require_version('Gtk', '3.0')
 gi.require_version('GLib', '2.0')
-from gi.repository import Gtk, GObject, GLib
+from gi.repository import Gtk, GObject, GLib, Gdk, Pango
 import threading
 import sys
 import os
@@ -54,7 +54,8 @@ class WorkspaceRow(Gtk.ListBoxRow):
         # Title line (workspace title)
         self._title_label = Gtk.Label(label=title)
         self._title_label.set_xalign(0)
-        self._title_label.set_ellipsize(True)
+        # Ellipsize so a long title can't force the window wider.
+        self._title_label.set_ellipsize(Pango.EllipsizeMode.END)
         self._title_label.set_max_width_chars(30)
         box.pack_start(self._title_label, True, True, 0)
 
@@ -62,11 +63,39 @@ class WorkspaceRow(Gtk.ListBoxRow):
         self._meta_label = Gtk.Label(label="")
         self._meta_label.set_xalign(0)
         self._meta_label.set_opacity(0.7)
+        # Paths: keep both ends visible. Without ellipsizing, a long cwd
+        # set this label's minimum width (~560px) and the window's with it.
+        self._meta_label.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
         self._meta_label.set_max_width_chars(30)
         box.pack_start(self._meta_label, True, True, 0)
 
+        # Latest notification from this workspace's agent (cmux-style), shown
+        # only while unread.
+        self._notify_label = Gtk.Label(label="")
+        self._notify_label.set_xalign(0)
+        self._notify_label.set_ellipsize(True)
+        self._notify_label.set_max_width_chars(30)
+        self._notify_label.get_style_context().add_class("notify-preview")
+        self._notify_label.set_no_show_all(True)
+        box.pack_start(self._notify_label, True, True, 0)
+
         self.add(box)
         self.show_all()
+
+    def set_attention(self, unread=False, waiting=False, last_notify=""):
+        """Reflect a workspace's notification state: a dot (red while an
+        agent waits for input, orange when just unread) plus the message."""
+        self.set_unread(unread or waiting)
+        style = self._indicator.get_style_context()
+        if waiting:
+            style.remove_class("unread-indicator")
+        self.set_waiting(waiting)
+        if (unread or waiting) and last_notify:
+            self._notify_label.set_text(last_notify)
+            self._notify_label.show()
+        else:
+            self._notify_label.set_text("")
+            self._notify_label.hide()
 
     def set_metadata(self, cwd=None, branch=None):
         """Set secondary metadata label. Show cwd and git branch if present."""
@@ -286,10 +315,6 @@ class Sidebar(Gtk.Box):
     # ── public API ──────────────────────────────────────────
     def refresh(self):
         """Fetch workspace list from daemon and update sidebar rows."""
-        # L4 fix: skip daemon call when no workspaces exist after first check
-        if self._empty_count > 2:
-            return
-
         def _do_refresh():
             try:
                 resp = self._client.send("workspace.list")
@@ -344,6 +369,9 @@ class Sidebar(Gtk.Box):
                 row.set_metadata(cwd=cwd, branch=branch)
                 self._rows[ws_id] = row
                 self._list_box.add(row)
+            row.set_attention(unread=bool(ws.get("unread")),
+                              waiting=bool(ws.get("waiting")),
+                              last_notify=ws.get("last_notify") or "")
 
         self._list_box.show_all()
 

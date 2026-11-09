@@ -23,6 +23,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "lmux.h"
+#include "lmux_json.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,6 +32,7 @@
 #include <pthread.h>
 #include <fcntl.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <sys/un.h>
 #include <sys/stat.h>
 #include <poll.h>
@@ -167,7 +169,7 @@ done:
  * @param client_fd  File descriptor of the connected client socket.
  * @return 0 if authentication succeeds, -1 if auth fails, -2 if rate limited.
  */
-static int verify_socket_credentials(int client_fd, const char *socket_path) {
+static int verify_socket_credentials(int client_fd) {
     struct ucred cred;
     socklen_t len = sizeof(cred);
     
@@ -176,20 +178,17 @@ static int verify_socket_credentials(int client_fd, const char *socket_path) {
         return -1;
     }
     
-    /* Get the UID of the socket file owner */
-    struct stat st;
-    if (stat(socket_path, &st) < 0) {
-        lmux_log(LMUX_LOG_ERROR, "server: stat(%s) failed: %s", socket_path, strerror(errno));
-        return -1;
-    }
+    /* Compare against the daemon's own effective UID rather than the
+     * socket file's owner: stat()ing the path is a second lookup that
+     * can be raced (the file swapped or re-owned between bind and now),
+     * while our own UID cannot change underneath us. */
+    uid_t expected_uid = geteuid();
     
-    uid_t socket_owner_uid = st.st_uid;
+    lmux_log(LMUX_LOG_DEBUG, "server: client UID=%u, daemon UID=%u", cred.uid, expected_uid);
     
-    lmux_log(LMUX_LOG_DEBUG, "server: client UID=%u, socket owner UID=%u", cred.uid, socket_owner_uid);
-    
-    if (cred.uid != socket_owner_uid) {
+    if (cred.uid != expected_uid) {
         lmux_log(LMUX_LOG_WARN, "server: rejected connection from UID %u (expected %u)", 
-                 cred.uid, socket_owner_uid);
+                 cred.uid, expected_uid);
         return -1;
     }
     
@@ -216,19 +215,68 @@ static int verify_socket_credentials(int client_fd, const char *socket_path) {
 /* Extract the "cmd" value from a JSON request line. Returns true on
  * success with the command name in `out`. */
 static bool control_extract_cmd(const char *line, char *out, size_t cap) {
-    const char *k = strstr(line, "\"cmd\"");
-    if (!k) return false;
-    k += 5;
-    while (*k == ' ' || *k == '\t') k++;
-    if (*k != ':') return false;
-    k++;
-    while (*k == ' ' || *k == '\t') k++;
-    if (*k != '"') return false;
-    k++;
-    size_t n = 0;
-    while (*k && *k != '"' && n + 1 < cap) out[n++] = *k++;
-    out[n] = 0;
-    return n > 0;
+    /* Same rule as the dispatcher: only the request's own top-level "cmd"
+     * counts, never one nested in args or embedded in a string value. */
+    const char *v = lmux_json_find_toplevel_key(line, "cmd", NULL);
+    return v && lmux_json_decode_string(v, out, cap) && out[0];
+}
+
+/* pane.attach: the reply carries the view pty master as SCM_RIGHTS
+ * ancillary data on its first byte (Linux fd passing). */
+static bool request_is_pane_attach(const char *line) {
+    char cmd[128] = {0};
+    return control_extract_cmd(line, cmd, sizeof cmd) &&
+           strcmp(cmd, "pane.attach") == 0;
+}
+
+static void serve_pane_attach(lmux_app *app, int fd, const char *line) {
+    int pty_fd = -1;
+    char *response = lmux_pane_attach_json(app, line, &pty_fd);
+    lmux_metrics_inc_requests(app);
+    if (!response) {
+        if (pty_fd >= 0) close(pty_fd);
+        close(fd);
+        return;
+    }
+    size_t rlen = strlen(response);
+    char *msg = malloc(rlen + 2);
+    if (msg) {
+        memcpy(msg, response, rlen);
+        msg[rlen] = '\n';
+        msg[rlen + 1] = 0;
+        struct iovec iov = {.iov_base = msg, .iov_len = rlen + 1};
+        union {
+            char buf[CMSG_SPACE(sizeof(int))];
+            struct cmsghdr align;
+        } ctl;
+        struct msghdr mh;
+        memset(&mh, 0, sizeof mh);
+        memset(&ctl, 0, sizeof ctl);
+        mh.msg_iov = &iov;
+        mh.msg_iovlen = 1;
+        if (pty_fd >= 0) {
+            mh.msg_control = ctl.buf;
+            mh.msg_controllen = sizeof ctl.buf;
+            struct cmsghdr *cm = CMSG_FIRSTHDR(&mh);
+            cm->cmsg_level = SOL_SOCKET;
+            cm->cmsg_type = SCM_RIGHTS;
+            cm->cmsg_len = CMSG_LEN(sizeof(int));
+            memcpy(CMSG_DATA(cm), &pty_fd, sizeof(int));
+        }
+        ssize_t w = sendmsg(fd, &mh, MSG_NOSIGNAL);
+        if (w >= 0 && (size_t)w < rlen + 1) {
+            /* Ancillary data went with the first chunk; finish the line. */
+            ssize_t _w = send(fd, msg + w, rlen + 1 - (size_t)w, MSG_NOSIGNAL);
+            (void)_w;
+        }
+        free(msg);
+    }
+    /* The client now holds its own copy of the master (or never got one, in
+     * which case the daemon sees EOF on the view and detaches it). */
+    if (pty_fd >= 0) close(pty_fd);
+    free(response);
+    shutdown(fd, SHUT_WR);
+    close(fd);
 }
 
 static bool control_is_attach(const char *line) {
@@ -374,8 +422,7 @@ static void serve_client(lmux_app *app, int client_fd) {
     lmux_metrics_inc_connections(app);
 
     /* Authenticate the client before processing any request */
-    const char *socket_path = lmux_socket_path(app);
-    int auth_rc = verify_socket_credentials(client_fd, socket_path);
+    int auth_rc = verify_socket_credentials(client_fd);
     if (auth_rc < 0) {
         lmux_metrics_inc_errors(app);
         const char *err;
@@ -437,13 +484,22 @@ static void serve_client(lmux_app *app, int client_fd) {
         serve_control_client(app, client_fd, p);
         return;
     }
+    if (request_is_pane_attach(p)) {
+        serve_pane_attach(app, client_fd, p);
+        return;
+    }
     char *response = lmux_dispatch_json(app, buf);
     lmux_metrics_inc_requests(app);
 
     /* Check for event streaming response. */
     int is_events = response && strstr(response, "\"stream\":\"events\"") != NULL;
     char name_filter[128] = {0}, cat_filter[128] = {0};
+    /* Each subscriber reads the replay ring through its own cursor: start
+     * after everything already published, or after an explicit after_seq. */
+    uint64_t ev_cursor = lmux_app_event_seq(app);
     if (is_events && response) {
+        const char *as = strstr(response, "\"after_seq\":");
+        if (as) ev_cursor = strtoull(as + 12, NULL, 10);
         /* Extract filter values from the response JSON */
         const char *nf = strstr(response, "\"name_filter\":\"");
         if (nf) {
@@ -509,7 +565,7 @@ static void serve_client(lmux_app *app, int client_fd) {
 
                 /* Send pending events */
                 for (;;) {
-                    char *ev = lmux_event_pop(app);
+                    char *ev = lmux_event_next(app, &ev_cursor);
                     if (!ev) break;
                     /* Check filter before sending */
                     if ((name_filter[0] || cat_filter[0])) {
@@ -570,10 +626,34 @@ typedef struct {
     int       listen_fd;
 } server_thread_arg;
 
+/* Cap on concurrently served connections. Each one is a detached thread
+ * with a 64 KiB request buffer on its stack; without a cap a runaway local
+ * script could exhaust threads/memory and take every terminal down with the
+ * daemon. Persistent control-mode clients count against it too. */
+#define LMUX_MAX_CLIENTS 256
+static int g_active_clients = 0;
+static pthread_mutex_t g_clients_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static bool client_slot_acquire(void) {
+    bool ok;
+    pthread_mutex_lock(&g_clients_lock);
+    ok = g_active_clients < LMUX_MAX_CLIENTS;
+    if (ok) g_active_clients++;
+    pthread_mutex_unlock(&g_clients_lock);
+    return ok;
+}
+
+static void client_slot_release(void) {
+    pthread_mutex_lock(&g_clients_lock);
+    if (g_active_clients > 0) g_active_clients--;
+    pthread_mutex_unlock(&g_clients_lock);
+}
+
 static void *client_thread(void *arg) {
     client_thread_arg *cta = (client_thread_arg *)arg;
     serve_client(cta->app, cta->client_fd);
     free(cta);
+    client_slot_release();
     return NULL;
 }
 
@@ -596,6 +676,15 @@ static void *server_thread(void *arg) {
         /* Set FD_CLOEXEC so the client socket fd is not inherited by forked children */
         fcntl(client_fd, F_SETFD, FD_CLOEXEC);
 
+        if (!client_slot_acquire()) {
+            static const char busy[] = "{\"ok\":false,\"error\":{\"type\":\"urn:lmux:busy\",\"title\":\"Too Many Connections\",\"code\":\"busy\",\"detail\":\"too many concurrent connections, try again later\",\"trace_id\":\"null\"}}\n";
+            ssize_t _w = send(client_fd, busy, sizeof busy - 1, MSG_NOSIGNAL | MSG_DONTWAIT);
+            (void)_w;
+            lmux_log(LMUX_LOG_WARN, "server: connection limit (%d) reached, refusing client", LMUX_MAX_CLIENTS);
+            close(client_fd);
+            continue;
+        }
+
         /* Spawn a thread to handle this client so accept loop stays free. */
         client_thread_arg *cta = malloc(sizeof *cta);
         if (cta) {
@@ -607,9 +696,11 @@ static void *server_thread(void *arg) {
             } else {
                 free(cta);
                 close(client_fd);
+                client_slot_release();
             }
         } else {
             close(client_fd);
+            client_slot_release();
         }
     }
 

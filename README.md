@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="https://github.com/Dream-Pixels-Forge/lmux/releases/tag/v1.2.0"><img src="https://img.shields.io/badge/release-v1.2.0-blue" alt="Release"></a>
-  <img src="https://img.shields.io/badge/tests-217%20passing-brightgreen" alt="Tests">
+  <a href="https://github.com/Dream-Pixels-Forge/lmux/actions/workflows/ci.yml"><img src="https://github.com/Dream-Pixels-Forge/lmux/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <img src="https://img.shields.io/badge/core-C17-orange" alt="Core">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
 </p>
@@ -281,11 +281,20 @@ with `invalid_params`.
 |----------|--------|
 | `Ctrl+Shift+T` | New surface (tab) |
 | `Ctrl+Shift+W` | Close surface |
-| `Ctrl+Shift+-` | Split pane vertical |
-| `Ctrl+Shift+=` | Split pane horizontal |
+| `Ctrl+Shift+E` | Split pane vertical |
+| `Ctrl+Shift+D` | Split pane horizontal |
+| `Ctrl+Shift+X` | Close pane |
 | `Ctrl+Shift+N` | New workspace |
+| `Ctrl+Shift+Alt+W` | Close workspace |
+| `Ctrl+Shift+P` | Command palette |
+| `Ctrl+Shift+S` | Toggle sidebar |
+| `Ctrl+Shift+B` | Toggle browser panel |
+| `Ctrl+Shift+O` | Reopen last session |
 | `Ctrl+Shift+Q` | Quit |
 | `Ctrl+Shift+Arrow` | Focus prev/next pane |
+
+Plain `Shift+letter` and `Ctrl+letter` always go to the terminal. Custom
+bindings live in `~/.config/lmux/shortcuts.json`.
 
 ---
 
@@ -357,17 +366,17 @@ node scripts/test.mjs --unit
 # Run integration tests only
 python3 tests/test_integration.py -v
 
-# Run fuzz tests
-./tests/fuzz_json
+# Run unit tests (incl. the OSC and JSON-protocol fuzzers) under ASan/UBSan
+node scripts/test.mjs --sanitize --unit
 
 # Run benchmarks
 python3 tests/benchmarks.py
 ```
 
-**Test results:**
-- 217 integration tests (Python)
-- 37 C unit tests
-- 20K+ fuzz iterations
+**What CI runs** (see the badge above for the current status):
+- C unit tests, plus the same suite under AddressSanitizer/UBSan
+- Fuzzers for the OSC parser and the JSON request parser/dispatcher
+- The Python integration suite against a real daemon
 - Performance benchmarks (p99 < 50ms)
 
 ---
@@ -385,7 +394,7 @@ python3 tests/benchmarks.py
 | **Workspace templates** | No | Yes |
 | **Performance profiling** | No | Yes |
 | **Tmux compat** | Partial | Full (10 commands) |
-| **Tests** | ~100 | 217+ |
+| **Tests** | ~100 | ~400 integration + C unit + fuzz |
 | **Supply chain** | None | SBOM + signing + Trivy |
 
 See [dev-notes/COMPARISON.md](dev-notes/COMPARISON.md) for detailed analysis.

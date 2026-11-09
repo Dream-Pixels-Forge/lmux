@@ -43,9 +43,13 @@ class PaneContainer(Gtk.Box):
     / _PaneLeaf. Operations: split, remove, focus-next, focus-prev, focus-dir.
     """
 
-    def __init__(self, surface_id=None):
+    def __init__(self, surface_id=None, daemon=None, workspace_id=None):
         super().__init__()
         self.surface_id = surface_id
+        # DaemonClient when panes are daemon-owned (ids are daemon pane ids
+        # and each TerminalWidget attaches to the daemon's pty).
+        self._daemon = daemon
+        self.workspace_id = workspace_id
         self._tree = None        # root: _PaneLeaf | _SplitNode
         self._panes = {}         # int pane_id -> _PaneLeaf
         self._pane_order = []    # ordered list of pane_ids (insertion order)
@@ -65,8 +69,7 @@ class PaneContainer(Gtk.Box):
             self._prefix_count += 1
             title = f"Pane {self._prefix_count}"
 
-        term = TerminalWidget(title)
-        term.pane_id = pane_id
+        term = self._make_terminal(title, pane_id)
         leaf = _PaneLeaf(pane_id, term)
         self._panes[pane_id] = leaf
         self._pane_order.append(pane_id)
@@ -84,6 +87,38 @@ class PaneContainer(Gtk.Box):
         self._rebuild_layout()
         self.show_all()
         return term
+
+    def _make_terminal(self, title, pane_id):
+        from terminal import TerminalWidget
+        if self._daemon is not None:
+            term = TerminalWidget(title, client=self._daemon, pane_id=pane_id)
+        else:
+            term = TerminalWidget(title)
+        term.pane_id = pane_id
+        term._on_focus = self._on_terminal_focus
+        return term
+
+    def _on_terminal_focus(self, pane_id):
+        """Clicking/typing in a pane makes it the focused one — locally and,
+        for daemon panes, in the daemon (so CLI defaults follow the GUI)."""
+        if pane_id not in self._panes:
+            return
+        self._focused = pane_id
+        if self._daemon is not None:
+            import threading
+            args = {"id": str(pane_id)}
+            if self.workspace_id is not None:
+                args["workspace_id"] = str(self.workspace_id)
+            threading.Thread(
+                target=lambda: self._daemon.send("pane.focus", args),
+                daemon=True,
+            ).start()
+
+    def has_pane(self, pane_id):
+        return pane_id in self._panes
+
+    def pane_ids(self):
+        return list(self._pane_order)
 
     def remove_pane(self, pane_id):
         """Remove a pane by id. Last pane is never removed."""
@@ -117,8 +152,7 @@ class PaneContainer(Gtk.Box):
             self._prefix_count += 1
             title = f"Pane {self._prefix_count}"
 
-        new_term = TerminalWidget(title)
-        new_term.pane_id = new_id
+        new_term = self._make_terminal(title, new_id)
         new_leaf = _PaneLeaf(new_id, new_term)
         self._panes[new_id] = new_leaf
         self._pane_order.append(new_id)
@@ -236,6 +270,13 @@ class PaneContainer(Gtk.Box):
         """Rebuild the Gtk.Paned tree from the internal split tree."""
         for child in list(self.get_children()):
             self.remove(child)
+        # Leaves nested in the old Gtk.Paned tree are still parented there;
+        # detach them so the new tree can pack them (else gtk_box_pack
+        # asserts and the pane silently disappears).
+        for leaf in self._panes.values():
+            parent = leaf.widget.get_parent()
+            if parent is not None:
+                parent.remove(leaf.widget)
 
         if self._tree is None:
             self.show_all()
