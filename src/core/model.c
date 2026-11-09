@@ -3374,33 +3374,49 @@ const lmux_notification *lmux_notification_at(lmux_app *app, size_t index) {
     return app->notifications.items[index];
 }
 
+/* Recompute a workspace's waiting flag from ITS notifications only (it used
+ * to scan every workspace, so one agent waiting kept all of them marked). */
+static void workspace_recompute_waiting(lmux_app *app, lmux_workspace *ws) {
+    char wid[32];
+    snprintf(wid, sizeof wid, "%u", ws->id);
+    bool any = false;
+    for (size_t j = 0; j < app->notifications.len && !any; j++) {
+        const lmux_notification *m = app->notifications.items[j];
+        any = m->waiting && strcmp(m->workspace_id, wid) == 0;
+    }
+    ws->waiting = any;
+}
+
 void lmux_notification_mark_read(lmux_app *app, uint64_t seq) {
     if (!app) return;
     for (size_t i = 0; i < app->notifications.len; i++) {
         lmux_notification *n = app->notifications.items[i];
         if (n->seq == seq) {
             n->waiting = false;
-            /* Find and update the owning workspace */
             if (n->workspace_id[0]) {
-                lmux_id wid = (lmux_id)atol(n->workspace_id);
-                lmux_workspace *ws = lmux_workspace_by_id(app, wid);
+                lmux_workspace *ws =
+                    lmux_workspace_by_id(app, (lmux_id)atol(n->workspace_id));
                 if (ws) {
                     ws->unread = false;
-                    /* Only clear waiting if no other notification is waiting */
-                    bool any_waiting = false;
-                    for (size_t j = 0; j < app->notifications.len; j++) {
-                        if (((lmux_notification *)app->notifications.items[j])->waiting) {
-                            any_waiting = true;
-                            break;
-                        }
-                    }
-
-                    ws->waiting = any_waiting;
+                    workspace_recompute_waiting(app, ws);
                 }
             }
             return;
         }
     }
+}
+
+/* Mark every notification of one workspace read: what the GUI does when the
+ * user opens that workspace (cmux clears its badge the same way). */
+static void workspace_mark_all_read(lmux_app *app, lmux_workspace *ws) {
+    char wid[32];
+    snprintf(wid, sizeof wid, "%u", ws->id);
+    for (size_t i = 0; i < app->notifications.len; i++) {
+        lmux_notification *n = app->notifications.items[i];
+        if (strcmp(n->workspace_id, wid) == 0) n->waiting = false;
+    }
+    ws->unread = false;
+    ws->waiting = false;
 }
 
 /* ------------------------------------------------------------------ */
@@ -4535,14 +4551,19 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         for (size_t i = 0; i < app->workspaces.len; i++) {
             lmux_workspace *ws = app->workspaces.items[i];
             RESULT_GROW;
-            char _te[512], _ce[1024], _be[256];
+            char _te[512], _ce[1024], _be[256], _le[1024];
             if (i > 0) written += snprintf(result + written, result_cap - written, ",");
+            /* unread/waiting/last_notify feed the sidebar's attention dot. */
             written += snprintf(result + written, result_cap - written,
-                "{\"id\":%u,\"title\":\"%s\",\"cwd\":\"%s\",\"git_branch\":\"%s\"}",
+                "{\"id\":%u,\"title\":\"%s\",\"cwd\":\"%s\",\"git_branch\":\"%s\","
+                "\"unread\":%s,\"waiting\":%s,\"last_notify\":\"%s\"}",
                 ws->id,
                 json_escape_str(_te, sizeof _te, ws->title),
                 json_escape_str(_ce, sizeof _ce, ws->cwd),
-                json_escape_str(_be, sizeof _be, ws->git_branch));
+                json_escape_str(_be, sizeof _be, ws->git_branch),
+                ws->unread ? "true" : "false",
+                ws->waiting ? "true" : "false",
+                json_escape_str(_le, sizeof _le, ws->last_notify));
         }
         written += snprintf(result + written, result_cap - written, "]}}");
         goto done;
@@ -5516,24 +5537,35 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         bool waiting = false;
         json_extract_string(args_json, "text", text, sizeof text);
         json_extract_bool(args_json, "waiting", &waiting);
-        char ws_id[64] = {0};
+        char ws_id[64] = {0}, pane_str[32] = {0};
         json_extract_string(args_json, "workspace_id", ws_id, sizeof ws_id);
-        if (ws_id[0]) {
-            lmux_workspace *ws = lmux_workspace_by_id(app, (lmux_id)atol(ws_id));
-            if (ws) lmux_workspace_notify(ws, text, waiting);
-            else   lmux_notify(app, text, waiting);
-        } else {
-            lmux_notify(app, text, waiting);
-        }
+        json_extract_string(args_json, "pane_id", pane_str, sizeof pane_str);
+        /* A pane (e.g. $LMUX_PANE_ID of the agent that raised it) pins the
+         * notification to that pane and, unless given, its workspace. */
+        lmux_pane *src_pane = pane_str[0] ? app_find_pane(app, (lmux_id)atol(pane_str)) : NULL;
+        lmux_workspace *ws = ws_id[0] ? lmux_workspace_by_id(app, (lmux_id)atol(ws_id)) : NULL;
+        if (!ws && src_pane) ws = src_pane->owner;
+        if (ws) lmux_workspace_notify(ws, text, waiting);
+        else    lmux_notify(app, text, waiting);
+        lmux_notification *created = app->notifications.len
+            ? app->notifications.items[app->notifications.len - 1] : NULL;
+        if (created && src_pane) created->pane_id = src_pane->id;
         /* Desktop notification for waiting (agent-input-required) alerts */
         if (waiting) {
             char dtitle[128];
             snprintf(dtitle, sizeof dtitle, "lmux");
             lmux_desktop_notify(dtitle, text);
         }
-        lmux_event_push(app, "notification.created", "notification", "\"seq\":%llu,\"text\":\"%s\",\"waiting\":%s",
-            (unsigned long long)app->notify_seq, lmux_json_esc(text), waiting ? "true" : "false");
-        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+        lmux_event_push(app, "notification.created", "notification",
+            "\"seq\":%llu,\"text\":\"%s\",\"waiting\":%s,"
+            "\"workspace_id\":\"%s\",\"pane_id\":%u",
+            (unsigned long long)app->notify_seq,
+            lmux_json_esc(text),
+            waiting ? "true" : "false",
+            lmux_json_esc(created ? created->workspace_id : ""),
+            created ? (unsigned)created->pane_id : 0u);
+        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{\"seq\":%llu}}",
+                           (unsigned long long)app->notify_seq);
         goto done;
     }
 
@@ -5542,12 +5574,15 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{\"notifications\":[");
         for (size_t i = 0; i < app->notifications.len; i++) {
             const lmux_notification *n = app->notifications.items[i];
+            char _ne[2048];
             RESULT_GROW;
             if (i > 0) written += snprintf(result + written, result_cap - written, ",");
             written += snprintf(result + written, result_cap - written,
-                "{\"seq\":%llu,\"text\":\"%s\",\"waiting\":%s,\"created_at\":%lld,\"workspace_id\":\"%s\"}",
-                (unsigned long long)n->seq, n->text, n->waiting ? "true" : "false",
-                (long long)n->created_at, n->workspace_id);
+                "{\"seq\":%llu,\"text\":\"%s\",\"waiting\":%s,\"created_at\":%lld,"
+                "\"workspace_id\":\"%s\",\"pane_id\":%u}",
+                (unsigned long long)n->seq, json_escape_str(_ne, sizeof _ne, n->text),
+                n->waiting ? "true" : "false",
+                (long long)n->created_at, n->workspace_id, (unsigned)n->pane_id);
         }
         written += snprintf(result + written, result_cap - written, "]}}");
         goto done;
@@ -5566,9 +5601,18 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
 
     /* --- notification.mark_read --- */
     if (strcmp(cmd, "notification.mark_read") == 0) {
-        char seq_str[64] = {0};
+        char seq_str[64] = {0}, mr_ws[32] = {0};
         json_extract_string(args_json, "seq", seq_str, sizeof seq_str);
-        if (seq_str[0]) {
+        json_extract_string(args_json, "workspace_id", mr_ws, sizeof mr_ws);
+        if (mr_ws[0]) {
+            lmux_workspace *ws = lmux_workspace_by_id(app, (lmux_id)atol(mr_ws));
+            if (!ws) {
+                written = snprintf(result, result_cap,
+                    "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"workspace not found\"}}");
+                goto done;
+            }
+            workspace_mark_all_read(app, ws);
+        } else if (seq_str[0]) {
             uint64_t seq = (uint64_t)atol(seq_str);
             lmux_notification_mark_read(app, seq);
         } else {

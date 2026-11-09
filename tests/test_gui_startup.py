@@ -97,6 +97,102 @@ class WorkspaceGroupsShapeTests(unittest.TestCase):
         self.assertEqual(normalize_groups(None), {})
 
 
+class _RecordingClient:
+    """Stand-in DaemonClient: records requests, answers ok."""
+
+    def __init__(self):
+        self.sent = []
+        self._hook_registry = None
+        self._focus_history = None
+        self._browser_api_bridge = None
+
+    def send(self, cmd, args=None):
+        self.sent.append((cmd, args or {}))
+        return {"ok": True, "result": {}}
+
+    def is_daemon_alive(self):
+        return False
+
+    def send_events(self, callback=None):
+        import threading
+        return threading.Event()
+
+
+@unittest.skipUnless(HAS_DISPLAY, "needs a display for GTK")
+class SidebarAttentionTests(unittest.TestCase):
+    """cmux-style attention: a workspace whose agent raised a notification
+    shows a dot (and the message) in the sidebar until it is opened."""
+
+    def setUp(self):
+        from sidebar import Sidebar
+        self.sb = Sidebar(_RecordingClient())
+
+    def _row(self, ws_id=1):
+        return self.sb._rows[ws_id]
+
+    def test_unread_waiting_workspace_shows_dot_and_message(self):
+        self.sb._update_list([{"id": 1, "title": "agent", "unread": True,
+                               "waiting": True,
+                               "last_notify": "Agent needs input"}])
+        row = self._row()
+        self.assertEqual(row._indicator.get_text(), "●")
+        self.assertTrue(row._indicator.get_style_context().has_class("waiting-indicator"))
+        self.assertIn("Agent needs input", row._notify_label.get_text())
+        self.assertTrue(row._notify_label.get_visible())
+
+    def test_read_workspace_clears_dot_and_message(self):
+        self.sb._update_list([{"id": 1, "title": "a", "unread": True,
+                               "waiting": True, "last_notify": "x"}])
+        self.sb._update_list([{"id": 1, "title": "a", "unread": False,
+                               "waiting": False, "last_notify": "x"}])
+        row = self._row()
+        self.assertEqual(row._indicator.get_text(), "")
+        ctx = row._indicator.get_style_context()
+        self.assertFalse(ctx.has_class("waiting-indicator"))
+        self.assertFalse(ctx.has_class("unread-indicator"))
+        self.assertFalse(row._notify_label.get_visible())
+
+    def test_unread_without_waiting_uses_unread_style(self):
+        self.sb._update_list([{"id": 1, "title": "a", "unread": True,
+                               "waiting": False, "last_notify": "done"}])
+        ctx = self._row()._indicator.get_style_context()
+        self.assertTrue(ctx.has_class("unread-indicator"))
+        self.assertFalse(ctx.has_class("waiting-indicator"))
+
+
+@unittest.skipUnless(HAS_DISPLAY, "needs a display for GTK")
+class OpenWorkspaceMarksReadTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self._env = {k: os.environ.get(k) for k in ("HOME", "LMUX_SOCKET_PATH")}
+        os.environ["HOME"] = self.tmp.name
+        os.environ["LMUX_SOCKET_PATH"] = os.path.join(self.tmp.name, "none.sock")
+
+    def tearDown(self):
+        for k, v in self._env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self.tmp.cleanup()
+
+    def test_selecting_workspace_marks_its_notifications_read(self):
+        import main
+        client = _RecordingClient()
+        win = main.LmuxWindow(client=client)
+        try:
+            win._on_workspace_selected(None, 7)
+            deadline = __import__("time").time() + 3
+            while ("notification.mark_read", {"workspace_id": "7"}) not in client.sent \
+                    and __import__("time").time() < deadline:
+                while Gtk.events_pending():
+                    Gtk.main_iteration_do(False)
+            self.assertIn(("notification.mark_read", {"workspace_id": "7"}),
+                          client.sent)
+        finally:
+            win.destroy()
+
+
 @unittest.skipUnless(HAS_DISPLAY, "needs a display for GTK")
 class MainWindowStartupTests(unittest.TestCase):
     def setUp(self):
