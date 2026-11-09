@@ -42,6 +42,9 @@ struct lmux_pane {
     int           copy_sel_start_row;
     int           copy_sel_start_col;
     bool          copy_selecting;
+    char         *copy_search_pattern;   /* active search pattern */
+    bool          copy_search_backward;  /* search direction */
+    bool          copy_rectangle;        /* rectangle selection mode */
     char         *sb;
     size_t        sb_len;
     size_t        sb_cap;
@@ -294,6 +297,12 @@ static const char *get_variable_value(struct lmux_app *app, struct lmux_workspac
         snprintf(out, out_cap, "%s", pane->focused ? "1" : "0");
     } else if (strcmp(var_name, "window_active") == 0) {
         snprintf(out, out_cap, "%s", surf->focused ? "1" : "0");
+    } else if (strcmp(var_name, "copy_mode") == 0) {
+        snprintf(out, out_cap, "%s", pane->copy_mode_active ? "1" : "0");
+    } else if (strcmp(var_name, "copy_cursor_row") == 0) {
+        snprintf(out, out_cap, "%d", pane->copy_cursor_row);
+    } else if (strcmp(var_name, "copy_cursor_col") == 0) {
+        snprintf(out, out_cap, "%d", pane->copy_cursor_col);
     } else if (strcmp(var_name, "buffer_count") == 0) {
         snprintf(out, out_cap, "%zu", lmux_buffer_count(app));
     } else if (strncmp(var_name, "buffer_", 7) == 0 && 
