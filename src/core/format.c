@@ -233,7 +233,7 @@ static bool format_expand_recursive(struct lmux_app *app, struct lmux_workspace 
             var_name[var_len] = '\0';
             p++; /* Skip } */
             
-            char var_value[256] = {0};
+            char var_value[1024] = {0};   /* pane->url is up to 1023 */
             const char *val = get_variable_value(app, ws, surf, pane, var_name, var_value, sizeof var_value);
             
             size_t n = strlen(val);
@@ -257,9 +257,11 @@ static bool format_expand_recursive(struct lmux_app *app, struct lmux_workspace 
 static const char *get_variable_value(struct lmux_app *app, struct lmux_workspace *ws,
                                        struct lmux_surface *surf, struct lmux_pane *pane,
                                        const char *var_name, char *buf, size_t cap) {
-    static char static_buf[256];
-    char *out = buf ? buf : static_buf;
-    size_t out_cap = cap ? cap : sizeof static_buf;
+    /* Callers always supply the buffer: a shared static fallback would race
+     * under the dispatcher's read lock, where lookups run concurrently. */
+    if (!buf || cap == 0) return "";
+    char *out = buf;
+    size_t out_cap = cap;
     
     (void)app; /* Unused for now, but kept for future extensibility */
     

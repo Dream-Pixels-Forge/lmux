@@ -16,6 +16,22 @@
 #include <fcntl.h>
 #include <errno.h>
 
+/* Write the whole buffer, retrying short writes and EINTR. Returns 0 on
+ * success, -1 once the peer is gone (callers just stop streaming). */
+static int http_write_all(int fd, const void *buf, size_t len) {
+    const char *p = buf;
+    while (len > 0) {
+        ssize_t w = send(fd, p, len, MSG_NOSIGNAL);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        p += w;
+        len -= (size_t)w;
+    }
+    return 0;
+}
+
 #define HTTP_MAX_CLIENTS 32
 #define HTTP_BUFFER_SIZE 8192
 /* N11 (ISS-0027): SSE streams are long-lived (one thread + one slot
@@ -45,16 +61,6 @@ typedef struct {
     int fd;
     int slot;
 } http_client_arg_t;
-
-static const char *http_get_mime_type(const char *path) {
-    if (strstr(path, ".html")) return "text/html";
-    if (strstr(path, ".css")) return "text/css";
-    if (strstr(path, ".js")) return "application/javascript";
-    if (strstr(path, ".json")) return "application/json";
-    if (strstr(path, ".svg")) return "image/svg+xml";
-    if (strstr(path, ".ico")) return "image/x-icon";
-    return "text/plain";
-}
 
 /* Escape a string for safe inclusion in a JSON string value (ISS-0002:
  * log lines are untrusted input — a quote, backslash or control
@@ -104,8 +110,8 @@ static void http_send_response(int client_fd, int status, const char *content_ty
         status,
         status == 200 ? "OK" : (status == 404 ? "Not Found" : "Internal Server Error"),
         content_type, body_len);
-    write(client_fd, header, strlen(header));
-    if (body) write(client_fd, body, body_len);
+    http_write_all(client_fd, header, strlen(header));
+    if (body) http_write_all(client_fd, body, body_len);
 }
 
 static void http_send_sse_header(int client_fd) {
@@ -115,25 +121,23 @@ static void http_send_sse_header(int client_fd) {
         "Cache-Control: no-cache\r\n"
         "Connection: keep-alive\r\n"
         "\r\n";
-    write(client_fd, header, strlen(header));
+    http_write_all(client_fd, header, strlen(header));
 }
 
 static void http_send_sse_event(int client_fd, const char *data) {
     /* ISS-0025: strip CR — log lines are untrusted input and callers only
      * strip LF, so a bare \r would split/smuggle SSE frames. */
     char buf[HTTP_BUFFER_SIZE];
-    size_t pos = 0;
-    pos += (size_t)snprintf(buf + pos, sizeof buf - pos, "data: ");
-    for (const char *p = data; *p && pos + 3 < sizeof buf; p++) {
-        if (*p == '\r') continue;
+    const size_t limit = sizeof buf - 2;          /* room for the "\n\n" */
+    size_t pos = 6;
+    memcpy(buf, "data: ", 6);
+    for (const char *p = data; *p && pos < limit; p++) {
+        if (*p == '\r' || *p == '\n') continue;  /* one event, one line */
         buf[pos++] = *p;
     }
-    if (pos + 2 < sizeof buf) {
-        buf[pos++] = '\n';
-        buf[pos++] = '\n';
-    }
-    buf[pos] = '\0';
-    write(client_fd, buf, pos);
+    buf[pos++] = '\n';
+    buf[pos++] = '\n';
+    http_write_all(client_fd, buf, pos);
 }
 
 static void *http_client_thread(void *arg) {
@@ -143,14 +147,17 @@ static void *http_client_thread(void *arg) {
     int slot = carg->slot;
     free(carg);
 
+    /* N11: set when this worker holds an SSE slot; released at done:.
+     * Declared before the first `goto done` so it is never read
+     * uninitialized on the early-exit paths. */
+    bool holds_sse_slot = false;
+
     char buffer[HTTP_BUFFER_SIZE];
     ssize_t bytes_read = read(client_fd, buffer, sizeof(buffer) - 1);
     if (bytes_read <= 0) {
         goto done;
     }
     buffer[bytes_read] = '\0';
-    /* N11: set when this worker holds an SSE slot; released at done:. */
-    bool holds_sse_slot = false;
 
     /* Parse request line */
     char method[16], path[256], version[16];
@@ -181,8 +188,8 @@ static void *http_client_thread(void *arg) {
                 "Retry-After: 5\r\n"
                 "Connection: close\r\n\r\n",
                 strlen(body));
-            (void)write(client_fd, hdr, strlen(hdr));
-            (void)write(client_fd, body, strlen(body));
+            http_write_all(client_fd, hdr, strlen(hdr));
+            http_write_all(client_fd, body, strlen(body));
             goto done;
         }
         g_http_server->sse_count++;
@@ -197,7 +204,7 @@ static void *http_client_thread(void *arg) {
         http_send_sse_header(client_fd);
 
         /* Send initial keepalive */
-        write(client_fd, ": keepalive\n\n", 13);
+        http_write_all(client_fd, ": keepalive\n\n", 13);
 
         /* If log file exists, send existing lines first */
         if (log_path && log_path[0]) {
@@ -223,6 +230,7 @@ static void *http_client_thread(void *arg) {
                 long last_pos = ftell(fp);
 
                 extern http_server_t *g_http_server;
+                time_t last_heartbeat = 0;   /* per connection, not shared */
                 while (g_http_server && g_http_server->running) {
                     /* Check for new data */
                     fseek(fp, 0, SEEK_END);
@@ -250,10 +258,9 @@ static void *http_client_thread(void *arg) {
                     }
 
                     /* Send heartbeat every 15 seconds */
-                    static time_t last_heartbeat = 0;
                     time_t now = time(NULL);
                     if (now - last_heartbeat >= 15) {
-                        write(client_fd, ": ping\n\n", 8);
+                        if (http_write_all(client_fd, ": ping\n\n", 8) < 0) break;
                         last_heartbeat = now;
                     }
 
