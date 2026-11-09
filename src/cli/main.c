@@ -117,6 +117,7 @@ static char *send_request(int fd, const char *json_request) {
     char *buf = malloc(cap);
     if (!buf) {
         fprintf(stderr, "lmux: out of memory\n");
+        return NULL;
     }
     ssize_t r;
     bool found_newline = false;
@@ -212,7 +213,7 @@ static char *translate_tmux_command(int argc, char **argv) {
 
     /* new-session [-s name] [-d] [-x width] [-y height]
      * → workspace.create {"title": name} */
-    if (strcmp(tmux_cmd, "new-session") == 0 || strcmp(tmux_cmd, "new-session") == 0) {
+    if (strcmp(tmux_cmd, "new-session") == 0) {
         const char *name = NULL;
         int i = 2;
         /* Check for -s flag */
@@ -422,6 +423,7 @@ static char *translate_tmux_command(int argc, char **argv) {
         } else {
             fprintf(stderr, "lmux tmux: rename-session requires a new name\n");
             free(json);
+            json = NULL;
         }
         return json;
     }
@@ -452,6 +454,9 @@ static char *translate_tmux_command(int argc, char **argv) {
 /* Build a JSON command string from argc/argv.
  * Called with argv starting at the command name.
  * Returns a malloc'd string. */
+/* Socket path this invocation talks to (set in main before dispatch). */
+static const char *g_socket_path = NULL;
+
 static char *build_json_command(int argc, char **argv) {
 
     /* Normalize command name: translate hyphens to underscores */
@@ -480,6 +485,12 @@ static char *build_json_command(int argc, char **argv) {
     }
     for (char *p = cmd_normalized; *p; p++) {
         if (*p == '-') *p = '_';
+    }
+    /* `list-commands` / `list_commands` both target the registry query; the
+     * daemon's canonical name uses a hyphen, so restore it after the hyphen
+     * -> underscore normalisation above. */
+    if (strcmp(cmd_normalized, "list_commands") == 0) {
+        snprintf(cmd_normalized, sizeof cmd_normalized, "list-commands");
     }
     const char *cmd = cmd_normalized;
     size_t args_len = 0;
@@ -605,6 +616,100 @@ static char *build_json_command(int argc, char **argv) {
                 args_len += snprintf(args_buf + args_len, sizeof args_buf - args_len, ",\"workspace_id\":\"%s\"", (json_escape(argv[2], _esc, sizeof _esc), _esc));
             }
         }
+    }
+    /* buffer.set [name] <data> */
+    else if (strcmp(cmd, "buffer.set") == 0) {
+        if (argc >= 2) {
+            /* If first arg doesn't look like a flag, treat as data with auto-name */
+            if (argv[1][0] != '-') {
+                if (argc >= 3) {
+                    /* First arg is name, rest is data */
+                    args_len = snprintf(args_buf, sizeof args_buf,
+                        "\"name\":\"%s\",\"data\":\"%s\"",
+                        (json_escape(argv[1], _esc, sizeof _esc), _esc),
+                        (json_escape(argv[2], _esc, sizeof _esc), _esc));
+                } else {
+                    /* Only data, auto-generate name */
+                    args_len = snprintf(args_buf, sizeof args_buf,
+                        "\"data\":\"%s\"", (json_escape(argv[1], _esc, sizeof _esc), _esc));
+                }
+            }
+        }
+    }
+    /* buffer.get <name> */
+    else if (strcmp(cmd, "buffer.get") == 0 && argc >= 2) {
+        args_len = snprintf(args_buf, sizeof args_buf, "\"name\":\"%s\"", (json_escape(argv[1], _esc, sizeof _esc), _esc));
+    }
+    /* buffer.list */
+    else if (strcmp(cmd, "buffer.list") == 0) {
+        /* args: {} */
+    }
+    /* buffer.delete <name> */
+    else if (strcmp(cmd, "buffer.delete") == 0 && argc >= 2) {
+        args_len = snprintf(args_buf, sizeof args_buf, "\"name\":\"%s\"", (json_escape(argv[1], _esc, sizeof _esc), _esc));
+    }
+    /* buffer.save <name> <path> */
+    else if (strcmp(cmd, "buffer.save") == 0 && argc >= 3) {
+        args_len = snprintf(args_buf, sizeof args_buf,
+            "\"name\":\"%s\",\"path\":\"%s\"",
+            (json_escape(argv[1], _esc, sizeof _esc), _esc),
+            (json_escape(argv[2], _esc, sizeof _esc), _esc));
+    }
+    /* buffer.load <name> <path> */
+    else if (strcmp(cmd, "buffer.load") == 0 && argc >= 3) {
+        args_len = snprintf(args_buf, sizeof args_buf,
+            "\"name\":\"%s\",\"path\":\"%s\"",
+            (json_escape(argv[1], _esc, sizeof _esc), _esc),
+            (json_escape(argv[2], _esc, sizeof _esc), _esc));
+    }
+    /* buffer.capture_pane [surface_id] [workspace_id] <buffer_name> [-S start] [-E end] */
+    else if (strcmp(cmd, "buffer.capture_pane") == 0) {
+        const char *buf_name = NULL;
+        const char *start_line = "0";
+        const char *end_line = "-1";
+        const char *surface_id = NULL;
+        const char *workspace_id = NULL;
+        
+        for (int i = 1; i < argc; i++) {
+            if (strcmp(argv[i], "-S") == 0 && i + 1 < argc) {
+                start_line = argv[++i];
+            } else if (strcmp(argv[i], "-E") == 0 && i + 1 < argc) {
+                end_line = argv[++i];
+            } else if (surface_id == NULL && workspace_id == NULL) {
+                /* First positional could be surface_id or buffer_name */
+                /* We'll use a simple heuristic: if more args follow, it's surface_id */
+                if (i + 1 < argc && argv[i + 1][0] != '-') {
+                    surface_id = argv[i];
+                } else {
+                    buf_name = argv[i];
+                }
+            } else if (workspace_id == NULL) {
+                workspace_id = argv[i];
+            } else if (buf_name == NULL) {
+                buf_name = argv[i];
+            }
+        }
+        
+        if (buf_name) {
+            args_len = snprintf(args_buf, sizeof args_buf, "\"buffer_name\":\"%s\"", (json_escape(buf_name, _esc, sizeof _esc), _esc));
+            if (surface_id) {
+                args_len += snprintf(args_buf + args_len, sizeof args_buf - args_len, ",\"surface_id\":\"%s\"", (json_escape(surface_id, _esc, sizeof _esc), _esc));
+            }
+            if (workspace_id) {
+                args_len += snprintf(args_buf + args_len, sizeof args_buf - args_len, ",\"workspace_id\":\"%s\"", (json_escape(workspace_id, _esc, sizeof _esc), _esc));
+            }
+            args_len += snprintf(args_buf + args_len, sizeof args_buf - args_len, ",\"start_line\":\"%s\",\"end_line\":\"%s\"", start_line, end_line);
+        }
+    }
+    /* buffer.limit [limit] */
+    else if (strcmp(cmd, "buffer.limit") == 0) {
+        if (argc >= 2) {
+            args_len = snprintf(args_buf, sizeof args_buf, "\"limit\":\"%s\"", (json_escape(argv[1], _esc, sizeof _esc), _esc));
+        }
+    }
+    /* buffer.count */
+    else if (strcmp(cmd, "buffer.count") == 0) {
+        /* args: {} */
     }
     /* capabilities */
     else if (strcmp(cmd, "capabilities") == 0) {
@@ -732,6 +837,17 @@ static char *build_json_command(int argc, char **argv) {
         }
         if (argc >= 4) {
             args_len += snprintf(args_buf + args_len, sizeof args_buf - args_len, ",\"workspace_id\":\"%s\"", (json_escape(argv[3], _esc, sizeof _esc), _esc));
+        }
+    }
+    /* notification.ring.add <pane_id> [reason] / notification.ring.clear <pane_id>
+     * (pane_id defaults to $LMUX_PANE_ID inside a pane, see below) */
+    else if ((strcmp(cmd, "notification.ring.add") == 0 || strcmp(cmd, "notification.ring") == 0 ||
+              strcmp(cmd, "notification.ring.clear") == 0) && argc >= 2) {
+        args_len = snprintf(args_buf, sizeof args_buf, "\"pane_id\":\"%s\"",
+                            (json_escape(argv[1], _esc, sizeof _esc), _esc));
+        if (argc >= 3 && strcmp(cmd, "notification.ring.clear") != 0) {
+            args_len += snprintf(args_buf + args_len, sizeof args_buf - args_len,
+                                 ",\"reason\":\"%s\"", (json_escape(argv[2], _esc, sizeof _esc), _esc));
         }
     }
     /* notification.create <text> [waiting] [workspace_id] */
@@ -1030,6 +1146,60 @@ static char *build_json_command(int argc, char **argv) {
     else if (strcmp(cmd, "hooks") == 0) { cmd = "hooks.list"; }
     else if (strcmp(cmd, "naming") == 0) { cmd = "naming.suggest"; }
 
+    /* send-keys <keys...>: tmux-style key list joined by spaces; the key
+     * names Enter/C-m, Tab, Space, Escape and C-c are translated. Sends to
+     * surface.send_text (and so to $LMUX_PANE_ID when run inside a pane). */
+    if (strcmp(cmd, "send_keys") == 0 && argc >= 2) {
+        char keys[2048];
+        size_t kl = 0;
+        keys[0] = 0;
+        for (int ki = 1; ki < argc; ki++) {
+            const char *a = argv[ki];
+            const char *lit = NULL;
+            bool named = true;
+            if (strcmp(a, "Enter") == 0 || strcmp(a, "C-m") == 0) lit = "\r";
+            else if (strcmp(a, "Tab") == 0) lit = "\t";
+            else if (strcmp(a, "Space") == 0) lit = " ";
+            else if (strcmp(a, "Escape") == 0) lit = "\x1b";
+            else if (strcmp(a, "C-c") == 0) lit = "\x03";
+            else { lit = a; named = false; }
+            /* Literal words are space-separated, like tmux joining args. */
+            if (!named && ki > 1 && kl > 0 && keys[kl - 1] != '\r' &&
+                keys[kl - 1] != '\t' && kl + 1 < sizeof keys)
+                keys[kl++] = ' ';
+            size_t ll = strlen(lit);
+            if (kl + ll >= sizeof keys) break;
+            memcpy(keys + kl, lit, ll);
+            kl += ll;
+            keys[kl] = 0;
+        }
+        cmd = "surface.send_text";
+        args_len = snprintf(args_buf, sizeof args_buf, "\"text\":\"%s\"",
+                            (json_escape(keys, _esc, sizeof _esc), _esc));
+    }
+
+    /* Inside a pane, target that pane by default (like tmux's $TMUX_PANE):
+     * the daemon exports LMUX_PANE_ID to every pane child. Only when no
+     * explicit surface/pane was given and we talk to that same daemon. */
+    if (strcmp(cmd, "read_screen") == 0 || strcmp(cmd, "capture_pane") == 0 ||
+        strcmp(cmd, "read-screen") == 0 || strcmp(cmd, "surface.send_text") == 0 ||
+        strcmp(cmd, "surface.split") == 0 ||
+        /* An agent's alert belongs to the pane it runs in (cmux-style). */
+        strcmp(cmd, "notification.create") == 0 ||
+        strcmp(cmd, "notification.ring.add") == 0 || strcmp(cmd, "notification.ring") == 0 ||
+        strcmp(cmd, "notification.ring.clear") == 0) {
+        const char *env_pane = getenv("LMUX_PANE_ID");
+        const char *env_sock = getenv("LMUX_SOCKET_PATH");
+        bool same_daemon = env_sock && (!g_socket_path || strcmp(env_sock, g_socket_path) == 0);
+        if (env_pane && env_pane[0] && same_daemon &&
+            !strstr(args_buf, "\"surface_id\"") && !strstr(args_buf, "\"pane_id\"") &&
+            args_len + 64 < sizeof args_buf) {
+            args_len += snprintf(args_buf + args_len, sizeof args_buf - args_len,
+                                 "%s\"pane_id\":\"%s\"", args_len ? "," : "",
+                                 (json_escape(env_pane, _esc, sizeof _esc), _esc));
+        }
+    }
+
     char *json = malloc(8192);
     if (args_len > 0) {
         snprintf(json, 8192, "{\"cmd\":\"%s\",\"args\":{%s}}", cmd, args_buf);
@@ -1282,6 +1452,20 @@ static int exit_code_for_response(const char *response) {
     return 1;
 }
 
+/* Print a JSON string body (cursor just past the opening quote) up to the
+ * closing quote, unescaping \" \\ \n \t. */
+static void print_json_str(const char *s) {
+    while (*s && *s != '"') {
+        if (*s == '\\' && s[1]) {
+            s++;
+            putchar(*s == 'n' ? '\n' : *s == 't' ? '\t' : *s);
+            s++;
+            continue;
+        }
+        putchar(*s++);
+    }
+}
+
 static void print_response(const char *response, bool raw_json) {
     if (!response) return;
 
@@ -1395,18 +1579,18 @@ static void print_response(const char *response, bool raw_json) {
                 const char *w = strstr(arr, "\"waiting\":true");
                 const char *txt = strstr(arr, "\"text\":\"");
                 printf("  ");
+                /* Skip the full `"key":"` prefix (strlen, not a hand count:
+                 * "kind"/"text" used += 7 for an 8-char prefix and printed
+                 * nothing), and print through \" escapes. */
                 if (k && k < obj_end) {
-                    k += 7;
-                    while (*k && *k != '"') putchar(*k++);
+                    print_json_str(k + strlen("\"kind\":\""));
                     printf(" ");
                 }
                 if (t && t < obj_end) {
-                    t += 9;
-                    while (*t && *t != '"') putchar(*t++);
+                    print_json_str(t + strlen("\"title\":\""));
                 }
                 if (txt && txt < obj_end) {
-                    txt += 7;
-                    while (*txt && *txt != '"') putchar(*txt++);
+                    print_json_str(txt + strlen("\"text\":\""));
                 }
                 if (i && i < obj_end) {
                     i += 5;
@@ -1562,83 +1746,15 @@ static void print_usage(void) {
     printf("  lmux help                         Show this help\n");
     printf("  lmux version                      Show version\n\n");
     printf("Commands:\n");
-    printf("  workspace.create <title>          Create a workspace\n");
-    printf("  workspace.list                    List workspaces\n");
-    printf("  workspace.close <id>              Close a workspace\n");
-    printf("  workspace.select <id>             Focus a workspace\n");
-    printf("  workspace.current                 Show focused workspace\n");
-    printf("  ssh <user@host> [port]             Create an SSH-backed workspace\n");
-    printf("  workspace.rename <id> <title>     Rename a workspace\n");
-    printf("  surface.create [ws_id] [title]    Create a surface\n");
-    printf("  surface.list                      List surfaces\n");
-    printf("  surface.close <id> [ws_id]        Close a surface\n");
-    printf("  notification.clear                       Clear all notifications\n");
-    printf("  notification.mark-read [seq]             Mark notification as read\n");
-    printf("  surface.focus <id> [ws_id]               Focus a surface\n");
-    printf("  surface.send-key <key> [s_id] [ws]       Send a single key to a surface\n");
-    printf("  workspace.reorder <from> <to>            Reorder workspace\n");
-    printf("  snapshot.save [path]               Save workspace state to file\n");
-    printf("  snapshot.load [path]               Load workspace state from file\n");
-    printf("  surface.split <dir> [s_id] [ws]   Split pane (dir: h|v)\n");
-    printf("  pane.list                         List panes\n");
-    printf("  pane.focus <id> [ws_id]           Focus a pane\n");
-    printf("  surface.send_text <text>          Send text to surface\n");
-    printf("  notification.create <text>        Send notification\n");
-    printf("  notification.list                 List notifications\n");
-    printf("  notification.ring <pane_id> [reason] Add visual ring to pane\n");
-    printf("  notification.ring.clear <pane_id>  Clear ring from pane\n");
-    printf("  notification.ring.list             List active rings\n");
-    printf("  notification.hook <event> [filter] [redirect] Add notification hook\n");
-  printf("  notification.hook.remove <event>  Remove notification hook\n");
-  printf("  notification.hook.list             List notification hooks\n");
-  printf("  window.create <title>              Create new window\n");
-  printf("  window.list                        List windows\n");
-  printf("  window.close <id>                  Close window\n");
-  printf("  window.focus <id>                  Focus window\n");
-  printf("  window.move-workspace <win_id> <ws_id> Move workspace to window\n");
-  printf("  ssh.session.create <host> [user] [key] Create SSH session\n");
-  printf("  ssh.session.list                     List SSH sessions\n");
-  printf("  ssh.session.kill <id>                Kill SSH session\n");
-  printf("  ssh.session.save [path]              Save SSH sessions\n");
-  printf("  ssh.session.restore [path]           Restore SSH sessions\n");
-  printf("  feed.panel.create <title> [filter]   Create feed panel\n");
-  printf("  feed.panel.list                      List feed panels\n");
-  printf("  feed.panel.close <id>                Close feed panel\n");
-  printf("  feed.entry.add <panel_id> <text>     Add entry to feed\n");
-  printf("  feed.entry.list <panel_id>           List feed entries\n");
-  printf("  feed.panel.clear <panel_id>          Clear feed panel\n");
-    printf("  ping                              Check connectivity\n");
-    printf("  display-message <message>          Echo a message back from the daemon\n");
-    printf("  tree                              Print workspace/surface/pane hierarchy\n");
-    printf("  pane.resize <dir> [cols] [rows] [s_id] [ws]  Resize a pane\n");
-    printf("  pane.focus-dir <dx> [dy]           Move focus in a direction\n");
-    printf("  last-pane                         Focus the last active pane\n");
-  printf("  workspace.refresh [ws_id]           Refresh workspace metadata\n");
-  printf("  read-screen [s_id] [ws]            Read terminal screen content\n");
-  printf("  capture-pane [s_id] [ws]           Alias for read-screen\n");
-  printf("  session.save                       Save session to disk\n");
-  printf("  session.restore                    Restore session from disk\n");
-  printf("  config.get [key]                   Get config value(s)\n");
-  printf("  config.set <key> <value>           Set config value\n");
-  printf("  workspace.group.create <name>       Create a workspace group\n");
-  printf("  workspace.group.list               List workspace groups\n");
-  printf("  workspace.group.add <name> <ws_id> Add workspace to group\n");
-  printf("  workspace.group.remove <name> <ws_id> Remove workspace from group\n");
-    printf("  agent.spawn <name> <command> [ws_id] Spawn an agent process\n");
-    printf("  agent.list                         List running agents\n");
-    printf("  agent.stop <id>                    Stop an agent process\n");
-    printf("  agent.hibernate <id>               Hibernate agent (kill to save RAM)\n");
-    printf("  agent.resume <id>                  Resume hibernated agent\n");
-    printf("  agent.hibernation.status           Show hibernation status\n");
-    printf("  ssh.list                           List active SSH sessions\n");
-    printf("  ssh.connect <host> [port] [user]   Connect to remote host via SSH\n");
-    printf("  ssh.disconnect <session_id>        Disconnect an SSH session\n");
-    printf("  hooks.list                         List registered hook scripts\n");
-    printf("  hooks.add <event> <script>         Register a hook script for an event\n");
-    printf("  hooks.remove <event>                Unregister a hook script\n");
-    printf("  naming.suggest <dir>               Get workspace name suggestions for a directory\n");
-    printf("  focus.history [count]              Show recent focus history\n");
-    printf("  capabilities                       Print server capabilities\n");
+
+    size_t count = 0;
+    const lmux_cmd_entry *entries = lmux_registry_all(&count);
+    for (size_t i = 0; i < count; i++) {
+        printf("  %-35s %s\n", entries[i].name, entries[i].summary);
+    }
+
+    printf("\n");
+    printf("  list-commands                      List all available commands\n");
     printf("  health.live                        Check if daemon is alive\n");
     printf("  health.ready                       Check if daemon is ready\n");
     printf("  metrics                            Show server metrics\n");
@@ -1711,9 +1827,32 @@ int main(int argc, char **argv) {
         socket_path = default_path;
     }
 
+    g_socket_path = socket_path;
+
     /* Remaining args = command. */
     argc -= i;
     argv += i;
+
+    /* Check for command-specific help */
+    if (argc >= 2 && (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0)) {
+        size_t count = 0;
+        const lmux_cmd_entry *entries = lmux_registry_all(&count);
+        int found = 0;
+        for (size_t i = 0; i < count; i++) {
+            if (strcmp(entries[i].name, argv[0]) == 0) {
+                printf("lmux %s — %s\n\n", entries[i].name, entries[i].summary);
+                printf("%s\n", entries[i].help);
+                found = 1;
+                break;
+            }
+        }
+        if (!found) {
+            fprintf(stderr, "lmux: unknown command: %s\n", argv[0]);
+            fprintf(stderr, "Try 'lmux help' for a list of commands.\n");
+            return 1;
+        }
+        return 0;
+    }
 
     /* Control mode (tmux -C equivalent) handles its own dispatch. */
     if (control_mode) {
@@ -1805,8 +1944,9 @@ int main(int argc, char **argv) {
         /* Main loop: check both app state and async exit flag. */
         while (lmux_app_is_running(app) && !daemon_should_exit) {
             lmux_app_tick(app);
-            struct timespec ts = {0, 16000000L}; /* 16ms = ~60Hz */
-            nanosleep(&ts, NULL);
+            /* Sleep until a pane pty / attached view has data (<=16ms), so
+             * relayed keystrokes are not delayed by a fixed tick. */
+            lmux_app_wait(app, 16);
         }
         /* Graceful shutdown: save snapshot, stop server, cleanup. */
         if (daemon_app_global) {

@@ -115,7 +115,10 @@ lmux is a native Linux terminal emulator for running AI coding agents in paralle
 - `workspace.focus` - Focus workspace by ID
 - `surface.create` - Create tab in workspace
 - `surface.list` - List surfaces in workspace
-- `pane.split` - Split current pane
+- `surface.split` - Split a pane (`pane_id`, `direction`)
+- `pane.attach` - Get a view pty for a pane (fd via SCM_RIGHTS)
+- `pane.close` - Close a pane
+- `events` - Stream events (`after_seq` to resume)
 - `config.get` - Get config value
 - `config.set` - Set config value
 - `agent.spawn` - Spawn agent process
@@ -128,6 +131,46 @@ lmux is a native Linux terminal emulator for running AI coding agents in paralle
 - `config.save` - Save workspace config
 - `workspace.groups` - Workspace group management
 - `tiling.layout` - Set tiling layout
+
+## Terminal Ownership (daemon-owned panes)
+
+The daemon is the single owner of every terminal. The GUI never spawns a
+shell while the daemon is reachable; it renders the daemon's panes.
+
+- **Creation.** GUI tabs and splits go through `surface.create` /
+  `surface.split` (with `pane_id`) and are keyed by the ids the daemon
+  returns. `pane.list` reports `split_from` / `split_dir`, so a GUI that
+  attaches to an existing workspace rebuilds the same split tree.
+- **Attach (fd passing).** `pane.attach {pane_id}` replies with JSON and
+  passes a pty master over the Unix socket as `SCM_RIGHTS` ancillary data.
+  The GUI wraps it with `Vte.Pty.new_foreign_sync`. The fd is not the pane's
+  real pty: the daemon opens a second, raw-mode *view* pty per attach and
+  relays it. Output read from the real pty goes to the scrollback (what
+  `read-screen` renders), the OSC 133 parser and the view; bytes typed in
+  the view are written to the real pty; a window size VTE sets on the view
+  is applied to the real pty. Keeping the daemon the only reader of the
+  real pty is what lets `read-screen` and the GUI see the same stream (two
+  readers of one pty master would each get part of the output). On attach
+  the scrollback tail is replayed into the view. The relay never blocks the
+  daemon: output the view has not accepted is queued (bounded at 1 MiB) and
+  the real pty is not read while that queue is non-empty (backpressure).
+  The daemon loop waits in `poll()` on all pty and view fds
+  (`lmux_app_wait`), so relayed keystrokes are not delayed by a fixed tick.
+  Streaming output over the JSON socket was the alternative; fd passing
+  keeps VTE on a real tty (native resize, no base64 framing).
+- **Environment.** Pane children get `LMUX_SOCKET_PATH`, `LMUX_WORKSPACE_ID`,
+  `LMUX_SURFACE_ID` and `LMUX_PANE_ID` (and `TERM=xterm-256color` when the
+  daemon has none). Inside a pane, `lmux read-screen`, `lmux send-keys`,
+  `surface.send_text` and `surface.split` default to `$LMUX_PANE_ID`.
+- **Events.** `surface.created`, `surface.closed`, `pane.created` (with
+  `target_pane_id`, `direction`), `pane.closed` and `pane.exited` are
+  streamed to every `events` subscriber; each subscriber reads the replay
+  ring through its own cursor (`after_seq` to resume), so the GUI and a CLI
+  `lmux events` both see everything. The GUI applies them idempotently, so
+  `lmux surface.split v` from a shell splits the visible window. A shell
+  exit closes its pane unless `remain-on-exit` is set.
+- **Offline fallback.** With no daemon (and autostart disabled or failed)
+  the GUI falls back to local VTE shells with local ids.
 
 ## Tiling Window Manager
 

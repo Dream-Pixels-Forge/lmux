@@ -176,6 +176,35 @@ class TestPing(unittest.TestCase):
             self.assertIn(cmd, caps, f"missing capability: {cmd}")
 
 
+class TestListCommands(unittest.TestCase):
+    """The `list-commands` command (M1a command registry)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.c = _ensure_daemon()
+
+    def test_list_commands_returns_table(self):
+        resp = self.c.send("list-commands", {})
+        self.assertTrue(resp.get("ok"), resp)
+        commands = resp.get("result", {}).get("commands", [])
+        self.assertIsInstance(commands, list)
+        self.assertGreater(len(commands), 0)
+
+    def test_list_commands_contains_core_entries(self):
+        commands = self.c.send("list-commands", {}).get("result", {}).get(
+            "commands", [])
+        names = [c.get("name") for c in commands]
+        self.assertIn("workspace.create", names)
+        self.assertIn("list-commands", names)
+
+    def test_list_commands_entries_have_summaries(self):
+        commands = self.c.send("list-commands", {}).get("result", {}).get(
+            "commands", [])
+        for c in commands:
+            self.assertIn("name", c)
+            self.assertIn("summary", c)
+
+
 # ====================================================================
 # Workspace lifecycle
 # ====================================================================
@@ -1606,8 +1635,11 @@ class TestPtyDeferralOnRestore(unittest.TestCase):
             deadline = time.time() + 30
             while time.time() < deadline and client is None:
                 time.sleep(0.25)
+                # LmuxClient() connects lazily: probe with a real ping.
                 try:
-                    client = LmuxClient(sock)
+                    probe = LmuxClient(sock)
+                    if probe.send("ping", {}).get("ok"):
+                        client = probe
                 except Exception:  # noqa: BLE001 - not up yet
                     client = None
             self.assertIsNotNone(client, "daemon did not come up")
@@ -3112,28 +3144,32 @@ class TestSnapshotLoadConfinement(unittest.TestCase):
         self.assertEqual(resp["result"]["path"], saved)
 
 
-class TestDependencyGateTargetsMaster(unittest.TestCase):
-    """#13: trivy.yml was already fail-closed but triggered on `main` while the
-    repo's default branch is `master`, so the gate had never run."""
+class TestDependencyGateTargetsDefaultBranch(unittest.TestCase):
+    """#13: trivy.yml was fail-closed but triggered on a branch that didn't
+    exist, so the gate never ran. The default branch is now `main` (renamed
+    from `master`); every workflow trigger must follow it."""
+
+    DEFAULT_BRANCH = "main"
+    STALE_BRANCH = "master"
 
     @classmethod
     def setUpClass(cls):
         cls.trivy = Path(__file__).parent.parent / ".github" / "workflows" / "trivy.yml"
 
-    def test_no_workflow_targets_a_nonexistent_main_branch(self):
+    def test_no_workflow_targets_the_stale_branch(self):
         workflows = list(self.trivy.parent.glob("*.yml"))
         offenders = [w.name for w in workflows
-                     if "branches: [main]" in w.read_text()]
+                     if f"branches: [{self.STALE_BRANCH}]" in w.read_text()]
         self.assertEqual(offenders, [],
-                         f"these workflows target 'main' but the default "
-                         f"branch is 'master': {offenders}")
+                         f"these workflows target '{self.STALE_BRANCH}' but the "
+                         f"default branch is '{self.DEFAULT_BRANCH}': {offenders}")
 
     def test_dependency_gate_is_fail_closed(self):
         text = self.trivy.read_text()
         self.assertIn("exit-code: 1", text,
                       "the gate must stay fail-closed")
-        self.assertIn("branches: [master]", text,
-                      "the gate must trigger on master")
+        self.assertIn(f"branches: [{self.DEFAULT_BRANCH}]", text,
+                      f"the gate must trigger on {self.DEFAULT_BRANCH}")
 
 
 # ====================================================================
@@ -3164,6 +3200,22 @@ class TestConfigPersistence(unittest.TestCase):
                             "config.json should be written after a group create")
             self.assertIn(name, cfg_file.read_text(),
                           "created group should be present in config.json")
+        finally:
+            _shutdown_isolated(daemon, home)
+
+    def test_group_list_reports_member_workspace_ids(self):
+        """The GUI needs each group's member IDs, not just a count."""
+        client, daemon, home = _isolated_client()
+        try:
+            name = _unique("members")
+            ws = client.send("workspace.create", {"title": "g"})["result"]["id"]
+            client.send("workspace.group.create", {"name": name})
+            client.send("workspace.group.add",
+                        {"name": name, "workspace_id": str(ws)})
+            groups = client.send("workspace.group.list")["result"]["groups"]
+            g = next(g for g in groups if g["name"] == name)
+            self.assertEqual(g["workspace_count"], 1)
+            self.assertEqual(g["workspace_ids"], [ws])
         finally:
             _shutdown_isolated(daemon, home)
 
@@ -3493,6 +3545,114 @@ class TestNotificationWorkspaceAssoc(unittest.TestCase):
         self.assertGreater(len(notifs), 0)
         self.assertIn("workspace_id", notifs[0])
         self.c.workspace_close(ws["id"])
+
+
+class TestNotificationAttribution(unittest.TestCase):
+    """cmux-style agent alerts: a notification raised from inside a pane is
+    tied to that pane and its workspace, the sidebar can see which workspace
+    needs attention, and opening the workspace clears it.
+
+    Before: the CLI sent no workspace/pane, workspace.list carried no unread
+    or waiting state, and `notification.ring.add <pane>` lost its argument,
+    so an agent's alert never reached the GUI.
+    """
+
+    def setUp(self):
+        self.c, self.daemon, self.home = _isolated_client()
+        self.cli = Path(__file__).parent.parent / "build" / "lmux"
+
+    def tearDown(self):
+        _shutdown_isolated(self.daemon, self.home)
+
+    def _ws_with_pane(self, title):
+        ws = self.c.workspace_create(_unique(title))["id"]
+        panes = self.c.assert_ok("pane.list", {"workspace_id": str(ws)})["panes"]
+        return ws, panes[0]["id"]
+
+    def _ws_state(self, ws_id):
+        wss = self.c.assert_ok("workspace.list")["workspaces"]
+        return next(w for w in wss if w["id"] == ws_id)
+
+    def _run_in_pane(self, pane_id, ws_id, *args):
+        env = dict(os.environ)
+        env.update({"LMUX_SOCKET_PATH": self.c.socket_path,
+                    "LMUX_PANE_ID": str(pane_id),
+                    "LMUX_WORKSPACE_ID": str(ws_id)})
+        return subprocess.run([str(self.cli), *args], env=env,
+                              capture_output=True, text=True, timeout=15)
+
+    def test_pane_id_resolves_owning_workspace(self):
+        ws, pane = self._ws_with_pane("attr")
+        self.c.assert_ok("notification.create",
+                         {"text": "needs input", "pane_id": str(pane)})
+        n = self.c.notification_list()[-1]
+        self.assertEqual(n["workspace_id"], str(ws))
+        self.assertEqual(n["pane_id"], pane)
+
+    def test_workspace_list_reports_unread_waiting_and_last_message(self):
+        ws, pane = self._ws_with_pane("unread")
+        before = self._ws_state(ws)
+        self.assertFalse(before["unread"])
+        self.assertFalse(before["waiting"])
+        self.c.assert_ok("notification.create", {
+            "text": "Agent \"done\"", "pane_id": str(pane), "waiting": True})
+        after = self._ws_state(ws)
+        self.assertTrue(after["unread"])
+        self.assertTrue(after["waiting"])
+        self.assertEqual(after["last_notify"], 'Agent "done"')
+
+    def test_mark_read_by_workspace_clears_only_that_workspace(self):
+        ws_a, pane_a = self._ws_with_pane("a")
+        ws_b, pane_b = self._ws_with_pane("b")
+        for p in (pane_a, pane_b):
+            self.c.assert_ok("notification.create",
+                             {"text": "wait", "pane_id": str(p), "waiting": True})
+        self.c.assert_ok("notification.mark_read", {"workspace_id": str(ws_a)})
+        a, b = self._ws_state(ws_a), self._ws_state(ws_b)
+        self.assertFalse(a["unread"])
+        self.assertFalse(a["waiting"], "A's own waits are cleared")
+        self.assertTrue(b["unread"], "B is untouched")
+        self.assertTrue(b["waiting"], "B's wait must not leak into A or vice versa")
+
+    def test_created_event_carries_workspace_and_pane(self):
+        ws, pane = self._ws_with_pane("evt")
+        tap = _EventTap(self.c.socket_path)
+        try:
+            self.c.assert_ok("notification.create",
+                             {"text": "hi", "pane_id": str(pane)})
+            data = tap.wait_for("notification.created")
+        finally:
+            tap.close()
+        self.assertIsNotNone(data, "no notification.created event")
+        self.assertEqual(str(data.get("workspace_id")), str(ws))
+        self.assertEqual(data.get("pane_id"), pane)
+
+    def test_cli_inside_pane_attributes_notification(self):
+        ws, pane = self._ws_with_pane("cli")
+        r = self._run_in_pane(pane, ws, "notification.create", "from agent")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        n = self.c.notification_list()[-1]
+        self.assertEqual(n["text"], "from agent")
+        self.assertEqual(n["workspace_id"], str(ws))
+        self.assertEqual(n["pane_id"], pane)
+
+    def test_cli_ring_add_takes_pane_argument_and_env_default(self):
+        ws, pane = self._ws_with_pane("ring")
+        r = self._run_in_pane(pane, ws, "notification.ring.add", str(pane), "waiting")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.c.assert_ok("notification.ring.clear", {"pane_id": str(pane)})
+        r = self._run_in_pane(pane, ws, "notification.ring.add")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        rings = self.c.assert_ok("notification.ring.list")
+        self.assertEqual(rings["count"], 1)
+
+    def test_cli_notification_list_prints_messages(self):
+        ws, pane = self._ws_with_pane("print")
+        self.c.assert_ok("notification.create",
+                         {"text": "visible text", "pane_id": str(pane)})
+        r = self._run_in_pane(pane, ws, "notification.list")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("visible text", r.stdout)
 
 
 # ====================================================================
@@ -6060,6 +6220,23 @@ class TestPackagingEntryPoints(unittest.TestCase):
             errors, [],
             "flatpak AppStream metainfo fails validation:\n"
             + "\n".join(errors))
+    def test_flatpak_manifest_compiles_every_core_source(self):
+        """The flatpak manifest lists each core .c file by hand. When
+        src/core/registry.c was added, the manifest wasn't updated and the
+        flatpak CI job failed to link (undefined lmux_registry_all)."""
+        root = Path(__file__).parent.parent
+        manifest = (root / "packaging" / "io.github.lmux.lmux.yml").read_text()
+        missing = []
+        for src in sorted((root / "src" / "core").glob("*.c")):
+            obj = src.stem + ".o"
+            if f"src/core/{src.name}" not in manifest:
+                missing.append(f"{src.name} (not compiled)")
+            elif not re.search(rf"^\s*- ar rcs .*\b{re.escape(obj)}\b",
+                               manifest, re.MULTILINE):
+                missing.append(f"{obj} (not archived)")
+        self.assertEqual(missing, [],
+                         f"flatpak manifest is missing core sources: {missing}")
+
     def test_make_flatpak_target_references_existing_manifest(self):
         """`make flatpak` must point at a manifest that exists.
 
@@ -6514,8 +6691,12 @@ class TestHarnessPtydTeardown(unittest.TestCase):
                 deadline = time.time() + 60
                 while time.time() < deadline and client is None:
                     time.sleep(0.25)
+                    # LmuxClient() connects lazily, so constructing it proves
+                    # nothing: probe with a real ping until the daemon binds.
                     try:
-                        client = LmuxClient(sock)
+                        probe = LmuxClient(sock, timeout=5.0)
+                        if probe.send("ping", {}).get("ok"):
+                            client = probe
                     except Exception:  # noqa: BLE001 - not up yet
                         client = None
                 if client is not None:
@@ -6592,6 +6773,380 @@ class TestVersionParity(unittest.TestCase):
             len(distinct), 1,
             "version sites disagree:\n" + "\n".join(
                 f"  {name}: {ver}" for name, ver in sites.items()))
+
+
+# ====================================================================
+# Daemon-owned terminals: the GUI attaches to daemon panes (fd passing),
+# children get LMUX_* env, CLI targets its own pane, events fan out.
+# ====================================================================
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_LMUX_BIN = _REPO_ROOT / "build" / "lmux"
+
+
+def _pane_attach(sock_path, pane_id, ws_id=None):
+    """Send pane.attach and return (response, fd-or-None)."""
+    args = {"pane_id": str(pane_id)}
+    if ws_id is not None:
+        args["workspace_id"] = str(ws_id)
+    s = socket.socket(socket.AF_UNIX)
+    s.settimeout(10)
+    s.connect(sock_path)
+    try:
+        s.sendall((json.dumps({"cmd": "pane.attach", "args": args}) + "\n").encode())
+        data, fds, _flags, _addr = socket.recv_fds(s, 65536, 1)
+        chunks = [data]
+        while True:
+            try:
+                more = s.recv(65536)
+            except socket.timeout:
+                break
+            if not more:
+                break
+            chunks.append(more)
+    finally:
+        s.close()
+    resp = json.loads(b"".join(chunks).decode().strip())
+    return resp, (fds[0] if fds else None)
+
+
+def _read_fd_until(fd, needle, timeout=5.0):
+    """Read from fd until needle (bytes) appears; return everything read."""
+    import select
+    buf = b""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        r, _, _ = select.select([fd], [], [], 0.1)
+        if r:
+            try:
+                chunk = os.read(fd, 65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf += chunk
+            if needle in buf:
+                return buf
+    return buf
+
+
+def _screen_until(c, args, needle, timeout=5.0):
+    text = ""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        resp = c.send("read-screen", args)
+        text = resp.get("result", {}).get("text", "") if resp.get("ok") else ""
+        if needle in text:
+            return text
+        time.sleep(0.1)
+    return text
+
+
+class _EventTap:
+    """Background events subscriber collecting decoded event dicts."""
+
+    def __init__(self, sock_path):
+        self.events = []
+        self._lock = threading.Lock()
+        self._sock = socket.socket(socket.AF_UNIX)
+        self._sock.settimeout(0.2)
+        self._sock.connect(sock_path)
+        self._sock.sendall(b'{"cmd":"events","args":{}}\n')
+        self._stop = threading.Event()
+        self._ready = threading.Event()
+        self._t = threading.Thread(target=self._run, daemon=True)
+        self._t.start()
+        self._ready.wait(5)
+
+    def _run(self):
+        buf = b""
+        while not self._stop.is_set():
+            try:
+                data = self._sock.recv(65536)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            if not data:
+                break
+            buf += data
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                try:
+                    evt = json.loads(line)
+                except ValueError:
+                    continue
+                if evt.get("type") == "ack":
+                    self._ready.set()
+                with self._lock:
+                    self.events.append(evt)
+
+    def wait_for(self, name, pred=lambda d: True, timeout=5.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with self._lock:
+                for e in self.events:
+                    if e.get("name") == name and pred(e.get("data") or {}):
+                        return e.get("data") or {}
+            time.sleep(0.05)
+        return None
+
+    def close(self):
+        self._stop.set()
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+
+
+class TestGuiDaemonClientBackToBack(unittest.TestCase):
+    """gui/daemon_client.DaemonClient vs the one-request-per-connection server.
+
+    The daemon answers one request per connection and then closes it. The
+    client used to keep the socket for the next request, so a quick second
+    call could be written into a closed connection and come back as
+    "empty response" — which made the GUI fall back to local shells at
+    random (flaky tests/test_gui_daemon_terminals.py).
+    """
+
+    # Runs on a private daemon: ~250 rapid requests on the shared one used
+    # up its 1000 req/60s per-UID budget on fast CI runners, so unrelated
+    # tests later in the suite failed with rate_limited.
+    @classmethod
+    def setUpClass(cls):
+        cls.client, cls.daemon, cls.home = _isolated_client()
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "gui"))
+        from daemon_client import DaemonClient
+        cls.dc = DaemonClient(cls.client.socket_path)
+
+    @classmethod
+    def tearDownClass(cls):
+        _shutdown_isolated(cls.daemon, cls.home)
+
+    def test_back_to_back_requests_all_succeed(self):
+        failures = []
+        for i in range(200):
+            cmd = "surface.list" if i % 2 else "pane.list"
+            resp = self.dc.send(cmd, {})
+            if not resp.get("ok"):
+                failures.append((i, cmd, resp.get("error")))
+        self.assertEqual(failures, [])
+
+    def test_large_response_is_read_completely(self):
+        ws = self.client.workspace_create(_unique("big-resp"))
+        for _ in range(30):
+            self.client.assert_ok("surface.create", {"workspace_id": str(ws["id"])})
+        for _ in range(20):
+            resp = self.dc.send("pane.list", {})
+            self.assertTrue(resp.get("ok"), resp.get("error"))
+
+
+class TestDaemonOwnedTerminals(unittest.TestCase):
+    """The daemon is the single owner of pane ptys."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.c = _ensure_daemon()
+        cls.sock = _daemon.socket_path
+
+    def _ws(self):
+        ws = self.c.workspace_create(_unique("own-ws"))
+        return int(ws["id"])
+
+    def _split(self, ws_id, direction="v", **extra):
+        # /bin/sh, not $SHELL: an empty test HOME makes zsh run its
+        # new-user wizard, which swallows the first keystroke.
+        extra.setdefault("command", "/bin/sh")
+        args = {"workspace_id": str(ws_id), "direction": direction}
+        args.update({k: str(v) for k, v in extra.items()})
+        return self.c.assert_ok("surface.split", args)
+
+    def _first_pane(self, ws_id):
+        panes = self.c.assert_ok("pane.list", {"workspace_id": str(ws_id)})["panes"]
+        return panes[0]
+
+    def test_split_result_reports_surface_and_workspace(self):
+        ws = self._ws()
+        res = self._split(ws)
+        self.assertEqual(int(res["workspace_id"]), ws)
+        sid = self._first_pane(ws)["surface_id"]
+        self.assertEqual(int(res["surface_id"]), sid)
+
+    def test_surface_create_reports_initial_pane(self):
+        ws = self._ws()
+        res = self.c.assert_ok("surface.create", {"workspace_id": str(ws)})
+        self.assertIn("pane_id", res)
+        panes = self.c.assert_ok("pane.list", {"workspace_id": str(ws)})["panes"]
+        match = [p for p in panes if p["id"] == int(res["pane_id"])]
+        self.assertEqual(len(match), 1)
+        self.assertEqual(match[0]["surface_id"], int(res["id"]))
+
+    def test_pane_child_gets_lmux_env(self):
+        ws = self._ws()
+        out = Path(tempfile.mkdtemp(prefix="lmux-env-")) / "env.txt"
+        res = self._split(ws, command=f"env > {out}; sleep 30")
+        deadline = time.time() + 5
+        while time.time() < deadline and not (out.exists() and out.stat().st_size):
+            time.sleep(0.05)
+        env = dict(l.split("=", 1) for l in out.read_text().splitlines() if "=" in l)
+        self.assertEqual(env.get("LMUX_PANE_ID"), str(res["id"]))
+        self.assertEqual(env.get("LMUX_SURFACE_ID"), str(res["surface_id"]))
+        self.assertEqual(env.get("LMUX_WORKSPACE_ID"), str(ws))
+        self.assertEqual(env.get("LMUX_SOCKET_PATH"), self.sock)
+
+    def test_attach_returns_pty_fd_shared_with_read_screen(self):
+        ws = self._ws()
+        pid = self._split(ws)["id"]
+        resp, fd = _pane_attach(self.sock, pid)
+        self.assertTrue(resp.get("ok"), resp)
+        self.assertIsNotNone(fd, "pane.attach must pass an fd via SCM_RIGHTS")
+        try:
+            self.assertTrue(os.isatty(fd))
+            os.write(fd, b"echo ATTACH_$((40+2))\n")
+            self.assertIn(b"ATTACH_42", _read_fd_until(fd, b"ATTACH_42"))
+            # The daemon still sees the output the view received.
+            self.assertIn("ATTACH_42",
+                          _screen_until(self.c, {"pane_id": str(pid)}, "ATTACH_42"))
+        finally:
+            os.close(fd)
+
+    def test_send_text_reaches_attached_view(self):
+        ws = self._ws()
+        pid = self._split(ws)["id"]
+        _resp, fd = _pane_attach(self.sock, pid)
+        try:
+            self.c.assert_ok("surface.send_text",
+                             {"pane_id": str(pid), "text": "echo VIEW_$((6*7))\n"})
+            self.assertIn(b"VIEW_42", _read_fd_until(fd, b"VIEW_42"))
+        finally:
+            os.close(fd)
+
+    def test_attach_replays_earlier_output(self):
+        ws = self._ws()
+        pid = self._split(ws, command="printf 'PRE_%s\\n' ATTACH_MARK; sleep 30")["id"]
+        _screen_until(self.c, {"pane_id": str(pid)}, "PRE_ATTACH_MARK")
+        _resp, fd = _pane_attach(self.sock, pid)
+        try:
+            self.assertIn(b"PRE_ATTACH_MARK", _read_fd_until(fd, b"PRE_ATTACH_MARK"))
+        finally:
+            os.close(fd)
+
+    def test_attach_view_resize_reaches_child(self):
+        import fcntl
+        import struct
+        import termios
+        ws = self._ws()
+        pid = self._split(ws)["id"]
+        _resp, fd = _pane_attach(self.sock, pid)
+        try:
+            fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 33, 101, 0, 0))
+            time.sleep(0.3)
+            os.write(fd, b"stty size\n")
+            self.assertIn(b"33 101", _read_fd_until(fd, b"33 101"))
+        finally:
+            os.close(fd)
+
+    def test_attach_unknown_pane_fails_without_fd(self):
+        resp, fd = _pane_attach(self.sock, 987654)
+        self.assertFalse(resp.get("ok"))
+        self.assertIsNone(fd)
+
+    def test_send_text_and_read_screen_honour_pane_id(self):
+        ws = self._ws()
+        first = self._first_pane(ws)["id"]
+        second = self._split(ws)["id"]
+        self.c.assert_ok("pane.focus", {"workspace_id": str(ws), "id": str(first)})
+        self.c.assert_ok("surface.send_text",
+                         {"pane_id": str(second), "text": "echo TARGET_$((1+1))B\n"})
+        self.assertIn("TARGET_2B",
+                      _screen_until(self.c, {"pane_id": str(second)}, "TARGET_2B"))
+        self.assertNotIn("TARGET_2B",
+                         _screen_until(self.c, {"pane_id": str(first)}, "TARGET_2B", 0.5))
+
+    def test_events_fan_out_to_every_subscriber(self):
+        a, b = _EventTap(self.sock), _EventTap(self.sock)
+        try:
+            ws = self._ws()
+            surf = self.c.assert_ok("surface.create", {"workspace_id": str(ws)})
+            sid = int(surf["id"])
+            for tap in (a, b):
+                d = tap.wait_for("surface.created", lambda d: d.get("id") == sid)
+                self.assertIsNotNone(d, "each subscriber must see surface.created")
+                self.assertEqual(d.get("workspace_id"), ws)
+                self.assertEqual(d.get("pane_id"), int(surf["pane_id"]))
+            split = self._split(ws, "h", pane_id=surf["pane_id"])
+            for tap in (a, b):
+                d = tap.wait_for("pane.created", lambda d: d.get("id") == split["id"])
+                self.assertIsNotNone(d, "each subscriber must see pane.created")
+                self.assertEqual(d.get("surface_id"), sid)
+                self.assertEqual(d.get("workspace_id"), ws)
+                self.assertEqual(d.get("target_pane_id"), int(surf["pane_id"]))
+                self.assertEqual(d.get("direction"), "h")
+        finally:
+            a.close()
+            b.close()
+
+    def test_pane_close_removes_pane_and_emits_event(self):
+        tap = _EventTap(self.sock)
+        try:
+            ws = self._ws()
+            pid = self._split(ws)["id"]
+            self.c.assert_ok("pane.close", {"id": str(pid)})
+            ids = [p["id"] for p in
+                   self.c.assert_ok("pane.list", {"workspace_id": str(ws)})["panes"]]
+            self.assertNotIn(pid, ids)
+            self.assertIsNotNone(tap.wait_for("pane.closed", lambda d: d.get("id") == pid))
+        finally:
+            tap.close()
+
+    def _cli(self, *args, env_extra):
+        env = dict(os.environ)
+        env["LMUX_SOCKET_PATH"] = self.sock
+        env.update(env_extra)
+        return subprocess.run([str(_LMUX_BIN), *args], env=env, capture_output=True,
+                              text=True, timeout=15)
+
+    def test_cli_send_keys_and_read_screen_use_pane_env(self):
+        ws = self._ws()
+        first = self._first_pane(ws)["id"]
+        mine = self._split(ws)["id"]
+        self.c.assert_ok("pane.focus", {"workspace_id": str(ws), "id": str(first)})
+        # A different workspace has focus, as it would for a background pane.
+        self._ws()
+        env = {"LMUX_PANE_ID": str(mine), "LMUX_WORKSPACE_ID": str(ws)}
+        r = self._cli("send-keys", "echo CLI_$((2+3))_OK", "Enter", env_extra=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        deadline = time.time() + 5
+        out = ""
+        while time.time() < deadline:
+            out = self._cli("read-screen", env_extra=env).stdout
+            if "CLI_5_OK" in out:
+                break
+            time.sleep(0.1)
+        self.assertIn("CLI_5_OK", out)
+
+    def test_cli_split_targets_pane_env(self):
+        tap = _EventTap(self.sock)
+        try:
+            ws = self._ws()
+            mine = self._first_pane(ws)["id"]
+            self._ws()  # move focus elsewhere
+            env = {"LMUX_PANE_ID": str(mine), "LMUX_WORKSPACE_ID": str(ws)}
+            r = self._cli("surface.split", "v", env_extra=env)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            d = tap.wait_for("pane.created", lambda d: d.get("target_pane_id") == mine)
+            self.assertIsNotNone(d)
+            self.assertEqual(d.get("workspace_id"), ws)
+            self.assertEqual(d.get("direction"), "v")
+        finally:
+            tap.close()
+
+    def test_pane_list_reports_split_direction(self):
+        ws = self._ws()
+        pid = self._split(ws, "v")["id"]
+        panes = self.c.assert_ok("pane.list", {"workspace_id": str(ws)})["panes"]
+        p = next(p for p in panes if p["id"] == pid)
+        self.assertEqual(p.get("split_dir"), "v")
 
 
 if __name__ == "__main__":

@@ -41,6 +41,8 @@ class WorkspaceRow(Gtk.ListBoxRow):
         self._branch_label = Gtk.Label(label="")
         self._branch_label.set_opacity(0.6)
         self._branch_label.set_xalign(1)
+        self._branch_label.set_ellipsize(3)  # Pango.EllipsizeMode.END
+        self._branch_label.set_max_width_chars(20)
         box.append(self._branch_label)
 
         self.set_child(box)
@@ -109,8 +111,13 @@ class Sidebar(Gtk.Box):
         self._listbox = Gtk.ListBox()
         self._listbox.set_selection_mode(Gtk.SelectionMode.SINGLE)
         self._listbox.connect("row-selected", self._on_row_selected)
-        self._listbox.set_vexpand(True)
-        self.append(self._listbox)
+        # Scroll the list: appended directly, each workspace row raised the
+        # window's minimum height until it could no longer be shrunk.
+        list_scroll = Gtk.ScrolledWindow()
+        list_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        list_scroll.set_vexpand(True)
+        list_scroll.set_child(self._listbox)
+        self.append(list_scroll)
 
         # Error label
         self._error_label = Gtk.Label(label="")

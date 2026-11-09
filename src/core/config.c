@@ -8,6 +8,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "lmux.h"
+#include "lmux_json.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -45,57 +46,24 @@ static char *cfg_json_escape(const char *in, char *out, size_t cap) {
     return out;
 }
 
+/* Field lookups go through the shared, string-aware helpers in json.c so the
+ * config loader and the request parser agree on JSON (\uXXXX decoding,
+ * keys never matched inside values). */
 static const char *cfg_json_find_key(const char *json, const char *key) {
-    if (!json || !key) return NULL;
-    char needle[256];
-    snprintf(needle, sizeof needle, "\"%s\"", key);
-    const char *p = strstr(json, needle);
-    if (!p) return NULL;
-    const char *colon = strchr(p + strlen(needle), ':');
-    if (!colon) return NULL;
-    const char *val = colon + 1;
-    while (*val == ' ' || *val == '\t' || *val == '\n' || *val == '\r') val++;
-    return val;
+    return lmux_json_find_key(json, key);
 }
 
 static bool cfg_json_extract_string(const char *json, const char *key,
                                      char *out, size_t cap) {
-    const char *val = cfg_json_find_key(json, key);
-    if (!val) return false;
-    if (*val != '"') return false;
-    val++;
-    size_t i = 0;
-    while (*val && *val != '"' && i < cap - 1) {
-        if (*val == '\\' && *(val + 1)) {
-            char next = *(val + 1);
-            if (next == 'n') { out[i++] = '\n'; val += 2; }
-            else if (next == 't') { out[i++] = '\t'; val += 2; }
-            else if (next == '\\') { out[i++] = '\\'; val += 2; }
-            else if (next == '"') { out[i++] = '"'; val += 2; }
-            else { out[i++] = *val++; }
-        } else {
-            out[i++] = *val++;
-        }
-    }
-    out[i] = 0;
-    return true;
+    return lmux_json_extract_string(json, key, out, cap);
 }
 
 static bool cfg_json_extract_int(const char *json, const char *key, int *out) {
-    const char *val = cfg_json_find_key(json, key);
-    if (!val) return false;
-    /* Reject non-numeric values (type mismatch) */
-    if (*val != '-' && (*val < '0' || *val > '9')) return false;
-    *out = (int)strtol(val, NULL, 10);
-    return true;
+    return lmux_json_extract_int(json, key, out);
 }
 
 static bool cfg_json_extract_bool(const char *json, const char *key, bool *out) {
-    const char *val = cfg_json_find_key(json, key);
-    if (!val) return false;
-    if (strncmp(val, "true", 4) == 0) { *out = true; return true; }
-    if (strncmp(val, "false", 5) == 0) { *out = false; return true; }
-    return false;
+    return lmux_json_extract_bool(json, key, out);
 }
 
 /* ----- Array-of-objects parsing helpers (local) -----
@@ -589,9 +557,11 @@ bool lmux_config_save(const lmux_config *cfg, const char *path) {
     fprintf(f, "  \"keybindings\": [\n");
     for (size_t i = 0; i < cfg->keybindings.len; i++) {
         lmux_keybinding *kb = cfg->keybindings.items[i];
+        char key_esc[2048], action_esc[2048];
+        cfg_json_escape(kb->key, key_esc, sizeof key_esc);
+        cfg_json_escape(kb->action, action_esc, sizeof action_esc);
         fprintf(f, "    {\"key\": \"%s\", \"action\": \"%s\"}%s\n",
-                cfg_json_escape(kb->key, esc_buf, sizeof esc_buf),
-                cfg_json_escape(kb->action, esc_buf, sizeof esc_buf),
+                key_esc, action_esc,
                 i + 1 < cfg->keybindings.len ? "," : "");
     }
     fprintf(f, "  ],\n");
@@ -600,11 +570,13 @@ bool lmux_config_save(const lmux_config *cfg, const char *path) {
     fprintf(f, "  \"themes\": [\n");
     for (size_t i = 0; i < cfg->themes.len; i++) {
         lmux_theme_entry *t = cfg->themes.items[i];
+        char name_esc[2048], fg_esc[2048], bg_esc[2048], cur_esc[2048];
+        cfg_json_escape(t->name, name_esc, sizeof name_esc);
+        cfg_json_escape(t->fg, fg_esc, sizeof fg_esc);
+        cfg_json_escape(t->bg, bg_esc, sizeof bg_esc);
+        cfg_json_escape(t->cursor, cur_esc, sizeof cur_esc);
         fprintf(f, "    {\"name\": \"%s\", \"fg\": \"%s\", \"bg\": \"%s\", \"cursor\": \"%s\"}%s\n",
-                cfg_json_escape(t->name, esc_buf, sizeof esc_buf),
-                cfg_json_escape(t->fg, esc_buf, sizeof esc_buf),
-                cfg_json_escape(t->bg, esc_buf, sizeof esc_buf),
-                cfg_json_escape(t->cursor, esc_buf, sizeof esc_buf),
+                name_esc, fg_esc, bg_esc, cur_esc,
                 i + 1 < cfg->themes.len ? "," : "");
     }
     fprintf(f, "  ],\n");
