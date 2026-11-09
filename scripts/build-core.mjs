@@ -42,6 +42,7 @@ const CFLAGS = [
 ].filter(Boolean).join(" ");
 
 const sources = [
+    join(ROOT, "src", "core", "json.c"),
     join(ROOT, "src", "core", "model.c"),
     join(ROOT, "src", "core", "http_server.c"),
     join(ROOT, "src", "core", "osc.c"),

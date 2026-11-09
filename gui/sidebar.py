@@ -2,7 +2,7 @@
 import gi
 gi.require_version('Gtk', '3.0')
 gi.require_version('GLib', '2.0')
-from gi.repository import Gtk, GObject, GLib, Gdk
+from gi.repository import Gtk, GObject, GLib, Gdk, Pango
 import threading
 import sys
 import os
@@ -54,7 +54,8 @@ class WorkspaceRow(Gtk.ListBoxRow):
         # Title line (workspace title)
         self._title_label = Gtk.Label(label=title)
         self._title_label.set_xalign(0)
-        self._title_label.set_ellipsize(True)
+        # Ellipsize so a long title can't force the window wider.
+        self._title_label.set_ellipsize(Pango.EllipsizeMode.END)
         self._title_label.set_max_width_chars(30)
         box.pack_start(self._title_label, True, True, 0)
 
@@ -62,6 +63,9 @@ class WorkspaceRow(Gtk.ListBoxRow):
         self._meta_label = Gtk.Label(label="")
         self._meta_label.set_xalign(0)
         self._meta_label.set_opacity(0.7)
+        # Paths: keep both ends visible. Without ellipsizing, a long cwd
+        # set this label's minimum width (~560px) and the window's with it.
+        self._meta_label.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
         self._meta_label.set_max_width_chars(30)
         box.pack_start(self._meta_label, True, True, 0)
 

@@ -19,6 +19,15 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "lmux.h"
+#include "lmux_json.h"
+
+/* Historical names for the shared JSON helpers (src/core/json.c). */
+#define json_find_key          lmux_json_find_key
+#define json_find_toplevel_key lmux_json_find_toplevel_key
+#define json_extract_string    lmux_json_extract_string
+#define json_extract_int       lmux_json_extract_int
+#define json_extract_bool      lmux_json_extract_bool
+#define json_escape_str        lmux_json_escape
 #include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
@@ -774,7 +783,7 @@ static void buffer_evict_oldest(lmux_app *app) {
     /* Push event to queue */
     char event_json[512];
     snprintf(event_json, sizeof event_json,
-             "{\"event\":\"buffer-deleted\",\"name\":\"%s\"}", oldest->name);
+             "\"event\":\"buffer-deleted\",\"name\":\"%s\"", lmux_json_esc(oldest->name));
     lmux_event_push(app, "buffer-deleted", "buffer", "%s", event_json);
     
     /* Free and remove */
@@ -791,7 +800,7 @@ static void buffer_emit_created(lmux_app *app, const char *name) {
     
     char event_json[512];
     snprintf(event_json, sizeof event_json,
-             "{\"event\":\"buffer-created\",\"name\":\"%s\"}", name);
+             "\"event\":\"buffer-created\",\"name\":\"%s\"", lmux_json_esc(name));
     lmux_event_push(app, "buffer-created", "buffer", "%s", event_json);
 }
  
@@ -803,7 +812,7 @@ static void buffer_emit_changed(lmux_app *app, const char *name) {
     
     char event_json[512];
     snprintf(event_json, sizeof event_json,
-             "{\"event\":\"buffer-changed\",\"name\":\"%s\"}", name);
+             "\"event\":\"buffer-changed\",\"name\":\"%s\"", lmux_json_esc(name));
     lmux_event_push(app, "buffer-changed", "buffer", "%s", event_json);
 }
  
@@ -890,7 +899,7 @@ bool lmux_buffer_delete(lmux_app *app, const char *name) {
     
     char event_json[512];
     snprintf(event_json, sizeof event_json,
-             "{\"event\":\"buffer-deleted\",\"name\":\"%s\"}", buf->name);
+             "\"event\":\"buffer-deleted\",\"name\":\"%s\"", lmux_json_esc(buf->name));
     lmux_event_push(app, "buffer-deleted", "buffer", "%s", event_json);
     
     /* Free and remove */
@@ -1679,8 +1688,8 @@ static void hook_fire(lmux_app *app, const char *name, lmux_hook_scope scope,
     /* Also push to event queue for internal consumers */
     char event_json[1024];
     snprintf(event_json, sizeof event_json,
-             "{\"event\":\"hook-fired\",\"hook\":\"%s\",\"scope\":\"%s\",\"target_id\":%u,\"command\":\"%s\"}",
-             name, scope_str, (unsigned)target_id, command);
+             "\"event\":\"hook-fired\",\"hook\":\"%s\",\"scope\":\"%s\",\"target_id\":%u,\"command\":\"%s\"",
+             lmux_json_esc(name), scope_str, (unsigned)target_id, lmux_json_esc(command));
     lmux_event_push(app, "hook-fired", "hook", "%s", event_json);
 }
 
@@ -1983,10 +1992,6 @@ static lmux_surface *surface_new(lmux_workspace *ws) {
 /* App lifecycle                                                      */
 /* ------------------------------------------------------------------ */
 
-/* Forward declarations for static JSON helpers (used below in app lifecycle) */
-static const char *json_find_key(const char *json, const char *key);
-static bool json_extract_string(const char *json, const char *key, char *out, size_t cap);
-static bool json_extract_bool(const char *json, const char *key, bool *out);
 
 lmux_app *lmux_app_new(const char *socket_path) {
     lmux_app *a = calloc(1, sizeof *a);
@@ -3578,7 +3583,7 @@ lmux_window *lmux_window_create(lmux_app *app, const char *title) {
     app->windows.items[app->windows.len++] = w;
 
     lmux_event_push(app, "window.created", "window",
-        "{\"window_id\":%u,\"title\":\"%s\"}", w->id, w->title);
+        "\"window_id\":%u,\"title\":\"%s\"", w->id, lmux_json_esc(w->title));
     return w;
 }
 
@@ -3697,7 +3702,7 @@ lmux_ssh_session *lmux_ssh_session_create(lmux_app *app, const char *host,
     app->ssh_sessions.items[app->ssh_sessions.len++] = s;
 
     lmux_event_push(app, "ssh.session_created", "ssh",
-        "{\"session_id\":%u,\"host\":\"%s\",\"user\":\"%s\"}", s->id, s->host, s->user);
+        "\"session_id\":%u,\"host\":\"%s\",\"user\":\"%s\"", s->id, lmux_json_esc(s->host), lmux_json_esc(s->user));
     return s;
 }
 
@@ -3858,7 +3863,7 @@ lmux_feed_panel *lmux_feed_panel_create(lmux_app *app, const char *title, const 
     app->feed_panels.items[app->feed_panels.len++] = p;
 
     lmux_event_push(app, "feed.panel_created", "feed",
-        "{\"panel_id\":%u,\"title\":\"%s\"}", p->id, p->title);
+        "\"panel_id\":%u,\"title\":\"%s\"", p->id, lmux_json_esc(p->title));
     return p;
 }
 
@@ -4023,12 +4028,16 @@ static void event_push_v(lmux_app *app, bool live, const char *name,
     uint64_t seq = app->event_seq;
 
     /* Build data part */
-    char data[2048] = {0};
+    char data[8192] = {0};
     if (body_fmt) {
         va_list ap;
         va_copy(ap, ap_in);
-        vsnprintf(data, sizeof data, body_fmt, ap);
+        int dn = vsnprintf(data, sizeof data, body_fmt, ap);
         va_end(ap);
+        /* A body cut mid-escape is not JSON; say so instead of emitting a
+         * line every subscriber would fail to parse. */
+        if (dn < 0 || (size_t)dn >= sizeof data)
+            snprintf(data, sizeof data, "\"truncated\":true");
     }
 
     /* ISO-8601 timestamp */
@@ -4039,7 +4048,7 @@ static void event_push_v(lmux_app *app, bool live, const char *name,
     strftime(ts, sizeof ts, "%Y-%m-%dT%H:%M:%S", tm);
 
     /* Build event JSON (single allocation for queue) */
-    char event_json[4096];
+    char event_json[sizeof data + 1024];   /* header is < 300 bytes */
     int n = snprintf(event_json, sizeof event_json,
         "{\"type\":\"event\",\"seq\":%llu,\"boot_id\":\"%s\","
         "\"name\":\"%s\",\"category\":\"%s\","
@@ -4241,130 +4250,6 @@ const char *lmux_socket_path(const lmux_app *app) {
 /* ------------------------------------------------------------------ */
 
 
-/* Find a JSON key's value start after '"key":'. Returns pointer after '"', or NULL. */
-static const char *json_find_key(const char *json, const char *key) {
-    if (!json || !key) return NULL;
-    size_t klen = strlen(key);
-    const char *p = json;
-    while ((p = strstr(p, key)) != NULL) {
-        /* Must be preceded by '"' and followed by '":' */
-        if ((p == json || *(p - 1) == '"') && p[klen] == '"' && p[klen + 1] == ':') {
-            p += klen + 2; /* skip key": */
-            /* Skip insignificant whitespace, including newlines, so that
-             * pretty-printed JSON parses the same as compact JSON (#7). */
-            while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
-            return p;
-        }
-        p++;
-    }
-    return NULL;
-}
-
-/* Extract a JSON string value. Fills out with the unescaped value. Returns true on success. */
-static bool json_extract_string(const char *json, const char *key, char *out, size_t cap) {
-    const char *v = json_find_key(json, key);
-    if (!v || *v != '"') return false;
-    v++; /* skip opening quote */
-    size_t n = 0;
-    while (*v && n < cap - 1) {
-        if (*v == '"') { v++; break; }
-        if (*v == '\\') {
-            v++;
-            if (*v == 'u') {
-                /* Unicode escape \uXXXX */
-                v++;
-                unsigned int codepoint = 0;
-                for (int i = 0; i < 4 && *v && n < cap - 1; i++, v++) {
-                    char c = *v;
-                    int digit = (c >= '0' && c <= '9') ? c - '0' :
-                                (c >= 'a' && c <= 'f') ? c - 'a' + 10 :
-                                (c >= 'A' && c <= 'F') ? c - 'A' + 10 : -1;
-                    if (digit < 0) { codepoint = 0; break; }
-                    codepoint = (codepoint << 4) | digit;
-                }
-                /* Encode codepoint as UTF-8 */
-                if (codepoint <= 0x7F) {
-                    out[n++] = (char)codepoint;
-                } else if (codepoint <= 0x7FF) {
-                    out[n++] = 0xC0 | (codepoint >> 6);
-                    out[n++] = 0x80 | (codepoint & 0x3F);
-                } else if (codepoint <= 0xFFFF) {
-                    out[n++] = 0xE0 | (codepoint >> 12);
-                    out[n++] = 0x80 | ((codepoint >> 6) & 0x3F);
-                    out[n++] = 0x80 | (codepoint & 0x3F);
-                } else {
-                    /* Out of BMP - replace with replacement char */
-                    out[n++] = 0xEF;
-                    out[n++] = 0xBF;
-                    out[n++] = 0xBD;
-                }
-                continue;
-            }
-            switch (*v) {
-            case '"':  out[n++] = '"';  break;
-            case '\\': out[n++] = '\\'; break;
-            case 'n':  out[n++] = '\n'; break;
-            case 'r':  out[n++] = '\r'; break;
-            case 't':  out[n++] = '\t'; break;
-            default:   out[n++] = *v;   break;
-            }
-        } else {
-            out[n++] = *v;
-        }
-        v++;
-    }
-    out[n] = 0;
-    return true;
-}
-
-/* Extract a JSON integer value */
-static bool json_extract_int(const char *json, const char *key, int *out) {
-    const char *v = json_find_key(json, key);
-    if (!v) return false;
-    if (*v != '-' && (*v < '0' || *v > '9')) return false;
-    *out = (int)strtol(v, NULL, 10);
-    return true;
-}
-
-/* Extract a JSON boolean value */
-static bool json_extract_bool(const char *json, const char *key, bool *out) {
-    const char *v = json_find_key(json, key);
-    if (!v) return false;
-    if (strncmp(v, "true", 4) == 0) { *out = true; return true; }
-    if (strncmp(v, "false", 5) == 0) { *out = false; return true; }
-    return false;
-}
-
-/* Escape a string into a fixed buffer for safe JSON string output
- * (without surrounding quotes). Truncates if output exceeds cap.
- * Handles: ", \\, \\n, \\r, \\t, \\b, \\f, and control chars < 0x20.
- * Returns `out` for convenience. */
-static char *json_escape_str(char *out, size_t cap, const char *in) {
-    if (!out || cap == 0) return out;
-    if (!in) { out[0] = 0; return out; }
-    size_t j = 0;
-    for (const char *p = in; *p && j + 6 < cap; p++) {
-        unsigned char c = (unsigned char)*p;
-        switch (c) {
-        case '"':  out[j++] = '\\'; out[j++] = '"';  break;
-        case '\\': out[j++] = '\\'; out[j++] = '\\'; break;
-        case '\n': out[j++] = '\\'; out[j++] = 'n';  break;
-        case '\r': out[j++] = '\\'; out[j++] = 'r';  break;
-        case '\t': out[j++] = '\\'; out[j++] = 't';  break;
-        case '\b': out[j++] = '\\'; out[j++] = 'b';  break;
-        case '\f': out[j++] = '\\'; out[j++] = 'f';  break;
-        default:
-            if (c < 0x20) {
-                j += (size_t)snprintf(out + j, cap - j, "\\u%04x", c);
-            } else {
-                out[j++] = (char)c;
-            }
-        }
-    }
-    out[j] = 0;
-    return out;
-}
-
 /* Simple string hash for deterministic pseudo-random values */
 static unsigned hash_string(const char *s) {
     unsigned h = 5381;
@@ -4480,57 +4365,6 @@ static void naming_add(char names[][256], size_t *n, const char *name) {
         if (strcmp(names[i], name) == 0) return; /* GUI's `seen` set */
     snprintf(names[*n], 256, "%s", name);
     (*n)++;
-}
-
-/* Find a key at the JSON object's TOP level only.
- *
- * The daemon's generic json_find_key() matches the first "key": anywhere in the
- * document, so a nested `"name"` (inside "scripts", "dependencies", an array
- * element, ...) wins over the real top-level one. For workspace naming that
- * silently produced the wrong suggestion, so this walks the document tracking
- * depth and only reports a match at depth 1.
- *
- * Returns a pointer to the first character of the value, or NULL. `*depth_out`,
- * when non-NULL, receives the depth at which the match occurred.
- */
-static const char *json_find_toplevel_key(const char *json, const char *key,
-                                          int *depth_out) {
-    if (!json || !key) return NULL;
-    const size_t klen = strlen(key);
-    int depth = 0;
-    bool in_string = false, escaped = false;
-    const char *str_start = NULL;   /* first char after the opening quote */
-    for (const char *p = json; *p; p++) {
-        if (in_string) {
-            if (escaped) { escaped = false; continue; }
-            if (*p == '\\') { escaped = true; continue; }
-            if (*p != '"') continue;
-            /* Closing quote: p[-1] is the last content char, str_start the
-             * first, so the content spans str_start .. p-1 inclusive. */
-            in_string = false;
-            size_t got = (size_t)(p - str_start);
-            if (depth == 1 && got == klen && memcmp(str_start, key, klen) == 0) {
-                /* A key string is followed by ':'. A *value* string with the
-                 * same content (e.g. {"description": "name"}) is not, so only
-                 * accept the match when the colon is present; otherwise keep
-                 * scanning. This is what makes the lookup a parse rather than a
-                 * content pattern-match. */
-                const char *v = p + 1;
-                while (*v == ' ' || *v == '\t' || *v == '\n' || *v == '\r') v++;
-                if (*v == ':') {
-                    v++;
-                    while (*v == ' ' || *v == '\t' || *v == '\n' || *v == '\r') v++;
-                    if (depth_out) *depth_out = depth;
-                    return v;
-                }
-            }
-            continue;
-        }
-        if (*p == '"') { in_string = true; escaped = false; str_start = p + 1; continue; }
-        if (*p == '{' || *p == '[') depth++;
-        else if (*p == '}' || *p == ']') depth--;
-    }
-    return NULL;
 }
 
 /* Extract "name" from a package.json. Only a top-level "name" counts; a nested
@@ -4696,7 +4530,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             written = snprintf(result, result_cap,
                 "{\"ok\":true,\"result\":{\"id\":%u,\"title\":\"%s\"}}",
                 ws->id, JESC(ws->title));
-            lmux_event_push(app, "workspace.created", "workspace", "\"id\":%u,\"title\":\"%s\"", ws->id, ws->title);
+            lmux_event_push(app, "workspace.created", "workspace", "\"id\":%u,\"title\":\"%s\"", ws->id, lmux_json_esc(ws->title));
             /* ISS-0029: control fan-out (framing layer only, no dispatch). */
             {
                 char _ct[256], _cl[320];
@@ -5077,18 +4911,29 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                     if (!first) written += snprintf(result + written, result_cap - written, ",");
                     
                     /* Build pane JSON with optional formatted field */
-                    char formatted[512] = {0};
+                    /* Expanded text comes from pane state (titles, cwd,
+                     * commands), so it must be escaped; 512 input bytes can
+                     * grow to 6x as \u00XX escapes. */
+                    char formatted[3200] = {0};
                     bool has_formatted = false;
                     if (format_str[0]) {
-                        char *expanded = NULL;
-                        /* Use a temporary buffer for format expansion */
                         char fmt_buf[512];
                         if (lmux_format_expand(app, p, format_str, fmt_buf, sizeof fmt_buf)) {
-                            snprintf(formatted, sizeof formatted, ",\"formatted\":\"%s\"", fmt_buf);
+                            char fmt_esc[3100];
+                            json_escape_str(fmt_esc, sizeof fmt_esc, fmt_buf);
+                            snprintf(formatted, sizeof formatted, ",\"formatted\":\"%s\"", fmt_esc);
                             has_formatted = true;
                         }
                     }
-                    
+                    /* RESULT_GROW only guarantees 1 KiB of headroom; the
+                     * formatted field can be larger. */
+                    if ((size_t)written + strlen(formatted) + 1024 >= result_cap) {
+                        result_cap = (size_t)written + strlen(formatted) + 4096;
+                        char *_tmp = realloc(result, result_cap);
+                        if (!_tmp) { free(result); return strdup("{\"ok\":false,\"error\":{\"code\":\"oom\",\"message\":\"out of memory\"}}"); }
+                        result = _tmp;
+                    }
+
                     written += snprintf(result + written, result_cap - written,
                         "{\"id\":%u,\"kind\":\"%s\",\"focused\":%s,\"surface_id\":%u,"
                         "\"command_running\":%s,\"last_command_exit\":%d,"
@@ -5711,17 +5556,14 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             snprintf(dtitle, sizeof dtitle, "lmux");
             lmux_desktop_notify(dtitle, text);
         }
-        {
-            char _ne[2048];
-            lmux_event_push(app, "notification.created", "notification",
-                "\"seq\":%llu,\"text\":\"%s\",\"waiting\":%s,"
-                "\"workspace_id\":\"%s\",\"pane_id\":%u",
-                (unsigned long long)app->notify_seq,
-                json_escape_str(_ne, sizeof _ne, text),
-                waiting ? "true" : "false",
-                created ? created->workspace_id : "",
-                created ? (unsigned)created->pane_id : 0u);
-        }
+        lmux_event_push(app, "notification.created", "notification",
+            "\"seq\":%llu,\"text\":\"%s\",\"waiting\":%s,"
+            "\"workspace_id\":\"%s\",\"pane_id\":%u",
+            (unsigned long long)app->notify_seq,
+            lmux_json_esc(text),
+            waiting ? "true" : "false",
+            lmux_json_esc(created ? created->workspace_id : ""),
+            created ? (unsigned)created->pane_id : 0u);
         written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{\"seq\":%llu}}",
                            (unsigned long long)app->notify_seq);
         goto done;
@@ -6209,7 +6051,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             goto done;
         }
         snprintf(found->title, sizeof found->title, "%s", title);
-        lmux_event_push(app, "surface.renamed", "surface", "\"id\":%u,\"title\":\"%s\"", found->id, title);
+        lmux_event_push(app, "surface.renamed", "surface", "\"id\":%u,\"title\":\"%s\"", found->id, lmux_json_esc(title));
         written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
         goto done;
     }
@@ -7394,7 +7236,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         ag->pane_id = p->id;
         ag->started_at = time(NULL);
         vec_push(&app->agents, ag);
-        lmux_event_push(app, "agent.spawned", "agent", "\"id\":%u,\"name\":\"%s\",\"pane_id\":%u", ag->id, name, p->id);
+        lmux_event_push(app, "agent.spawned", "agent", "\"id\":%u,\"name\":\"%s\",\"pane_id\":%u", ag->id, lmux_json_esc(name), p->id);
         written = snprintf(result, result_cap,
             "{\"ok\":true,\"result\":{\"id\":%u,\"name\":\"%s\",\"pane_id\":%u,\"pid\":%d}}",
             ag->id, name, p->id, (int)ag->pid);
@@ -7568,7 +7410,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         }
         if (action[0] && strcmp(action, "signal") == 0) {
             wp->signaled = true;
-            lmux_event_push(app, "wait.signaled", "sync", "\"name\":\"%s\"", name);
+            lmux_event_push(app, "wait.signaled", "sync", "\"name\":\"%s\"", lmux_json_esc(name));
             written = snprintf(result, result_cap,
                 "{\"ok\":true,\"result\":{\"name\":\"%s\",\"signaled\":true}}", name);
         } else if (action[0] && strcmp(action, "reset") == 0) {
@@ -7683,8 +7525,8 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             goto done;
         }
         /* Browser is managed by GUI — daemon just acknowledges */
-        lmux_event_push(app, "browser.opened", "browser", "\"url\":\"%s\"", url);
-        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{\"url\":\"%s\"}}", url);
+        lmux_event_push(app, "browser.opened", "browser", "\"url\":\"%s\"", lmux_json_esc(url));
+        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{\"url\":\"%s\"}}", lmux_json_esc(url));
         goto done;
     }
 
@@ -7702,7 +7544,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_args\",\"message\":\"selector required\"}}");
             goto done;
         }
-        lmux_event_push(app, "browser.clicked", "browser", "\"selector\":\"%s\"", selector);
+        lmux_event_push(app, "browser.clicked", "browser", "\"selector\":\"%s\"", lmux_json_esc(selector));
         written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
         goto done;
     }
@@ -7717,7 +7559,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             goto done;
         }
         lmux_event_push(app, "browser.filled", "browser",
-            "\"selector\":\"%s\",\"value\":\"%s\"", selector, value);
+            "\"selector\":\"%s\",\"value\":\"%s\"", lmux_json_esc(selector), lmux_json_esc(value));
         written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
         goto done;
     }
@@ -8020,8 +7862,8 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
 
         char *fbuf = malloc(fsize + 1);
         if (!fbuf) { fclose(fp); goto done; }
-        (void)fread(fbuf, 1, fsize, fp);
-        fbuf[fsize] = '\0';
+        size_t fgot = fread(fbuf, 1, (size_t)fsize, fp);
+        fbuf[fgot] = '\0';   /* short read: parse what we actually got */
         fclose(fp);
 
         /* Parse mbox: "From " line starts a message */
@@ -8197,7 +8039,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing location\"}}");
             goto done;
         }
-        lmux_event_push(app, "weather.location_set", "weather", "\"location\":\"%s\"", location);
+        lmux_event_push(app, "weather.location_set", "weather", "\"location\":\"%s\"", lmux_json_esc(location));
         written = snprintf(result, result_cap,
             "{\"ok\":true,\"result\":{\"location\":\"%s\"}}", JESC(location));
         goto done;
@@ -8206,7 +8048,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
     /* --- weather.refresh --- */
     if (strcmp(cmd, "weather.refresh") == 0) {
         /* Refresh is a no-op for simulated weather */
-        lmux_event_push(app, "weather.refreshed", "weather", "{}");
+        lmux_event_push(app, "weather.refreshed", "weather", "");
         written = snprintf(result, result_cap,
             "{\"ok\":true,\"result\":{\"status\":\"refreshed\"}}");
         goto done;
@@ -9022,8 +8864,8 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         }
         char *fbuf = malloc(fsize + 1);
         if (!fbuf) { fclose(fp); goto done; }
-        (void)fread(fbuf, 1, fsize, fp);
-        fbuf[fsize] = '\0';
+        size_t fgot = fread(fbuf, 1, (size_t)fsize, fp);
+        fbuf[fgot] = '\0';   /* short read: parse what we actually got */
         fclose(fp);
 
         /* Create feed panel */
@@ -10692,7 +10534,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         if (pane_id[0]) lmux_ssh_session_attach(s, (lmux_id)atol(pane_id));
         written = snprintf(result, result_cap,
             "{\"ok\":true,\"result\":{\"id\":%u,\"host\":\"%s\",\"user\":\"%s\"}}",
-            s->id, s->host, s->user);
+            s->id, lmux_json_esc(s->host), lmux_json_esc(s->user));
         goto done;
     }
 
@@ -11124,8 +10966,13 @@ char *lmux_dispatch_json(lmux_app *app, const char *json_request) {
                                     "invalid_request", "request too large (max 64KB)", NULL);
     }
 
+    /* "cmd" and "args" are request-level fields: only the outermost object
+     * counts, so a nested {"args":{"cmd":...}} can never pick the command. */
     char cmd[128] = {0};
-    json_extract_string(json_request, "cmd", cmd, sizeof cmd);
+    {
+        const char *cv = json_find_toplevel_key(json_request, "cmd", NULL);
+        if (cv) lmux_json_decode_string(cv, cmd, sizeof cmd);
+    }
 
     if (!cmd[0]) {
         return make_error_response("urn:lmux:invalid-request", "Invalid Request",
@@ -11143,7 +10990,7 @@ char *lmux_dispatch_json(lmux_app *app, const char *json_request) {
     }
 
     /* Extract args object (everything after "args":{) */
-    const char *args_start = json_find_key(json_request, "args");
+    const char *args_start = json_find_toplevel_key(json_request, "args", NULL);
     /* Dynamic args buffer: starts at 1KB, grows if needed (L5 fix) */
     size_t args_cap = 1024;
     char *args_buf = calloc(args_cap, 1);
@@ -11540,6 +11387,7 @@ static void snap_drop_eager_panes(lmux_app *app, lmux_surface *sf) {
 
 static bool snap_load_panes(lmux_app *app, lmux_workspace *ws,
                             lmux_surface *sf, snap_rd *r) {
+    (void)app;
     if (!snap_eat(r, '[')) return false;
     if (snap_eat(r, ']')) return true;
     for (;;) {
@@ -11951,7 +11799,7 @@ bool lmux_agent_hibernate(lmux_app *app, lmux_id agent_id) {
             a->pid = 0;
             a->status = 0;
 
-            lmux_event_push(app, "agent.hibernated", "agent", "\"id\":%u,\"name\":\"%s\"", a->id, a->name);
+            lmux_event_push(app, "agent.hibernated", "agent", "\"id\":%u,\"name\":\"%s\"", a->id, lmux_json_esc(a->name));
             return true;
         }
     }
@@ -11980,7 +11828,7 @@ bool lmux_agent_resume(lmux_app *app, lmux_id agent_id) {
                 a->status = 1;
                 a->last_activity = time(NULL);
 
-                lmux_event_push(app, "agent.resumed", "agent", "\"id\":%u,\"name\":\"%s\"", a->id, a->name);
+                lmux_event_push(app, "agent.resumed", "agent", "\"id\":%u,\"name\":\"%s\"", a->id, lmux_json_esc(a->name));
                 return true;
             }
         }
