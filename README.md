@@ -281,11 +281,20 @@ with `invalid_params`.
 |----------|--------|
 | `Ctrl+Shift+T` | New surface (tab) |
 | `Ctrl+Shift+W` | Close surface |
-| `Ctrl+Shift+-` | Split pane vertical |
-| `Ctrl+Shift+=` | Split pane horizontal |
+| `Ctrl+Shift+E` | Split pane vertical |
+| `Ctrl+Shift+D` | Split pane horizontal |
+| `Ctrl+Shift+X` | Close pane |
 | `Ctrl+Shift+N` | New workspace |
+| `Ctrl+Shift+Alt+W` | Close workspace |
+| `Ctrl+Shift+P` | Command palette |
+| `Ctrl+Shift+S` | Toggle sidebar |
+| `Ctrl+Shift+B` | Toggle browser panel |
+| `Ctrl+Shift+O` | Reopen last session |
 | `Ctrl+Shift+Q` | Quit |
 | `Ctrl+Shift+Arrow` | Focus prev/next pane |
+
+Plain `Shift+letter` and `Ctrl+letter` always go to the terminal. Custom
+bindings live in `~/.config/lmux/shortcuts.json`.
 
 ---
 

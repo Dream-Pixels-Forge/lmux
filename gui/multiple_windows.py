@@ -70,8 +70,8 @@ class WindowManager:
 
 def setup_multiple_windows(app, accel_group):
     """Set up keyboard shortcuts for multiple windows."""
-    # Ctrl+Shift+N: New window
-    keyval, mods = Gtk.accelerator_parse("<Ctrl><Shift>n")
+    # Ctrl+Shift+Alt+N: New window (Ctrl+Shift+N is New workspace)
+    keyval, mods = Gtk.accelerator_parse("<Ctrl><Shift><Alt>n")
     if keyval:
         accel_group.connect(
             keyval, mods, Gtk.AccelFlags.VISIBLE,
