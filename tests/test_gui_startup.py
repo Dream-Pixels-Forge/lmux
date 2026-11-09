@@ -123,6 +123,38 @@ class MainWindowStartupTests(unittest.TestCase):
         finally:
             win.destroy()
 
+    def test_window_can_shrink(self):
+        """The window must not be pinned at its starting size.
+
+        The sidebar's stacked panels used to set a ~700px minimum height,
+        and a long workspace path label plus the (never really hidden)
+        browser panel set a ~1120px minimum width, so the window could not
+        be resized smaller in either direction.
+        """
+        import main
+        win = main.LmuxWindow()
+        try:
+            min_h, _ = win.get_preferred_height()
+            min_w, _ = win.get_preferred_width()
+            self.assertLess(min_h, 300, "window minimum height too large")
+            self.assertLess(min_w, 700, "window minimum width too large")
+        finally:
+            win.destroy()
+
+    def test_browser_panel_hidden_until_toggled(self):
+        import main
+        win = main.LmuxWindow()
+        try:
+            self.assertFalse(win._browser.get_visible(),
+                             "show_all() revealed the hidden browser panel")
+            win._toggle_browser()
+            self.assertTrue(win._browser.get_visible())
+            win._toggle_browser()
+            self.assertFalse(win._browser.get_visible(),
+                             "toggling off left the browser visible")
+        finally:
+            win.destroy()
+
 
 if __name__ == "__main__":
     unittest.main()

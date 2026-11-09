@@ -588,7 +588,17 @@ class LmuxWindow(Gtk.Window):
         self._sidebar.connect(
             "workspace-create-requested", self._on_workspace_create
         )
-        self._paned.pack1(self._sidebar, False, False)
+        # The sidebar stacks several panels (workspace list, SSH, focus
+        # history, hooks, groups, file explorer). Packed directly, the sum
+        # of their minimum heights (~670px) became the WINDOW's minimum
+        # height, so the window could never be made shorter. Scrolling the
+        # sidebar lets it shrink with the window instead.
+        self._sidebar_scroll = Gtk.ScrolledWindow()
+        self._sidebar_scroll.set_policy(
+            Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC
+        )
+        self._sidebar_scroll.add(self._sidebar)
+        self._paned.pack1(self._sidebar_scroll, False, False)
 
         # Workspace groups panel (below sidebar)
         self._workspace_groups_panel = WorkspaceGroupsPanel(self._client, parent_window=self)
@@ -607,6 +617,9 @@ class LmuxWindow(Gtk.Window):
         self._browser = BrowserPanel(client=self._client, parent_window=self)
         self._browser_visible = False
         self._outer_hpaned.pack2(self._browser, False, False)
+        # no_show_all: the window's final show_all() must not reveal it (a
+        # hidden-but-shown browser also added ~460px to the minimum width).
+        self._browser.set_no_show_all(True)
         self._browser.set_visible(False)
 
         # Browser scriptable API
@@ -831,18 +844,26 @@ class LmuxWindow(Gtk.Window):
 
     def _on_toggle_sidebar(self, check_item):
         visible = check_item.get_active()
+        self._sidebar_scroll.set_visible(visible)
         self._sidebar.set_visible(visible)
 
     def _toggle_browser(self):
         """Toggle the browser panel visibility."""
         self._browser_visible = not self._browser_visible
-        self._browser.set_visible(self._browser_visible)
         if self._browser_visible:
+            # show_all() is a no-op while no_show_all is set; lift it just
+            # for this call so the panel's children are shown too.
+            self._browser.set_no_show_all(False)
+            self._browser.show_all()
+            self._browser.set_no_show_all(True)
             # Set initial position for the hpaned divider
             alloc = self._outer_hpaned.get_allocation()
             if alloc.width > 0:
                 self._outer_hpaned.set_position(int(alloc.width * 0.65))
-        self._outer_hpaned.show_all()
+        else:
+            # Previously _outer_hpaned.show_all() ran here too, which
+            # re-showed the browser right after hiding it.
+            self._browser.hide()
 
     def _toggle_canvas(self):
         """Toggle canvas 2D layout mode."""
@@ -850,6 +871,8 @@ class LmuxWindow(Gtk.Window):
         if self._canvas_visible:
             # Switch stack to canvas
             self._stack.add_titled(self._canvas_container, "canvas", "Canvas")
+            # A Gtk.Stack can only switch to a visible child.
+            self._canvas_container.show_all()
             self._stack.set_visible_child(self._canvas_container)
         else:
             # Remove canvas from stack, show workspace views
