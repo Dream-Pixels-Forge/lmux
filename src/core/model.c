@@ -1460,6 +1460,17 @@ void lmux_app_free(lmux_app *a) {
         free(ws);
     }
     free(a->workspaces.items);
+    /* Session groups normally go away with their last workspace, but any
+     * still alive at shutdown (and their workspace-id lists) are ours. */
+    for (size_t i = 0; i < a->session_groups.len; i++) {
+        lmux_session_group *g = a->session_groups.items[i];
+        for (size_t j = 0; j < g->workspace_ids.len; j++)
+            free(g->workspace_ids.items[j]);
+        free(g->workspace_ids.items);
+        free(g);
+    }
+    free(a->session_groups.items);
+    a->session_groups = (vec_t){0};
     for (size_t i = 0; i < a->notifications.len; i++) {
         free(a->notifications.items[i]);
     }

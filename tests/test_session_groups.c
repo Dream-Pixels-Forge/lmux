@@ -57,6 +57,21 @@ static char *dispatch(lmux_app *app, const char *json) {
     return lmux_dispatch_json(app, json);
 }
 
+/* Dispatch a command built by one of the build_*_cmd() helpers when the
+ * response is not needed: frees both the command and the response, so the
+ * sanitizer job's leak checker only reports leaks in lmux itself. */
+static void run_owned(lmux_app *app, char *cmd) {
+    free(lmux_dispatch_json(app, cmd));
+    free(cmd);
+}
+
+/* Same, but hand the response back to the caller (who frees it). */
+static char *dispatch_owned(lmux_app *app, char *cmd) {
+    char *resp = lmux_dispatch_json(app, cmd);
+    free(cmd);
+    return resp;
+}
+
 /* Helper to build JSON with workspace IDs */
 static char *build_link_cmd(lmux_id surface_id, lmux_id target_ws_id) {
     char *cmd = malloc(512);
@@ -122,10 +137,10 @@ static void test_session_group_list(void) {
     lmux_app *app = make_app();
     
     /* Create workspaces in different groups */
-    dispatch(app, build_create_ws_cmd("ws1", "group1"));
-    dispatch(app, build_create_ws_cmd("ws2", "group1"));
-    dispatch(app, build_create_ws_cmd("ws3", "group2"));
-    dispatch(app, build_create_ws_cmd("ws4", NULL)); /* no group */
+    run_owned(app, build_create_ws_cmd("ws1", "group1"));
+    run_owned(app, build_create_ws_cmd("ws2", "group1"));
+    run_owned(app, build_create_ws_cmd("ws3", "group2"));
+    run_owned(app, build_create_ws_cmd("ws4", NULL)); /* no group */
     
     char *resp = dispatch(app, "{\"cmd\":\"session.group.list\",\"args\":{}}");
     ASSERT(resp != NULL, "response should not be NULL");
@@ -143,8 +158,8 @@ static void test_link_window(void) {
     lmux_app *app = make_app();
     
     /* Create two workspaces in the same group */
-    dispatch(app, build_create_ws_cmd("ws1", "mygroup"));
-    dispatch(app, build_create_ws_cmd("ws2", "mygroup"));
+    run_owned(app, build_create_ws_cmd("ws1", "mygroup"));
+    run_owned(app, build_create_ws_cmd("ws2", "mygroup"));
     
     /* Get workspace IDs using public API */
     lmux_workspace *ws1 = lmux_workspace_by_index(app, 0);
@@ -153,7 +168,6 @@ static void test_link_window(void) {
     ASSERT(ws2 != NULL, "ws2 should exist");
     ASSERT(ws1 != ws2, "workspaces should be different");
     
-    lmux_id ws1_id = lmux_workspace_get_id(ws1);
     lmux_id ws2_id = lmux_workspace_get_id(ws2);
     
     /* Create a surface in ws1 */
@@ -186,8 +200,8 @@ static void test_unlink_window(void) {
     lmux_app *app = make_app();
     
     /* Create two workspaces in the same group */
-    dispatch(app, build_create_ws_cmd("ws1", "mygroup"));
-    dispatch(app, build_create_ws_cmd("ws2", "mygroup"));
+    run_owned(app, build_create_ws_cmd("ws1", "mygroup"));
+    run_owned(app, build_create_ws_cmd("ws2", "mygroup"));
     
     lmux_workspace *ws1 = lmux_workspace_by_index(app, 0);
     lmux_workspace *ws2 = lmux_workspace_by_index(app, 1);
@@ -199,7 +213,7 @@ static void test_unlink_window(void) {
     /* Create a surface in ws1 and link to ws2 */
     lmux_surface *surf = lmux_surface_create(ws1, "shared-surface");
     lmux_id surf_id = lmux_surface_get_id(surf);
-    dispatch(app, build_link_cmd(surf_id, ws2_id));
+    run_owned(app, build_link_cmd(surf_id, ws2_id));
     
     /* Unlink from ws1 */
     char *cmd = build_unlink_cmd(surf_id, ws1_id);
@@ -224,20 +238,19 @@ static void test_destroy_source_workspace_keeps_surface(void) {
     lmux_app *app = make_app();
     
     /* Create two workspaces in the same group */
-    dispatch(app, build_create_ws_cmd("ws1", "mygroup"));
-    dispatch(app, build_create_ws_cmd("ws2", "mygroup"));
+    run_owned(app, build_create_ws_cmd("ws1", "mygroup"));
+    run_owned(app, build_create_ws_cmd("ws2", "mygroup"));
     
     lmux_workspace *ws1 = lmux_workspace_by_index(app, 0);
     lmux_workspace *ws2 = lmux_workspace_by_index(app, 1);
     ASSERT(ws1 != NULL && ws2 != NULL, "both workspaces should exist");
     
-    lmux_id ws1_id = lmux_workspace_get_id(ws1);
     lmux_id ws2_id = lmux_workspace_get_id(ws2);
     
     /* Create a surface in ws1 and link to ws2 */
     lmux_surface *surf = lmux_surface_create(ws1, "shared-surface");
     lmux_id surf_id = lmux_surface_get_id(surf);
-    dispatch(app, build_link_cmd(surf_id, ws2_id));
+    run_owned(app, build_link_cmd(surf_id, ws2_id));
     
     /* Close ws1 */
     lmux_workspace_close(app, ws1);
@@ -255,8 +268,8 @@ static void test_link_window_cross_group_fails(void) {
     lmux_app *app = make_app();
     
     /* Create workspaces in different groups */
-    dispatch(app, build_create_ws_cmd("ws1", "group1"));
-    dispatch(app, build_create_ws_cmd("ws2", "group2"));
+    run_owned(app, build_create_ws_cmd("ws1", "group1"));
+    run_owned(app, build_create_ws_cmd("ws2", "group2"));
     
     lmux_workspace *ws1 = lmux_workspace_by_index(app, 0);
     lmux_workspace *ws2 = lmux_workspace_by_index(app, 1);
@@ -284,8 +297,8 @@ static void test_link_window_ungrouped_fails(void) {
     lmux_app *app = make_app();
     
     /* Create one workspace in a group, one ungrouped */
-    dispatch(app, build_create_ws_cmd("ws1", "mygroup"));
-    dispatch(app, build_create_ws_cmd("ws2", NULL)); /* no group */
+    run_owned(app, build_create_ws_cmd("ws1", "mygroup"));
+    run_owned(app, build_create_ws_cmd("ws2", NULL)); /* no group */
     
     lmux_workspace *ws1 = lmux_workspace_by_index(app, 0);
     lmux_workspace *ws2 = lmux_workspace_by_index(app, 1);
@@ -313,8 +326,8 @@ static void test_list_windows_shows_linked_count(void) {
     lmux_app *app = make_app();
     
     /* Create two workspaces in the same group */
-    dispatch(app, build_create_ws_cmd("ws1", "mygroup"));
-    dispatch(app, build_create_ws_cmd("ws2", "mygroup"));
+    run_owned(app, build_create_ws_cmd("ws1", "mygroup"));
+    run_owned(app, build_create_ws_cmd("ws2", "mygroup"));
     
     lmux_workspace *ws1 = lmux_workspace_by_index(app, 0);
     lmux_workspace *ws2 = lmux_workspace_by_index(app, 1);
@@ -326,7 +339,7 @@ static void test_list_windows_shows_linked_count(void) {
     /* Create a surface in ws1 and link to ws2 */
     lmux_surface *surf = lmux_surface_create(ws1, "shared-surface");
     lmux_id surf_id = lmux_surface_get_id(surf);
-    dispatch(app, build_link_cmd(surf_id, ws2_id));
+    run_owned(app, build_link_cmd(surf_id, ws2_id));
     
     /* List surfaces in ws1 - should show linked count */
     char *cmd = build_list_surfaces_cmd(ws1_id);
@@ -362,7 +375,7 @@ static void test_control_notifications(void) {
     lmux_control_subscribe(slot, "test_window", "window", "");
     
     /* Create workspace with group - should fire %session-group-changed */
-    char *resp = dispatch(app, build_create_ws_cmd("ws1", "mygroup"));
+    char *resp = dispatch_owned(app, build_create_ws_cmd("ws1", "mygroup"));
     ASSERT(strstr(resp, "\"ok\":true"), "workspace.create should succeed");
     free(resp);
     
@@ -379,7 +392,7 @@ static void test_control_notifications(void) {
     ASSERT(found_group_created, "should receive %session-group-changed created notification");
     
     /* Create second workspace in group */
-    resp = dispatch(app, build_create_ws_cmd("ws2", "mygroup"));
+    resp = dispatch_owned(app, build_create_ws_cmd("ws2", "mygroup"));
     ASSERT(strstr(resp, "\"ok\":true"), "workspace.create should succeed");
     free(resp);
     
@@ -390,7 +403,7 @@ static void test_control_notifications(void) {
     lmux_id ws2_id = lmux_workspace_get_id(ws2);
     
     /* Link window - should fire %window-linked */
-    resp = dispatch(app, build_link_cmd(surf_id, ws2_id));
+    resp = dispatch_owned(app, build_link_cmd(surf_id, ws2_id));
     ASSERT(strstr(resp, "\"ok\":true"), "surface.link should succeed");
     free(resp);
     
@@ -406,7 +419,7 @@ static void test_control_notifications(void) {
     
     /* Unlink window - should fire %window-unlinked */
     lmux_id ws1_id = lmux_workspace_get_id(ws1);
-    resp = dispatch(app, build_unlink_cmd(surf_id, ws1_id));
+    resp = dispatch_owned(app, build_unlink_cmd(surf_id, ws1_id));
     ASSERT(strstr(resp, "\"ok\":true"), "surface.unlink should succeed");
     free(resp);
     
