@@ -166,26 +166,135 @@ class LmuxClient:
 
     # ── Copy mode operations ──────────────────────────────────
 
-    def pane_copy_mode_enter(self) -> dict:
-        return self.assert_ok("pane.copy_mode.enter")
+    def pane_copy_mode_enter(self, ws_id: Optional[int] = None, pane_id: Optional[int] = None) -> dict:
+        args = {}
+        if ws_id is not None:
+            args["workspace_id"] = str(ws_id)
+        if pane_id is not None:
+            args["pane_id"] = str(pane_id)
+        return self.assert_ok("pane.copy_mode.enter", args)
 
-    def pane_copy_mode_exit(self) -> dict:
-        return self.assert_ok("pane.copy_mode.exit")
+    def pane_copy_mode_exit(self, ws_id: Optional[int] = None, pane_id: Optional[int] = None) -> dict:
+        args = {}
+        if ws_id is not None:
+            args["workspace_id"] = str(ws_id)
+        if pane_id is not None:
+            args["pane_id"] = str(pane_id)
+        return self.assert_ok("pane.copy_mode.exit", args)
 
-    def pane_copy_mode_move(self, key: str) -> dict:
-        return self.assert_ok("pane.copy_mode.move", {"key": key})
+    def pane_copy_mode_move(self, key: str, ws_id: Optional[int] = None, pane_id: Optional[int] = None) -> dict:
+        args = {"key": key}
+        if ws_id is not None:
+            args["workspace_id"] = str(ws_id)
+        if pane_id is not None:
+            args["pane_id"] = str(pane_id)
+        return self.assert_ok("pane.copy_mode.move", args)
 
-    def pane_copy_mode_select_start(self) -> dict:
-        return self.assert_ok("pane.copy_mode.select_start")
+    def pane_copy_mode_select_start(self, ws_id: Optional[int] = None, pane_id: Optional[int] = None) -> dict:
+        args = {}
+        if ws_id is not None:
+            args["workspace_id"] = str(ws_id)
+        if pane_id is not None:
+            args["pane_id"] = str(pane_id)
+        return self.assert_ok("pane.copy_mode.select_start", args)
 
-    def pane_copy_mode_select_end(self) -> dict:
-        return self.assert_ok("pane.copy_mode.select_end")
+    def pane_copy_mode_select_end(self, ws_id: Optional[int] = None, pane_id: Optional[int] = None) -> dict:
+        args = {}
+        if ws_id is not None:
+            args["workspace_id"] = str(ws_id)
+        if pane_id is not None:
+            args["pane_id"] = str(pane_id)
+        return self.assert_ok("pane.copy_mode.select_end", args)
 
-    def pane_copy_mode_yank(self) -> dict:
-        return self.assert_ok("pane.copy_mode.yank")
+    def pane_copy_mode_yank(self, ws_id: Optional[int] = None, pane_id: Optional[int] = None) -> dict:
+        args = {}
+        if ws_id is not None:
+            args["workspace_id"] = str(ws_id)
+        if pane_id is not None:
+            args["pane_id"] = str(pane_id)
+        return self.assert_ok("pane.copy_mode.yank", args)
 
-    def pane_copy_mode_paste(self) -> dict:
-        return self.assert_ok("pane.copy_mode.paste")
+    def pane_copy_mode_paste(self, ws_id: Optional[int] = None, pane_id: Optional[int] = None) -> dict:
+        args = {}
+        if ws_id is not None:
+            args["workspace_id"] = str(ws_id)
+        if pane_id is not None:
+            args["pane_id"] = str(pane_id)
+        return self.assert_ok("pane.copy_mode.paste", args)
+
+    # New copy mode commands for ISS-0032
+    def pane_copy_mode_search(self, pattern: str, backward: bool = False, ws_id: Optional[int] = None, pane_id: Optional[int] = None) -> dict:
+        cmd = "pane.copy_mode.search_backward" if backward else "pane.copy_mode.search_forward"
+        args = {"pattern": pattern}
+        if ws_id is not None:
+            args["workspace_id"] = str(ws_id)
+        if pane_id is not None:
+            args["pane_id"] = str(pane_id)
+        return self.assert_ok(cmd, args)
+
+    def pane_copy_mode_search_next(self, ws_id: Optional[int] = None, pane_id: Optional[int] = None) -> dict:
+        args = {}
+        if ws_id is not None:
+            args["workspace_id"] = str(ws_id)
+        if pane_id is not None:
+            args["pane_id"] = str(pane_id)
+        return self.assert_ok("pane.copy_mode.search_next", args)
+
+    def pane_copy_mode_search_prev(self, ws_id: Optional[int] = None, pane_id: Optional[int] = None) -> dict:
+        args = {}
+        if ws_id is not None:
+            args["workspace_id"] = str(ws_id)
+        if pane_id is not None:
+            args["pane_id"] = str(pane_id)
+        return self.assert_ok("pane.copy_mode.search_prev", args)
+
+    def pane_copy_mode_goto_line(self, line: int, ws_id: Optional[int] = None, pane_id: Optional[int] = None) -> dict:
+        args = {"line": str(line)}
+        if ws_id is not None:
+            args["workspace_id"] = str(ws_id)
+        if pane_id is not None:
+            args["pane_id"] = str(pane_id)
+        return self.assert_ok("pane.copy_mode.goto_line", args)
+
+    def pane_copy_mode_rectangle_toggle(self, ws_id: Optional[int] = None, pane_id: Optional[int] = None) -> dict:
+        args = {}
+        if ws_id is not None:
+            args["workspace_id"] = str(ws_id)
+        if pane_id is not None:
+            args["pane_id"] = str(pane_id)
+        return self.assert_ok("pane.copy_mode.rectangle_toggle", args)
+
+    def pane_copy_mode_copy_pipe(self, command: str, ws_id: Optional[int] = None, pane_id: Optional[int] = None) -> dict:
+        args = {"command": command}
+        if ws_id is not None:
+            args["workspace_id"] = str(ws_id)
+        if pane_id is not None:
+            args["pane_id"] = str(pane_id)
+        return self.assert_ok("pane.copy_mode.copy_pipe", args)
+
+    def pane_copy_mode_select_space(self, ws_id: Optional[int] = None, pane_id: Optional[int] = None) -> dict:
+        args = {}
+        if ws_id is not None:
+            args["workspace_id"] = str(ws_id)
+        if pane_id is not None:
+            args["pane_id"] = str(pane_id)
+        return self.assert_ok("pane.copy_mode.select_space", args)
+
+    def pane_copy_mode_copy_selection(self, ws_id: Optional[int] = None, pane_id: Optional[int] = None) -> dict:
+        args = {}
+        if ws_id is not None:
+            args["workspace_id"] = str(ws_id)
+        if pane_id is not None:
+            args["pane_id"] = str(pane_id)
+        return self.assert_ok("pane.copy_mode.copy_selection", args)
+
+    def pane_copy_mode_copy_selection_and_cancel(self, ws_id: Optional[int] = None, pane_id: Optional[int] = None) -> dict:
+        args = {}
+        if ws_id is not None:
+            args["workspace_id"] = str(ws_id)
+        if pane_id is not None:
+            args["pane_id"] = str(pane_id)
+        return self.assert_ok("pane.copy_mode.copy_selection_and_cancel", args)
 
     # ── Notification operations ──────────────────────────────
 
