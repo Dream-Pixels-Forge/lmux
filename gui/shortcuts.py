@@ -9,6 +9,23 @@ import logging
 logger = logging.getLogger("lmux.shortcuts")
 
 
+# GDK modifier bits. Note 0x2 is LOCK (Caps Lock), not Control.
+SHIFT = 0x1   # Gdk.ModifierType.SHIFT_MASK
+LOCK = 0x2    # Gdk.ModifierType.LOCK_MASK
+CONTROL = 0x4  # Gdk.ModifierType.CONTROL_MASK
+ALT = 0x8     # Gdk.ModifierType.MOD1_MASK
+CTRL_SHIFT = CONTROL | SHIFT
+
+
+def _repair_mods(mods: int) -> int:
+    """Older builds saved Ctrl+Shift as SHIFT|LOCK (0x3). GTK ignores Lock
+    when matching, so those shortcuts fired on plain Shift+letter and ate
+    capital letters typed in the terminal. Map Lock back to Control."""
+    if mods & LOCK:
+        mods = (mods & ~LOCK) | CONTROL
+    return mods
+
+
 @dataclass
 class Shortcut:
     """Represents a keyboard shortcut."""
@@ -27,7 +44,8 @@ class Shortcut:
 
     @classmethod
     def from_dict(cls, d: dict) -> "Shortcut":
-        keys = [(k["keyval"], k["modifiers"]) for k in d.get("keys", [])]
+        keys = [(k["keyval"], _repair_mods(k["modifiers"]))
+                for k in d.get("keys", [])]
         return cls(
             action=d["action"],
             keys=keys,
@@ -38,27 +56,30 @@ class Shortcut:
 
 # Default shortcuts for lmux
 DEFAULT_SHORTCUTS: List[Shortcut] = [
+    # All Ctrl+Shift(+Alt): plain Shift+letter must reach the terminal, and
+    # Ctrl+letter (Ctrl+W, Ctrl+T...) belongs to the shell/editor.
     # Workspace actions
-    Shortcut("workspace.new", [(ord("t"), 0x1 | 0x2)], "New workspace", "workspace"),
-    Shortcut("workspace.close", [(ord("w"), 0x1 | 0x2)], "Close workspace", "workspace"),
+    Shortcut("workspace.new", [(ord("n"), CTRL_SHIFT)], "New workspace", "workspace"),
+    Shortcut("workspace.close", [(ord("w"), CTRL_SHIFT | ALT)], "Close workspace", "workspace"),
     # Tab/Surface actions
-    Shortcut("surface.new", [(ord("t"), 0x1 | 0x2)], "New tab", "surface"),
-    Shortcut("surface.close", [(ord("w"), 0x1 | 0x2)], "Close tab", "surface"),
-    # Pane actions
-    Shortcut("pane.split_v", [(ord("-"), 0x1 | 0x2)], "Split vertical", "pane"),
-    Shortcut("pane.split_h", [(ord("="), 0x1 | 0x2)], "Split horizontal", "pane"),
-    Shortcut("pane.close", [(ord("x"), 0x1 | 0x2)], "Close pane", "pane"),
+    Shortcut("surface.new", [(ord("t"), CTRL_SHIFT)], "New tab", "surface"),
+    Shortcut("surface.close", [(ord("w"), CTRL_SHIFT)], "Close tab", "surface"),
+    # Pane actions (Shift+'-' is '_', so the old '-'/'=' bindings never
+    # matched; Ctrl+Shift+O is taken by session reopen)
+    Shortcut("pane.split_v", [(ord("e"), CTRL_SHIFT)], "Split vertical", "pane"),
+    Shortcut("pane.split_h", [(ord("d"), CTRL_SHIFT)], "Split horizontal", "pane"),
+    Shortcut("pane.close", [(ord("x"), CTRL_SHIFT)], "Close pane", "pane"),
     # Navigation
-    Shortcut("pane.focus_up", [(0xff52, 0x1 | 0x2 | 0x4)], "Focus pane up", "navigation"),  # Up arrow
-    Shortcut("pane.focus_down", [(0xff54, 0x1 | 0x2 | 0x4)], "Focus pane down", "navigation"),  # Down arrow
-    Shortcut("pane.focus_left", [(0xff51, 0x1 | 0x2)], "Focus pane left", "navigation"),  # Left arrow
-    Shortcut("pane.focus_right", [(0xff53, 0x1 | 0x2)], "Focus pane right", "navigation"),  # Right arrow
+    Shortcut("pane.focus_up", [(0xff52, CTRL_SHIFT)], "Focus pane up", "navigation"),  # Up arrow
+    Shortcut("pane.focus_down", [(0xff54, CTRL_SHIFT)], "Focus pane down", "navigation"),  # Down arrow
+    Shortcut("pane.focus_left", [(0xff51, CTRL_SHIFT)], "Focus pane left", "navigation"),  # Left arrow
+    Shortcut("pane.focus_right", [(0xff53, CTRL_SHIFT)], "Focus pane right", "navigation"),  # Right arrow
     # View actions
-    Shortcut("view.sidebar.toggle", [(ord("s"), 0x1 | 0x2)], "Toggle sidebar", "view"),
-    Shortcut("view.command_palette", [(ord("p"), 0x1 | 0x2)], "Command palette", "view"),
-    Shortcut("view.browser.toggle", [(ord("b"), 0x1 | 0x2)], "Toggle browser panel", "view"),
+    Shortcut("view.sidebar.toggle", [(ord("s"), CTRL_SHIFT)], "Toggle sidebar", "view"),
+    Shortcut("view.command_palette", [(ord("p"), CTRL_SHIFT)], "Command palette", "view"),
+    Shortcut("view.browser.toggle", [(ord("b"), CTRL_SHIFT)], "Toggle browser panel", "view"),
     # Application
-    Shortcut("app.quit", [(ord("q"), 0x1 | 0x2)], "Quit lmux", "application"),
+    Shortcut("app.quit", [(ord("q"), CTRL_SHIFT)], "Quit lmux", "application"),
 ]
 
 

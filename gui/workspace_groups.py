@@ -46,12 +46,27 @@ class WorkspaceGroupItem(Gtk.ListBoxRow):
         self.show_all()
 
 
+def normalize_groups(groups) -> Dict[str, List[str]]:
+    """Map a workspace.group.list result to {group_name: [ws_id_str, ...]}.
+
+    The daemon returns a list of {"name", "workspace_count", "workspace_ids"};
+    an older dict-keyed-by-name shape is accepted too. IDs are strings.
+    """
+    if isinstance(groups, dict):
+        return {str(k): [str(i) for i in (v or [])] for k, v in groups.items()}
+    out: Dict[str, List[str]] = {}
+    for g in groups or []:
+        if isinstance(g, dict) and g.get("name"):
+            out[str(g["name"])] = [str(i) for i in g.get("workspace_ids") or []]
+    return out
+
+
 class WorkspaceGroupsPanel(Gtk.Box):
     """Panel for managing workspace groups."""
 
     def __init__(self, client: DaemonClient, parent_window=None):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        self._client = client
+        self._client = client or DaemonClient()
         self._parent_window = parent_window
         self._groups: Dict[str, List[str]] = {}
 
@@ -114,7 +129,7 @@ class WorkspaceGroupsPanel(Gtk.Box):
                 resp = self._client.send("workspace.group.list", {})
                 if resp.get("ok"):
                     result = resp.get("result", {})
-                    groups = result.get("groups", {})
+                    groups = normalize_groups(result.get("groups"))
                     GLib.idle_add(lambda: self._update_groups(groups))
             except Exception as e:
                 logger.error(f"Failed to load workspace groups: {e}")
@@ -253,7 +268,7 @@ class WorkspaceGroupsPanel(Gtk.Box):
             ws_title = ws.get("title", f"Workspace {ws_id}")
 
             # Skip workspaces already in this group
-            if ws_id in self._groups.get(group_name, []):
+            if str(ws_id) in self._groups.get(group_name, []):
                 continue
 
             row = Gtk.ListBoxRow()
@@ -331,7 +346,7 @@ class WorkspaceGroupsPanel(Gtk.Box):
                     resp = self._client.send("workspace.get", {"id": ws_id})
                     if resp.get("ok"):
                         return resp.get("result", {}).get("title", f"Workspace {ws_id}")
-                except:
+                except Exception:
                     pass
                 return f"Workspace {ws_id}"
 

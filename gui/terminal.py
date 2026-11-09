@@ -12,12 +12,22 @@ from panes import PaneContainer
 
 
 class TerminalWidget(Gtk.Box):
-    """A VTE terminal wrapped in a box with title bar."""
+    """A VTE terminal wrapped in a box with title bar.
 
-    def __init__(self, title="Terminal"):
+    With a ``client`` and ``pane_id`` the widget renders a pane the lmux
+    daemon owns: it asks the daemon for the pane's view pty (``pane.attach``,
+    fd passed over the socket with SCM_RIGHTS) and hands it to VTE with
+    ``Vte.Pty.new_foreign_sync``. The shell runs under the daemon, so
+    ``lmux send-keys`` / ``read-screen`` act on exactly what is shown here.
+    Without a client (daemon unreachable) it falls back to a local shell.
+    """
+
+    def __init__(self, title="Terminal", client=None, pane_id=None):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self._title = title
-        self._pane_id = None
+        self._pane_id = pane_id
+        self._attached = False
+        self._on_focus = None  # callback(pane_id) when the VTE gains focus
 
         # Title bar
         self._title_bar = Gtk.EventBox()
@@ -38,7 +48,40 @@ class TerminalWidget(Gtk.Box):
         self._scroll.add(self._vte)
         self.pack_start(self._scroll, True, True, 0)
 
-        # Spawn shell in terminal (use spawn_sync)
+        if client is not None and pane_id is not None:
+            self.attach(client, pane_id)
+        else:
+            self._spawn_local_shell()
+
+        # Connect VTE signals
+        self._vte.connect("window-title-changed", self._on_window_title_changed)
+        self._vte.connect("focus-in-event", self._on_vte_focus_in)
+        self._vte.connect("eof", self._on_vte_eof)
+
+        self.show_all()
+
+    # ── pty source ──────────────────────────────────────────
+
+    def attach(self, client, pane_id):
+        """Render daemon pane ``pane_id``. Returns True on success."""
+        _res, fd = client.attach_pane(pane_id)
+        if fd is None:
+            self._vte.feed(
+                f"\r\n[lmux: cannot attach to pane {pane_id}]\r\n".encode()
+            )
+            return False
+        try:
+            pty = Vte.Pty.new_foreign_sync(fd, None)
+        except GLib.Error:
+            os.close(fd)
+            return False
+        self._vte.set_pty(pty)  # VTE owns the fd from here
+        self._attached = True
+        self._pane_id = pane_id
+        return True
+
+    def _spawn_local_shell(self):
+        """Offline fallback: no daemon, so run a shell in-process."""
         shell = os.environ.get("SHELL", "/bin/sh")
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", DeprecationWarning)
@@ -52,10 +95,19 @@ class TerminalWidget(Gtk.Box):
                 None,  # cancellable
             )
 
-        # Connect VTE signals
-        self._vte.connect("window-title-changed", self._on_window_title_changed)
+    @property
+    def attached(self):
+        """True when this widget renders a daemon-owned pane."""
+        return self._attached
 
-        self.show_all()
+    def _on_vte_focus_in(self, *_args):
+        if self._on_focus is not None:
+            self._on_focus(self._pane_id)
+        return False
+
+    def _on_vte_eof(self, *_args):
+        # The daemon dropped our view (pane closed, or re-attached elsewhere).
+        self._attached = False
 
     @property
     def title(self):
@@ -124,10 +176,13 @@ class TerminalNotebook(Gtk.Notebook):
 
         self.connect("switch-page", self._on_switch_page)
 
-    def add_surface(self, surface_id=None, title=None):
+    def add_surface(self, surface_id=None, title=None, pane_id=None,
+                    daemon=None, workspace_id=None):
         """Add a new surface (notebook tab) with an initial terminal pane.
 
-        Returns (PaneContainer, TerminalWidget).
+        With ``daemon`` (a DaemonClient) the ids are the daemon's and the
+        pane attaches to the daemon's pty. Returns (PaneContainer,
+        TerminalWidget).
         """
         self._counter += 1
         if surface_id is None:
@@ -135,9 +190,11 @@ class TerminalNotebook(Gtk.Notebook):
         if title is None:
             title = f"Surface {self._counter}"
 
-        container = PaneContainer(surface_id=surface_id)
+        container = PaneContainer(surface_id=surface_id, daemon=daemon,
+                                  workspace_id=workspace_id)
         # Create the initial terminal pane for this surface
-        pane_id = 1
+        if pane_id is None:
+            pane_id = 1
         term = container.add_pane(pane_id, title)
 
         # Notebook tab label

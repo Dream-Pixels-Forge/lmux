@@ -1,8 +1,10 @@
 """lmux daemon client — Unix domain socket JSON-RPC."""
 import json
 import os
+import shutil
 import socket
 import stat
+import subprocess
 import threading
 import time
 
@@ -25,6 +27,28 @@ def _get_default_socket_path():
 
 
 DEFAULT_SOCKET_PATH = _get_default_socket_path()
+
+
+def find_lmux_binary():
+    """Locate the lmux CLI: $LMUX_BIN, then the source tree's build/lmux,
+    then PATH (deb / AppImage installs put it in usr/bin)."""
+    env_bin = os.environ.get("LMUX_BIN")
+    if env_bin:
+        return env_bin if os.access(env_bin, os.X_OK) else None
+    repo_bin = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "build", "lmux",
+    )
+    if os.access(repo_bin, os.X_OK):
+        return repo_bin
+    return shutil.which("lmux")
+
+
+def _daemon_log_path():
+    state = os.environ.get("XDG_STATE_HOME") or os.path.expanduser(
+        "~/.local/state"
+    )
+    return os.path.join(state, "lmux", "daemon.log")
 MAX_RESPONSE_SIZE = 16 * 1024 * 1024  # 16 MiB cap to prevent unbounded reads
 
 # N11 (ISS-0027): reconnect backoff for the events stream. A fixed
@@ -65,6 +89,56 @@ class DaemonClient:
         except FileNotFoundError:
             raise
 
+    def is_daemon_alive(self):
+        """True if something is accepting connections on our socket."""
+        try:
+            self._verify_socket()
+            s = socket.socket(socket.AF_UNIX)
+            s.settimeout(1)
+            try:
+                s.connect(self.path)
+            finally:
+                s.close()
+            return True
+        except (OSError, ValueError):
+            return False
+
+    def ensure_daemon(self, timeout=3.0):
+        """Start `lmux daemon` on our socket if none is running.
+
+        Returns True once the daemon accepts connections. Set
+        LMUX_NO_AUTOSTART=1 to disable. Daemon output goes to
+        $XDG_STATE_HOME/lmux/daemon.log. The daemon runs in its own session,
+        so it outlives the GUI (like `lmux daemon --detach`).
+        """
+        if self.is_daemon_alive():
+            return True
+        if os.environ.get("LMUX_NO_AUTOSTART") == "1":
+            return False
+        binary = find_lmux_binary()
+        if not binary:
+            return False
+        log_path = _daemon_log_path()
+        try:
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+            with open(log_path, "ab") as log:
+                subprocess.Popen(
+                    [binary, "--socket", self.path, "daemon"],
+                    stdin=subprocess.DEVNULL,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                    close_fds=True,
+                )
+        except OSError:
+            return False
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.is_daemon_alive():
+                return True
+            time.sleep(0.05)
+        return False
+
     def _connect(self):
         """Establish or re-establish persistent connection (H2 fix)."""
         if self._sock and self._connected:
@@ -88,7 +162,10 @@ class DaemonClient:
             self._connected = False
 
     def _recv_all(self, s):
-        """Read until the daemon closes the connection or timeout.
+        """Read until the daemon closes the connection (it shuts down its
+        write side after the reply) or timeout. Never stop on a short chunk:
+        a reply can arrive in several reads, and stopping early truncated
+        it into "invalid JSON".
 
         Caps total received bytes at MAX_RESPONSE_SIZE to prevent
         unbounded memory use from a misbehaving server.
@@ -106,14 +183,12 @@ class DaemonClient:
                         f"response exceeds {MAX_RESPONSE_SIZE} bytes"
                     )
                 chunks.append(chunk)
-                if len(chunk) < 65536:
-                    break
             except socket.timeout:
                 break
         return b"".join(chunks)
 
     def send(self, cmd, args=None):
-        """Send command with persistent connection + reconnect on failure (H2 fix).
+        """Send one command on its own connection, retrying connect failures.
         Emits hook events and tracks focus changes after successful commands."""
         if args is None:
             args = {}
@@ -128,17 +203,24 @@ class DaemonClient:
         for attempt in range(3):
             try:
                 with self._lock:
+                    # The daemon serves exactly one request per connection
+                    # and then closes it, so a reused socket would send the
+                    # next request into a dead connection ("empty
+                    # response"). Connect fresh for every request.
+                    self._disconnect()
                     s = self._connect()
                     try:
                         s.sendall(payload.encode())
                         raw = self._recv_all(s)
-                    except (socket.error, OSError):
+                    finally:
                         self._disconnect()
-                        raise
                 if not raw:
                     result = {"ok": False, "error": "empty response"}
                 else:
-                    result = json.loads(raw.decode().strip())
+                    try:
+                        result = json.loads(raw.decode().strip())
+                    except (json.JSONDecodeError, ValueError) as e:
+                        result = {"ok": False, "error": f"invalid JSON response: {e}"}
                 break
             except PermissionError as e:
                 result = {"ok": False, "error": f"permission denied: {e}"}
@@ -214,6 +296,7 @@ class DaemonClient:
         def _run():
             backoff = SSE_BACKOFF_INITIAL
             while not stop.is_set():
+                s = None
                 try:
                     s = socket.socket(socket.AF_UNIX)
                     s.settimeout(1)
@@ -241,9 +324,14 @@ class DaemonClient:
                                         pass
                         except socket.timeout:
                             continue
-                    s.close()
                 except Exception:
                     pass
+                finally:
+                    if s is not None:
+                        try:
+                            s.close()
+                        except Exception:
+                            pass
                 if not stop.is_set():
                     # N11: exponential backoff (1s doubling to 30s max),
                     # interruptible so stop() stays prompt.
@@ -254,6 +342,49 @@ class DaemonClient:
         t = threading.Thread(target=_run, daemon=True)
         t.start()
         return stop
+    # ── pane attach (daemon-owned terminals) ──────────────
+
+    def attach_pane(self, pane_id, timeout=5.0):
+        """Attach to a daemon pane's terminal.
+
+        Sends ``pane.attach`` on a dedicated connection; the daemon answers
+        with JSON and passes a pty master fd as SCM_RIGHTS ancillary data.
+        Returns ``(result_dict, fd)``; ``fd`` is None on failure. The caller
+        owns the fd (hand it to ``Vte.Pty.new_foreign_sync``).
+        """
+        payload = json.dumps(
+            {"cmd": "pane.attach", "args": {"pane_id": str(pane_id)}}
+        ) + "\n"
+        fds = []
+        try:
+            self._verify_socket()
+            s = socket.socket(socket.AF_UNIX)
+            s.settimeout(timeout)
+            try:
+                s.connect(self.path)
+                s.sendall(payload.encode())
+                data, fds, _flags, _addr = socket.recv_fds(s, 65536, 1)
+                chunks = [data]
+                while data and not chunks[-1].endswith(b"\n"):
+                    data = s.recv(65536)
+                    if not data:
+                        break
+                    chunks.append(data)
+            finally:
+                s.close()
+            resp = json.loads(b"".join(chunks).decode().strip() or "{}")
+        except (OSError, ValueError) as e:
+            for fd in fds:
+                os.close(fd)
+            return {"ok": False, "error": str(e)}, None
+        if not resp.get("ok") or not fds:
+            for fd in fds:
+                os.close(fd)
+            return resp, None
+        for extra in fds[1:]:
+            os.close(extra)
+        return resp.get("result", {}), fds[0]
+
     # ── hook & focus tracking ─────────────────────────────
 
     def _emit_hook(self, event, **kwargs):

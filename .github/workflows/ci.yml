@@ -3,7 +3,7 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
   push:
-    branches: [master]
+    branches: [main]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -79,6 +79,14 @@ jobs:
 
       - name: Run Python integration suite
         run: python3 tests/test_integration.py
+
+      # Headless GUI-module tests (no GTK/display needed). These used to run
+      # only on developer machines, so regressions like Shift+letter being
+      # swallowed by shortcuts never showed up in CI.
+      - name: Run headless GUI tests
+        run: |
+          python3 tests/test_shortcuts.py
+          python3 tests/test_daemon_autostart.py
 
   sanitizers:
     runs-on: ubuntu-latest
