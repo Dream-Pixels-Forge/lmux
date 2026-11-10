@@ -8,7 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Security
-
+- Command replies now JSON-escape every user-supplied string. 112 values were
+  inserted raw: titles, names, paths, hosts, hook commands, config values and
+  error-message fragments. One `"` in any of them made the reply invalid
+  JSON, or let it carry extra fields.
+- Replies grow to fit instead of being written with `written += snprintf(...)`.
+  An over-long value used to push `written` past the buffer, so the next
+  `result_cap - written` wrapped around and the following write overflowed
+  the heap. Fifteen list commands had the same pattern in fixed stack
+  buffers.
+- `events`: `after_seq` was copied into the reply as a bare value, so a
+  non-numeric one could add fields that the server then read back; it now
+  accepts digits only. The server parses the stream filters with the JSON
+  helpers instead of `strstr`.
 - Fixed a stack buffer overflow in the daemon's JSON string parser: a
   `\uXXXX` escape landing at the end of a field's buffer wrote past it, so a
   single request could crash `lmuxd` (and every terminal it owns). A string
@@ -23,7 +35,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `stat()`ing the socket path; concurrent connections are capped (256).
 
 ### Fixed
-
+- Replies that escaped two values with `JESC()` (`template.create`,
+  `cloud.vms.create`, `team.add`, `file_explorer.open_file`/`create_dir`) printed
+  one of the values twice, because both calls shared a single buffer.
+  `template.create` reported the workspace title as the template name.
+- `workspace.env` listing cut keys using the raw string's length applied to
+  the escaped string, which gave wrong keys and could split an escape.
+- `naming.suggest` could cache a list truncated mid-element and later replay
+  it as invalid JSON.
+- `lmux_app_free` now frees windows, SSH sessions and feed panels/entries
+  that are still open at shutdown.
 - Emoji and other non-BMP characters (`\ud83d\ude00` pairs) decode
   correctly instead of becoming U+FFFD.
 - `buffer-*`, `hook-fired`, `window.created`, `ssh.session_created`,

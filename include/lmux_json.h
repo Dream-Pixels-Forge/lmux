@@ -51,9 +51,12 @@ bool lmux_json_extract_bool(const char *json, const char *key, bool *out);
  * Truncates cleanly (never mid-escape) when `cap` is too small. */
 char *lmux_json_escape(char *out, size_t cap, const char *in);
 
-/* Escape into a thread-local rotating buffer (8 slots x 2048 bytes), so up to
- * eight results can be used in one printf-style call. Intended for event and
- * log payloads; longer values are truncated. Never returns NULL. */
+/* Escape into a thread-local rotating buffer, so up to LMUX_JSON_ESC_SLOTS
+ * results can be used in one printf-style call (the largest reply in
+ * dispatch_command needs 9). Values longer than a slot are truncated cleanly.
+ * Never returns NULL. */
+#define LMUX_JSON_ESC_SLOTS     16
+#define LMUX_JSON_ESC_SLOT_SIZE 4096
 const char *lmux_json_esc(const char *in);
 
 #ifdef __cplusplus

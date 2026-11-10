@@ -234,8 +234,8 @@ char *lmux_json_escape(char *out, size_t cap, const char *in) {
 }
 
 const char *lmux_json_esc(const char *in) {
-    static _Thread_local char bufs[8][2048];
+    static _Thread_local char bufs[LMUX_JSON_ESC_SLOTS][LMUX_JSON_ESC_SLOT_SIZE];
     static _Thread_local unsigned idx;
-    char *b = bufs[idx++ & 7];
+    char *b = bufs[idx++ % LMUX_JSON_ESC_SLOTS];
     return lmux_json_escape(b, sizeof bufs[0], in);
 }
