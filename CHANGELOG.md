@@ -35,6 +35,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `stat()`ing the socket path; concurrent connections are capped (256).
 
 ### Fixed
+- Turning **Auto-save session** off now works. The daemon always restored
+  the last snapshot at startup (the setting's `restore_on_start` was set but
+  never read) and always saved one on quit, so an old session kept coming
+  back. The setting now controls both, takes effect immediately when changed
+  from Settings (`config.set`), and the shutdown path no longer saves a second
+  copy to a recomputed path that ignored a custom `auto_save_path`.
+- `lmux workspace.list` printed only the first workspace: the CLI's
+  single-object output matched the first `"id"` anywhere in the reply, so a
+  list's first element was printed alone. Titles with quotes now also print
+  unescaped.
+- The sidebar no longer shows two file browsers. The built-in "Files"
+  extension tab duplicated the File Explorer panel, and listed the GUI
+  process's working directory rather than the workspace's. Removing it also
+  narrows the sidebar from 364px to 316px (window minimum width 447 → 397px).
 - Replies that escaped two values with `JESC()` (`template.create`,
   `cloud.vms.create`, `team.add`, `file_explorer.open_file`/`create_dir`) printed
   one of the values twice, because both calls shared a single buffer.

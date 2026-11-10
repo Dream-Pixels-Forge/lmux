@@ -2128,6 +2128,17 @@ static lmux_surface *surface_new(lmux_workspace *ws) {
 /* ------------------------------------------------------------------ */
 
 
+/* Derive the session save/restore behaviour from the config's "Auto-save
+ * session" setting. restore_on_start used to be set here but never read:
+ * a snapshot on disk was always restored, so turning the setting off in
+ * the GUI could not stop an old session from coming back. */
+static void app_apply_session_config(lmux_app *a) {
+    if (!a || !a->config) return;
+    a->auto_save_interval = a->config->auto_save_session
+        ? a->config->auto_save_interval_sec : 0;
+    a->restore_on_start = a->config->auto_save_session;
+}
+
 lmux_app *lmux_app_new(const char *socket_path) {
     lmux_app *a = calloc(1, sizeof *a);
     if (socket_path) {
@@ -2171,6 +2182,9 @@ lmux_app *lmux_app_new(const char *socket_path) {
     /* Config path defaults */
     lmux_config_path(a->config_path, sizeof a->config_path);
     lmux_data_path(a->auto_save_path, sizeof a->auto_save_path, "snapshot.json");
+    /* Without a config file the default ("Auto-save session" on) still
+     * decides restore; periodic saving stays off unless configured. */
+    a->restore_on_start = a->config ? a->config->auto_save_session : true;
 
     /* Read config file once into buffer */
     char cbuf[32768];
@@ -2185,12 +2199,7 @@ lmux_app *lmux_app_new(const char *socket_path) {
     /* Parse structured config from same buffer */
     if (a->config && cn > 0) {
         lmux_config_load_buf(a->config, cbuf, cn);
-        if (a->config->auto_save_session) {
-            a->auto_save_interval = a->config->auto_save_interval_sec;
-        } else {
-            a->auto_save_interval = 0;
-        }
-        a->restore_on_start = a->config->auto_save_session;
+        app_apply_session_config(a);
         
         /* Apply logging configuration (ISS-0002): file, level, format,
          * rotation. These are per-process globals and each daemon is its
@@ -2688,8 +2697,10 @@ void lmux_log_request(const char *request_id, const char *cmd, bool ok, const ch
 }
 
 void lmux_app_quit(lmux_app *a, int code) {
-    /* Auto-save session before quitting */
-    if (a && a->auto_save_path[0]) {
+    if (!a) return;
+    /* Auto-save the session before quitting, unless "Auto-save session" is
+     * off (then the previous session must not come back next start). */
+    if (a->auto_save_path[0] && (!a->config || a->config->auto_save_session)) {
         lmux_snapshot_save(a, a->auto_save_path);
     }
     a->running    = false;
@@ -7607,8 +7618,14 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         else if (strcmp(key, "scrollback_lines") == 0) app->config->scrollback_lines = (int)atol(value);
         else if (strcmp(key, "show_sidebar") == 0) app->config->show_sidebar = (strcmp(value, "true") == 0);
         else if (strcmp(key, "show_notifications_panel") == 0) app->config->show_notifications_panel = (strcmp(value, "true") == 0);
-        else if (strcmp(key, "auto_save_session") == 0) app->config->auto_save_session = (strcmp(value, "true") == 0);
-        else if (strcmp(key, "auto_save_interval_sec") == 0) app->config->auto_save_interval_sec = (int)atol(value);
+        else if (strcmp(key, "auto_save_session") == 0) {
+            app->config->auto_save_session = (strcmp(value, "true") == 0);
+            app_apply_session_config(app);   /* takes effect now, not on restart */
+        }
+        else if (strcmp(key, "auto_save_interval_sec") == 0) {
+            app->config->auto_save_interval_sec = (int)atol(value);
+            app_apply_session_config(app);
+        }
         else if (strcmp(key, "default_shell") == 0) snprintf(app->config->default_shell, sizeof app->config->default_shell, "%s", value);
         else if (strcmp(key, "agent_claude_code") == 0) snprintf(app->config->agent_paths[0], 512, "%s", value);
         else if (strcmp(key, "agent_opencode") == 0) snprintf(app->config->agent_paths[1], 512, "%s", value);
@@ -12546,6 +12563,11 @@ void lmux_app_auto_save(lmux_app *app) {
 
 void lmux_app_auto_restore(lmux_app *app) {
     if (!app || !app->auto_save_path[0]) return;
+    if (!app->restore_on_start) {
+        lmux_log(LMUX_LOG_INFO, "session: auto-save is off, not restoring %s",
+                 app->auto_save_path);
+        return;
+    }
     struct stat st;
     if (stat(app->auto_save_path, &st) == 0) {
         /* The daemon serves every client on its own thread (client_thread,

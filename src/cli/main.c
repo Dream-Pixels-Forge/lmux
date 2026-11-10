@@ -20,6 +20,7 @@
 
 
 #include "lmux.h"
+#include "lmux_json.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1541,25 +1542,21 @@ static void print_response(const char *response, bool raw_json) {
     const char *obj = res;
     while (*obj && *obj != '{') obj++;
     if (*obj == '{') {
-        id_v = strstr(obj, "\"id\":");
-        title_v = strstr(obj, "\"title\":");
-        kind_v = strstr(obj, "\"kind\":");
-        const char *end = strchr(obj, '}');
-        if (id_v && end && id_v < end) {
-            id_v += 5;
-            while (*id_v == ' ') id_v++;
-            printf("  ");
-            if (title_v && title_v < end) {
-                title_v += 9;
-                while (*title_v && *title_v != '"') putchar(*title_v++);
-            } else if (kind_v && kind_v < end) {
-                kind_v += 7;
-                while (*kind_v && *kind_v != '"') putchar(*kind_v++);
-            } else {
-                printf("object");
-            }
-            printf(" (id=");
-            while (*id_v && *id_v != ',' && *id_v != '}' && *id_v != ' ') putchar(*id_v++);
+        /* Only the result object's OWN id/title/kind count. Searching for the
+         * first "id" anywhere matched the first element of a list (e.g.
+         * workspace.list), printed it alone and returned, so `lmux
+         * workspace.list` showed one workspace however many existed. */
+        id_v = lmux_json_find_toplevel_key(obj, "id", NULL);
+        title_v = lmux_json_find_toplevel_key(obj, "title", NULL);
+        kind_v = lmux_json_find_toplevel_key(obj, "kind", NULL);
+        if (id_v) {
+            char label[512] = {0};
+            if (!(title_v && lmux_json_decode_string(title_v, label, sizeof label)) &&
+                !(kind_v && lmux_json_decode_string(kind_v, label, sizeof label)))
+                snprintf(label, sizeof label, "object");
+            printf("  %s (id=", label);
+            if (*id_v == '"') id_v++;
+            while (*id_v && *id_v != ',' && *id_v != '}' && *id_v != ' ' && *id_v != '"') putchar(*id_v++);
             printf(")\n");
             return;
         }
@@ -1964,21 +1961,11 @@ int main(int argc, char **argv) {
              * relayed keystrokes are not delayed by a fixed tick. */
             lmux_app_wait(app, 16);
         }
-        /* Graceful shutdown: save snapshot, stop server, cleanup. */
+        /* Graceful shutdown: save snapshot, stop server, cleanup.
+         * lmux_app_quit() saves to the configured auto_save_path, and only
+         * when "Auto-save session" is on. This used to also save to a path
+         * recomputed here, ignoring both a custom path and the setting. */
         if (daemon_app_global) {
-            char snap_path[512];
-            const char *xdg = getenv("XDG_DATA_HOME");
-            if (xdg) {
-                snprintf(snap_path, sizeof snap_path, "%s/lmux/snapshot.json", xdg);
-            } else {
-                const char *home = getenv("HOME");
-                if (home) {
-                    snprintf(snap_path, sizeof snap_path, "%s/.local/share/lmux/snapshot.json", home);
-                } else {
-                    snprintf(snap_path, sizeof snap_path, "/tmp/lmux/snapshot.json");
-                }
-            }
-            lmux_snapshot_save(daemon_app_global, snap_path);
             lmux_app_quit(daemon_app_global, 0);
         }
         lmux_http_server_stop();
