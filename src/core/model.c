@@ -2418,6 +2418,17 @@ void lmux_app_free(lmux_app *a) {
     if (a->event_log_fp) fclose(a->event_log_fp);
     free(a->notifications.items);
     /* Free configuration */
+    /* Windows, SSH sessions and feed panels/entries are flat structs that
+     * were only freed one by one on close; whatever was still open at
+     * shutdown leaked (caught by the sanitizer run of test_json_fuzz). */
+    {
+        vec_t *flat[] = { &a->windows, &a->ssh_sessions, &a->feed_panels, &a->feed_entries };
+        for (size_t v = 0; v < sizeof flat / sizeof *flat; v++) {
+            for (size_t i = 0; i < flat[v]->len; i++) free(flat[v]->items[i]);
+            free(flat[v]->items);
+            *flat[v] = (vec_t){0};
+        }
+    }
     lmux_config_free(a->config);
     hooks_free_all(a);
     naming_cache_free_all(a);
@@ -4836,6 +4847,43 @@ static lmux_pane *arg_pane(lmux_app *app, const char *args_json, bool *given) {
 #define PANE_NOT_FOUND_JSON \
     "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"pane not found\"}}"
 
+/* Append printf-style output to a dispatch reply, growing the buffer to fit.
+ *
+ * Replies used to be built with snprintf(result + written, result_cap -
+ * written, ...) and `written += <return value>`. snprintf returns the length
+ * it WOULD have written, so an over-long value (more likely now that user text
+ * is JSON-escaped) truncated the reply mid-JSON and pushed `written` past
+ * result_cap; the next `result_cap - written` then wrapped around to a huge
+ * size_t and the following write overflowed the heap buffer. This measures
+ * first, reallocs when needed, and only then writes. On OOM the fragment is
+ * dropped and the reply stays NUL-terminated. Returns the new length. */
+static int result_appendf(char **res, size_t *cap, int *written, const char *fmt, ...)
+    __attribute__((format(printf, 4, 5)));
+static int result_appendf(char **res, size_t *cap, int *written, const char *fmt, ...) {
+    size_t w = *written > 0 ? (size_t)*written : 0;
+    if (*cap == 0 || w >= *cap) w = *cap ? *cap - 1 : 0;
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(*res + w, *cap - w, fmt, ap);
+    va_end(ap);
+    if (n < 0) { (*res)[w] = 0; *written = (int)w; return *written; }
+    if ((size_t)n >= *cap - w) {
+        size_t need = w + (size_t)n + 1;
+        size_t ncap = *cap * 2 > need ? *cap * 2 : need + 4096;
+        char *t = realloc(*res, ncap);
+        if (!t) { (*res)[w] = 0; *written = (int)w; return *written; }
+        *res = t;
+        *cap = ncap;
+        va_start(ap, fmt);
+        vsnprintf(*res + w, *cap - w, fmt, ap);
+        va_end(ap);
+    }
+    *written = (int)(w + (size_t)n);
+    return *written;
+}
+#define RESULT_APPENDF(...) result_appendf(&result, &result_cap, &written, __VA_ARGS__)
+#define RESULT_SETF(...)    (written = 0, result_appendf(&result, &result_cap, &written, __VA_ARGS__))
+
 static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_json) {
     size_t result_cap = 16384;
     char *result = malloc(result_cap);
@@ -4852,10 +4900,11 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
 } while(0)
     /* Fixed-size stack buffer for JSON escaping output strings.
      * Large enough for titles, paths, branch names. */
-    char _esc_buf[1024];
-    /* Escape `in` into _esc_buf and return _esc_buf. Not reentrant —
-     * only use as a direct snprintf argument (consumed before next use). */
-    #define JESC(in) (json_escape_str(_esc_buf, sizeof _esc_buf, (in)))
+    /* Escape `in` for a JSON string. Uses lmux_json_esc's rotating
+     * thread-local buffers, so several JESC() calls can appear in one
+     * snprintf. (It used to share one buffer: two JESC() arguments in the
+     * same call both printed whichever was evaluated last.) */
+    #define JESC(in) lmux_json_esc(in)
 
     /* --- workspace.create --- */
     if (strcmp(cmd, "workspace.create") == 0) {
@@ -4876,7 +4925,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                 }
             }
             
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":true,\"result\":{\"id\":%u,\"title\":\"%s\"}}",
                 ws->id, JESC(ws->title));
             lmux_event_push(app, "workspace.created", "workspace", "\"id\":%u,\"title\":\"%s\"", ws->id, lmux_json_esc(ws->title));
@@ -4888,7 +4937,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                 control_emit("session", _cl);
             }
         } else {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"create_failed\",\"message\":\"failed to create workspace\"}}");
         }
         goto done;
@@ -4896,29 +4945,29 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
 
     /* --- session.group.list --- */
     if (strcmp(cmd, "session.group.list") == 0) {
-        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{\"groups\":[");
+        RESULT_SETF( "{\"ok\":true,\"result\":{\"groups\":[");
         for (size_t i = 0; i < app->session_groups.len; i++) {
             lmux_session_group *g = app->session_groups.items[i];
             RESULT_GROW;
-            if (i > 0) written += snprintf(result + written, result_cap - written, ",");
-            written += snprintf(result + written, result_cap - written,
+            if (i > 0) RESULT_APPENDF( ",");
+            RESULT_APPENDF(
                 "{\"id\":%u,\"name\":\"%s\",\"workspace_count\":%zu,\"synchronize_from\":%u}",
                 g->id, JESC(g->name), g->workspace_ids.len, g->synchronize_from);
         }
-        written += snprintf(result + written, result_cap - written, "]}}");
+        RESULT_APPENDF( "]}}");
         goto done;
     }
 
     /* --- workspace.list --- */
     if (strcmp(cmd, "workspace.list") == 0) {
-        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{\"workspaces\":[");
+        RESULT_SETF( "{\"ok\":true,\"result\":{\"workspaces\":[");
         for (size_t i = 0; i < app->workspaces.len; i++) {
             lmux_workspace *ws = app->workspaces.items[i];
             RESULT_GROW;
             char _te[512], _ce[1024], _be[256], _le[1024];
-            if (i > 0) written += snprintf(result + written, result_cap - written, ",");
+            if (i > 0) RESULT_APPENDF( ",");
             /* unread/waiting/last_notify feed the sidebar's attention dot. */
-            written += snprintf(result + written, result_cap - written,
+            RESULT_APPENDF(
                 "{\"id\":%u,\"title\":\"%s\",\"cwd\":\"%s\",\"git_branch\":\"%s\","
                 "\"unread\":%s,\"waiting\":%s,\"last_notify\":\"%s\"}",
                 ws->id,
@@ -4929,7 +4978,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                 ws->waiting ? "true" : "false",
                 json_escape_str(_le, sizeof _le, ws->last_notify));
         }
-        written += snprintf(result + written, result_cap - written, "]}}");
+        RESULT_APPENDF( "]}}");
         goto done;
     }
 
@@ -4943,7 +4992,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             if (ws) {
             lmux_event_push(app, "workspace.closed", "workspace", "\"id\":%u", wid);
                 lmux_workspace_close(app, ws);
-                written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+                RESULT_SETF( "{\"ok\":true,\"result\":{}}");
                 /* ISS-0029: control fan-out. */
                 {
                     char _cl[128];
@@ -4951,11 +5000,11 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                     control_emit("session", _cl);
                 }
             } else {
-                written = snprintf(result, result_cap,
+                RESULT_SETF(
                     "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"workspace not found\"}}");
             }
         } else {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing id\"}}");
         }
         goto done;
@@ -4975,7 +5024,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                 app->ws_last = app->ws_current;
                 app->ws_current = ws;
                 ws->focused = true;
-                written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+                RESULT_SETF( "{\"ok\":true,\"result\":{}}");
                 /* ISS-0029: control fan-out. */
                 {
                     char _ct[256], _cl[320];
@@ -4984,11 +5033,11 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                     control_emit("session", _cl);
                 }
             } else {
-                written = snprintf(result, result_cap,
+                RESULT_SETF(
                     "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"workspace not found\"}}");
             }
         } else {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing id\"}}");
         }
         goto done;
@@ -4999,14 +5048,14 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         lmux_workspace *ws = lmux_workspace_focused(app);
         if (ws) {
             char _te[512], _ce[1024], _be[256];
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":true,\"result\":{\"id\":%u,\"title\":\"%s\",\"cwd\":\"%s\",\"git_branch\":\"%s\"}}",
                 ws->id,
                 json_escape_str(_te, sizeof _te, ws->title),
                 json_escape_str(_ce, sizeof _ce, ws->cwd),
                 json_escape_str(_be, sizeof _be, ws->git_branch));
         } else {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no workspaces\"}}");
         }
         goto done;
@@ -5022,7 +5071,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             lmux_workspace *ws = lmux_workspace_by_id(app, wid);
             if (ws) {
                 lmux_workspace_set_title(ws, title);
-                written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+                RESULT_SETF( "{\"ok\":true,\"result\":{}}");
                 /* ISS-0029: control fan-out. */
                 {
                     char _ct[256], _cl[320];
@@ -5031,11 +5080,11 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                     control_emit("session", _cl);
                 }
             } else {
-                written = snprintf(result, result_cap,
+                RESULT_SETF(
                     "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"workspace not found\"}}");
             }
         } else {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing id and/or title\"}}");
         }
         goto done;
@@ -5052,7 +5101,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             lmux_surface *s = lmux_surface_create(ws, title[0] ? title : NULL);
             if (s) {
                 lmux_pane *p0 = s->panes.len ? s->panes.items[0] : NULL;
-                written = snprintf(result, result_cap,
+                RESULT_SETF(
                     "{\"ok\":true,\"result\":{\"id\":%u,\"title\":\"%s\","
                     "\"workspace_id\":%u,\"pane_id\":%u}}",
                     s->id, JESC(s->title), ws->id, p0 ? p0->id : 0);
@@ -5064,11 +5113,11 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                     control_emit("layout", _cl);
                 }
             } else {
-                written = snprintf(result, result_cap,
+                RESULT_SETF(
                     "{\"ok\":false,\"error\":{\"code\":\"create_failed\",\"message\":\"failed to create surface\"}}");
             }
         } else {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"workspace not found\"}}");
         }
         goto done;
@@ -5081,12 +5130,12 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         lmux_workspace *ws = ws_id[0] ? lmux_workspace_by_id(app, (lmux_id)atol(ws_id))
                                       : lmux_workspace_focused(app);
         if (ws) {
-            written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{\"surfaces\":[");
+            RESULT_SETF( "{\"ok\":true,\"result\":{\"surfaces\":[");
             for (size_t i = 0; i < ws->surfaces.len; i++) {
                 lmux_surface *s = ws->surfaces.items[i];
                 RESULT_GROW;
                 char _se[512];
-                if (i > 0) written += snprintf(result + written, result_cap - written, ",");
+                if (i > 0) RESULT_APPENDF( ",");
                 /* Count how many workspaces this surface is linked to */
                 int linked_count = 1;  /* at least the current workspace */
                 for (size_t j = 0; j < app->workspaces.len; j++) {
@@ -5099,13 +5148,13 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                         }
                     }
                 }
-                written += snprintf(result + written, result_cap - written,
+                RESULT_APPENDF(
                     "{\"id\":%u,\"title\":\"%s\",\"focused\":%s,\"linked_count\":%d}",
                     s->id, json_escape_str(_se, sizeof _se, s->title), s->focused ? "true" : "false", linked_count);
             }
-            written += snprintf(result + written, result_cap - written, "]}}");
+            RESULT_APPENDF( "]}}");
         } else {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no workspaces\"}}");
         }
         goto done;
@@ -5118,7 +5167,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         json_extract_int(args_json, "target_workspace_id", &target_ws_id);
         
         if (surface_id == 0 || target_ws_id == 0) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing surface_id or target_workspace_id\"}}");
             goto done;
         }
@@ -5137,14 +5186,14 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         }
         
         if (!surf) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"surface not found\"}}");
             goto done;
         }
         
         lmux_workspace *target_ws = lmux_workspace_by_id(app, (lmux_id)target_ws_id);
         if (!target_ws) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"target workspace not found\"}}");
             goto done;
         }
@@ -5152,7 +5201,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         /* Check if both workspaces are in the same group */
         if (source_ws->group_id == 0 || target_ws->group_id == 0 || 
             source_ws->group_id != target_ws->group_id) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"workspaces must be in the same session group\"}}");
             goto done;
         }
@@ -5160,7 +5209,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         /* Check if surface is already linked to target workspace */
         for (size_t i = 0; i < target_ws->surfaces.len; i++) {
             if (target_ws->surfaces.items[i] == surf) {
-                written = snprintf(result, result_cap,
+                RESULT_SETF(
                     "{\"ok\":true,\"result\":{}}");  /* Already linked, idempotent */
                 goto done;
             }
@@ -5173,7 +5222,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         /* Emit control notification */
         window_link_emit_control(app, (lmux_id)surface_id, (lmux_id)target_ws_id, true);
         
-        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+        RESULT_SETF( "{\"ok\":true,\"result\":{}}");
         goto done;
     }
 
@@ -5184,14 +5233,14 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         json_extract_int(args_json, "workspace_id", &ws_id);
         
         if (surface_id == 0 || ws_id == 0) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing surface_id or workspace_id\"}}");
             goto done;
         }
         
         lmux_workspace *ws = lmux_workspace_by_id(app, (lmux_id)ws_id);
         if (!ws) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"workspace not found\"}}");
             goto done;
         }
@@ -5218,12 +5267,12 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                 /* Emit control notification */
                 window_link_emit_control(app, (lmux_id)surface_id, (lmux_id)ws_id, false);
                 
-                written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+                RESULT_SETF( "{\"ok\":true,\"result\":{}}");
                 goto done;
             }
         }
         
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"surface not linked to this workspace\"}}");
         goto done;
     }
@@ -5236,7 +5285,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         lmux_workspace *ws = ws_id[0] ? lmux_workspace_by_id(app, (lmux_id)atol(ws_id))
                                       : lmux_workspace_focused(app);
         if (!ws) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no workspaces\"}}");
             goto done;
         }
@@ -5246,7 +5295,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                 lmux_surface *s = ws->surfaces.items[i];
                 if (s->id == sid) {
                     lmux_surface_close(ws, s);
-                    written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+                    RESULT_SETF( "{\"ok\":true,\"result\":{}}");
                     /* ISS-0029: control fan-out. */
                     {
                         char _cl[128];
@@ -5256,7 +5305,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                     goto done;
                 }
             }
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"surface not found\"}}");
         } else if (ws->surfaces.len > 0) {
             /* tmux-like default: close the focused surface. */
@@ -5264,7 +5313,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             if (!s) s = ws->surfaces.items[0];
             lmux_id cid = s->id;
             lmux_surface_close(ws, s);
-            written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+            RESULT_SETF( "{\"ok\":true,\"result\":{}}");
             /* ISS-0029: control fan-out (id captured before close frees s). */
             {
                 char _cl[128];
@@ -5272,7 +5321,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                 control_emit("layout", _cl);
             }
         } else {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"no surfaces\"}}");
         }
         goto done;
@@ -5288,14 +5337,14 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         bool pane_given = false;
         lmux_pane *target = arg_pane(app, args_json, &pane_given);
         if (pane_given && !target) {
-            written = snprintf(result, result_cap, PANE_NOT_FOUND_JSON);
+            RESULT_SETF( PANE_NOT_FOUND_JSON);
             goto done;
         }
         lmux_workspace *ws = target ? target->owner
                            : ws_id[0] ? lmux_workspace_by_id(app, (lmux_id)atol(ws_id))
                                       : lmux_workspace_focused(app);
         if (!ws) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"workspace not found\"}}");
             goto done;
         }
@@ -5315,7 +5364,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             if (!s && ws->surfaces.len > 0) s = ws->surfaces.items[0];
         }
         if (!s) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"surface not found\"}}");
             goto done;
         }
@@ -5325,14 +5374,14 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         }
         lmux_pane *p = pane_split_ex(ws, s, target, dir, command[0] ? command : NULL, true);
         if (!p) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"create_failed\",\"message\":\"failed to split\"}}");
             goto done;
         }
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"id\":%u,\"kind\":\"%s\",\"surface_id\":%u,"
             "\"workspace_id\":%u,\"target_pane_id\":%u,\"direction\":\"%s\"}}",
-            p->id, p->kind, s->id, ws->id, p->split_from,
+            p->id, lmux_json_esc(p->kind), s->id, ws->id, p->split_from,
             dir == LMUX_SPLIT_VERTICAL ? "v" : "h");
         /* ISS-0029: control fan-out. */
         {
@@ -5356,7 +5405,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             p = fws ? lmux_pane_focused(fws) : NULL;
         }
         if (!p) {
-            written = snprintf(result, result_cap, PANE_NOT_FOUND_JSON);
+            RESULT_SETF( PANE_NOT_FOUND_JSON);
             goto done;
         }
         lmux_workspace *pws = p->owner;
@@ -5381,7 +5430,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                 np->focused = true;
             }
         }
-        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{\"id\":%u}}", closed);
+        RESULT_SETF( "{\"ok\":true,\"result\":{\"id\":%u}}", closed);
         goto done;
     }
 
@@ -5394,14 +5443,14 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         lmux_workspace *ws = ws_id[0] ? lmux_workspace_by_id(app, (lmux_id)atol(ws_id))
                                       : lmux_workspace_focused(app);
         if (ws) {
-            written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{\"panes\":[");
+            RESULT_SETF( "{\"ok\":true,\"result\":{\"panes\":[");
             bool first = true;
             for (size_t i = 0; i < ws->surfaces.len; i++) {
                 lmux_surface *s = ws->surfaces.items[i];
                 for (size_t j = 0; j < s->panes.len; j++) {
                     lmux_pane *p = s->panes.items[j];
                     RESULT_GROW;
-                    if (!first) written += snprintf(result + written, result_cap - written, ",");
+                    if (!first) RESULT_APPENDF( ",");
                     
                     /* Build pane JSON with optional formatted field */
                     /* Expanded text comes from pane state (titles, cwd,
@@ -5427,12 +5476,12 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                         result = _tmp;
                     }
 
-                    written += snprintf(result + written, result_cap - written,
+                    RESULT_APPENDF(
                         "{\"id\":%u,\"kind\":\"%s\",\"focused\":%s,\"surface_id\":%u,"
                         "\"command_running\":%s,\"last_command_exit\":%d,"
                         "\"last_command_duration_ms\":%ld,\"last_command_started\":%ld,"
                         "\"split_from\":%u,\"split_dir\":\"%s\",\"exited\":%s%s}",
-                        p->id, p->kind, p->focused ? "true" : "false", s->id,
+                        p->id, lmux_json_esc(p->kind), p->focused ? "true" : "false", s->id,
                         p->cmd_running ? "true" : "false",
                         p->last_cmd_exit, p->last_cmd_duration_ms,
                         p->last_cmd_started_ms,
@@ -5443,9 +5492,9 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                     first = false;
                 }
             }
-            written += snprintf(result + written, result_cap - written, "]}}");
+            RESULT_APPENDF( "]}}");
         } else {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no workspaces\"}}");
         }
         goto done;
@@ -5466,7 +5515,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                     lmux_pane *p = s->panes.items[j];
                     if (p->id == pid) {
                         lmux_pane_focus(ws, p);
-                        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+                        RESULT_SETF( "{\"ok\":true,\"result\":{}}");
                         /* ISS-0029: control fan-out. */
                         {
                             char _cl[128];
@@ -5478,10 +5527,10 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                     }
                 }
             }
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"pane not found\"}}");
         } else {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing id\"}}");
         }
         goto done;
@@ -5499,7 +5548,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         lmux_workspace *ws = ws_id[0] ? lmux_workspace_by_id(app, (lmux_id)atol(ws_id))
                                       : lmux_workspace_focused(app);
         if (!ws) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"workspace not found\"}}");
             goto done;
         }
@@ -5523,7 +5572,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             }
         }
         lmux_event_push(app, "pane.resized", "pane", NULL);
-        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+        RESULT_SETF( "{\"ok\":true,\"result\":{}}");
         goto done;
     }
 
@@ -5533,13 +5582,13 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         json_extract_string(args_json, "dx", dx_str, sizeof dx_str);
         json_extract_string(args_json, "dy", dy_str, sizeof dy_str);
         if (!dx_str[0] && !dy_str[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing dx and/or dy\"}}");
             goto done;
         }
         lmux_workspace *ws = lmux_workspace_focused(app);
         if (!ws) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no workspaces\"}}");
             goto done;
         }
@@ -5547,7 +5596,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         int dy = dy_str[0] ? (int)atol(dy_str) : 0;
         lmux_pane_focus_dir(ws, dx, dy);
         lmux_event_push(app, "pane.focused", "pane", "\"id\":%u", lmux_pane_focused(ws)->id);
-        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+        RESULT_SETF( "{\"ok\":true,\"result\":{}}");
         goto done;
     }
 
@@ -5560,7 +5609,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         lmux_workspace *ws = ws_id[0] ? lmux_workspace_by_id(app, (lmux_id)atol(ws_id))
                                       : lmux_workspace_focused(app);
         if (!ws || !p_id[0] || !val_str[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing id and/or value\"}}");
             goto done;
         }
@@ -5576,9 +5625,9 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         }
         if (p) {
             lmux_pane_set_remain_on_exit(p, value);
-            written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+            RESULT_SETF( "{\"ok\":true,\"result\":{}}");
         } else {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"pane not found\"}}");
         }
         goto done;
@@ -5592,7 +5641,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         lmux_workspace *ws = ws_id[0] ? lmux_workspace_by_id(app, (lmux_id)atol(ws_id))
                                       : lmux_workspace_focused(app);
         if (!ws || !p_id[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing id\"}}");
             goto done;
         }
@@ -5607,9 +5656,9 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         }
         if (p) {
             bool value = lmux_pane_get_remain_on_exit(p);
-            written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{\"value\":%s}}", value ? "true" : "false");
+            RESULT_SETF( "{\"ok\":true,\"result\":{\"value\":%s}}", value ? "true" : "false");
         } else {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"pane not found\"}}");
         }
         goto done;
@@ -5622,13 +5671,13 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         lmux_workspace *ws = ws_id[0] ? lmux_workspace_by_id(app, (lmux_id)atol(ws_id))
                                       : lmux_workspace_focused(app);
         if (!ws) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"workspace not found\"}}");
             goto done;
         }
         lmux_workspace_refresh(ws);
         lmux_event_push(app, "workspace.refreshed", "workspace", "\"id\":%u", ws->id);
-        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+        RESULT_SETF( "{\"ok\":true,\"result\":{}}");
         goto done;
     }
 
@@ -5644,14 +5693,14 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         bool pane_given = false;
         lmux_pane *p = arg_pane(app, args_json, &pane_given);
         if (pane_given && !p) {
-            written = snprintf(result, result_cap, PANE_NOT_FOUND_JSON);
+            RESULT_SETF( PANE_NOT_FOUND_JSON);
             goto done;
         }
         if (p) goto read_screen_pane;
         lmux_workspace *ws = ws_id[0] ? lmux_workspace_by_id(app, (lmux_id)atol(ws_id))
                                       : lmux_workspace_focused(app);
         if (!ws) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"workspace not found\"}}");
             goto done;
         }
@@ -5668,7 +5717,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             s = lmux_surface_focused(ws);
         }
         if (!s) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"surface not found\"}}");
             goto done;
         }
@@ -5678,7 +5727,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         }
         if (!p && s->panes.len > 0) p = s->panes.items[0];
         if (!p) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no pty to read\"}}");
             goto done;
         }
@@ -5689,7 +5738,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
              * write, so a restored pane is not unreadable until typed into. */
             if (pane_spawn_pty(p) != 0) {
                 lmux_log(LMUX_LOG_DEBUG, "read-screen: no pty for pane %u", p->id);
-                written = snprintf(result, result_cap,
+                RESULT_SETF(
                     "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no pty to read\"}}");
                 goto done;
             }
@@ -5703,7 +5752,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
          * NUL termination so embedded NULs cannot truncate the capture. */
         size_t start = (p->sb_len > LMUX_CAPTURE_MAX) ? p->sb_len - LMUX_CAPTURE_MAX : 0;
         size_t n = p->sb_len - start;
-        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{\"text\":\"");
+        RESULT_SETF( "{\"ok\":true,\"result\":{\"text\":\"");
         if (written < 0) written = 0;
         for (size_t ii = 0; ii < n; ii++) {
             RESULT_GROW;
@@ -5721,8 +5770,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             }
         }
         RESULT_GROW;
-        int tail = snprintf(result + written, result_cap - (size_t)written, "\"}}");
-        if (tail > 0) written += tail;
+        RESULT_APPENDF("\"}}");
         result[written] = 0;
         goto done;
     }
@@ -5736,9 +5784,9 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         
         int rc = lmux_buffer_set(app, name[0] ? name : NULL, data, strlen(data));
         if (rc == 0) {
-            written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+            RESULT_SETF( "{\"ok\":true,\"result\":{}}");
         } else {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"set_failed\",\"message\":\"failed to set buffer\"}}");
         }
         goto done;
@@ -5749,7 +5797,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         char name[64] = {0};
         json_extract_string(args_json, "name", name, sizeof name);
         if (!name[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing name\"}}");
             goto done;
         }
@@ -5757,7 +5805,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         size_t size = lmux_buffer_get(app, name, NULL, 0);
         char *data = malloc(size + 1);
         if (!data) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"oom\",\"message\":\"out of memory\"}}");
             goto done;
         }
@@ -5782,9 +5830,9 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         escaped[esc_len] = '\0';
         free(data);
         
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"name\":\"%s\",\"data\":\"%s\",\"size\":%zu}}",
-            name, escaped, size);
+            lmux_json_esc(name), escaped, size);
         goto done;
     }
 
@@ -5793,16 +5841,16 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         char *names[256];
         size_t count = lmux_buffer_list(app, names, 256);
         
-        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{\"buffers\":[");
+        RESULT_SETF( "{\"ok\":true,\"result\":{\"buffers\":[");
         for (size_t i = 0; i < count; i++) {
             lmux_buffer *buf = buffer_find(app, names[i]);
             RESULT_GROW;
-            if (i > 0) written += snprintf(result + written, result_cap - written, ",");
-            written += snprintf(result + written, result_cap - written,
-                "{\"name\":\"%s\",\"size\":%zu}", names[i], buf ? buf->size : 0);
+            if (i > 0) RESULT_APPENDF( ",");
+            RESULT_APPENDF(
+                "{\"name\":\"%s\",\"size\":%zu}", lmux_json_esc(names[i]), buf ? buf->size : 0);
             free(names[i]);
         }
-        written += snprintf(result + written, result_cap - written, "]}}");
+        RESULT_APPENDF( "]}}");
         goto done;
     }
 
@@ -5811,13 +5859,13 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         char name[64] = {0};
         json_extract_string(args_json, "name", name, sizeof name);
         if (!name[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing name\"}}");
             goto done;
         }
         
         bool rc = lmux_buffer_delete(app, name);
-        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{\"deleted\":%s}}", rc ? "true" : "false");
+        RESULT_SETF( "{\"ok\":true,\"result\":{\"deleted\":%s}}", rc ? "true" : "false");
         goto done;
     }
 
@@ -5827,15 +5875,15 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         json_extract_string(args_json, "name", name, sizeof name);
         json_extract_string(args_json, "path", path, sizeof path);
         if (!name[0] || !path[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing name or path\"}}");
             goto done;
         }
         
         bool rc = lmux_buffer_save(app, name, path);
-        written = snprintf(result, result_cap, "{\"ok\":%s,\"result\":{}}", rc ? "true" : "false");
+        RESULT_SETF( "{\"ok\":%s,\"result\":{}}", rc ? "true" : "false");
         if (!rc) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"save_failed\",\"message\":\"failed to save buffer\"}}");
         }
         goto done;
@@ -5847,15 +5895,15 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         json_extract_string(args_json, "name", name, sizeof name);
         json_extract_string(args_json, "path", path, sizeof path);
         if (!name[0] || !path[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing name or path\"}}");
             goto done;
         }
         
         bool rc = lmux_buffer_load(app, name, path);
-        written = snprintf(result, result_cap, "{\"ok\":%s,\"result\":{}}", rc ? "true" : "false");
+        RESULT_SETF( "{\"ok\":%s,\"result\":{}}", rc ? "true" : "false");
         if (!rc) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"load_failed\",\"message\":\"failed to load buffer\"}}");
         }
         goto done;
@@ -5872,7 +5920,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         json_extract_string(args_json, "end_line", end_str, sizeof end_str);
         
         if (!buf_name[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing buffer_name\"}}");
             goto done;
         }
@@ -5880,7 +5928,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         lmux_workspace *ws = ws_id[0] ? lmux_workspace_by_id(app, (lmux_id)atol(ws_id))
                                       : lmux_workspace_focused(app);
         if (!ws) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"workspace not found\"}}");
             goto done;
         }
@@ -5898,7 +5946,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             s = lmux_surface_focused(ws);
         }
         if (!s) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"surface not found\"}}");
             goto done;
         }
@@ -5910,7 +5958,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         }
         if (!p && s->panes.len > 0) p = s->panes.items[0];
         if (!p) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no pane to capture\"}}");
             goto done;
         }
@@ -5920,9 +5968,9 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         
         int rc = lmux_buffer_capture_pane(app, p, buf_name, start_line, end_line);
         if (rc == 0) {
-            written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{\"buffer_name\":\"%s\"}}", buf_name);
+            RESULT_SETF( "{\"ok\":true,\"result\":{\"buffer_name\":\"%s\"}}", lmux_json_esc(buf_name));
         } else {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"capture_failed\",\"message\":\"failed to capture pane\"}}");
         }
         goto done;
@@ -5939,14 +5987,14 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         }
         
         size_t limit = lmux_buffer_get_limit(app);
-        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{\"limit\":%zu}}", limit);
+        RESULT_SETF( "{\"ok\":true,\"result\":{\"limit\":%zu}}", limit);
         goto done;
     }
 
     /* buffer.count - get buffer count */
     if (strcmp(cmd, "buffer.count") == 0) {
         size_t count = lmux_buffer_count(app);
-        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{\"count\":%zu}}", count);
+        RESULT_SETF( "{\"ok\":true,\"result\":{\"count\":%zu}}", count);
         goto done;
     }
 
@@ -5963,13 +6011,13 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             lmux_pane *tp = arg_pane(app, args_json, &pane_given);
             if (pane_given) {
                 if (!tp) {
-                    written = snprintf(result, result_cap, PANE_NOT_FOUND_JSON);
+                    RESULT_SETF( PANE_NOT_FOUND_JSON);
                 } else if (!text[0]) {
-                    written = snprintf(result, result_cap,
+                    RESULT_SETF(
                         "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing text\"}}");
                 } else {
                     lmux_pane_send_keys(tp, text);
-                    written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{\"pane_id\":%u}}", tp->id);
+                    RESULT_SETF( "{\"ok\":true,\"result\":{\"pane_id\":%u}}", tp->id);
                 }
                 goto done;
             }
@@ -5977,7 +6025,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         lmux_workspace *ws = ws_id[0] ? lmux_workspace_by_id(app, (lmux_id)atol(ws_id))
                                       : lmux_workspace_focused(app);
         if (!ws) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"workspace not found\"}}");
             goto done;
         }
@@ -6004,7 +6052,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                     if (cp->focused) { p = cp; break; }
                 }
                 lmux_pane_send_keys(p, text);
-                written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+                RESULT_SETF( "{\"ok\":true,\"result\":{}}");
                 /* ISS-0029: %output streaming hook. v1 echoes the sent text
                  * (sanitized, truncated); a PTY-output tap is future work. */
                 {
@@ -6014,11 +6062,11 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                     control_emit("output", _ol);
                 }
             } else {
-                written = snprintf(result, result_cap,
+                RESULT_SETF(
                     "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no focused pane\"}}");
             }
         } else {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing text\"}}");
         }
         goto done;
@@ -6057,27 +6105,27 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             waiting ? "true" : "false",
             lmux_json_esc(created ? created->workspace_id : ""),
             created ? (unsigned)created->pane_id : 0u);
-        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{\"seq\":%llu}}",
+        RESULT_SETF( "{\"ok\":true,\"result\":{\"seq\":%llu}}",
                            (unsigned long long)app->notify_seq);
         goto done;
     }
 
     /* --- notification.list --- */
     if (strcmp(cmd, "notification.list") == 0) {
-        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{\"notifications\":[");
+        RESULT_SETF( "{\"ok\":true,\"result\":{\"notifications\":[");
         for (size_t i = 0; i < app->notifications.len; i++) {
             const lmux_notification *n = app->notifications.items[i];
             char _ne[2048];
             RESULT_GROW;
-            if (i > 0) written += snprintf(result + written, result_cap - written, ",");
-            written += snprintf(result + written, result_cap - written,
+            if (i > 0) RESULT_APPENDF( ",");
+            RESULT_APPENDF(
                 "{\"seq\":%llu,\"text\":\"%s\",\"waiting\":%s,\"created_at\":%lld,"
                 "\"workspace_id\":\"%s\",\"pane_id\":%u}",
                 (unsigned long long)n->seq, json_escape_str(_ne, sizeof _ne, n->text),
                 n->waiting ? "true" : "false",
-                (long long)n->created_at, n->workspace_id, (unsigned)n->pane_id);
+                (long long)n->created_at, lmux_json_esc(n->workspace_id), (unsigned)n->pane_id);
         }
-        written += snprintf(result + written, result_cap - written, "]}}");
+        RESULT_APPENDF( "]}}");
         goto done;
     }
 
@@ -6088,7 +6136,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         }
         app->notifications.len = 0;
         lmux_event_push(app, "notification.cleared", "notification", NULL);
-        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+        RESULT_SETF( "{\"ok\":true,\"result\":{}}");
         goto done;
     }
 
@@ -6100,7 +6148,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         if (mr_ws[0]) {
             lmux_workspace *ws = lmux_workspace_by_id(app, (lmux_id)atol(mr_ws));
             if (!ws) {
-                written = snprintf(result, result_cap,
+                RESULT_SETF(
                     "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"workspace not found\"}}");
                 goto done;
             }
@@ -6115,7 +6163,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             }
         }
         lmux_event_push(app, "notification.read", "notification", NULL);
-        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+        RESULT_SETF( "{\"ok\":true,\"result\":{}}");
         goto done;
     }
 
@@ -6125,15 +6173,15 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         json_extract_string(args_json, "pane_id", pane_id_str, sizeof pane_id_str);
         json_extract_string(args_json, "reason", reason, sizeof reason);
         if (!pane_id_str[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing pane_id\"}}");
             goto done;
         }
         lmux_id pid = (lmux_id)atol(pane_id_str);
         if (lmux_notification_ring_add(app, pid, reason[0] ? reason : NULL)) {
-            written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+            RESULT_SETF( "{\"ok\":true,\"result\":{}}");
         } else {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"ring_failed\",\"message\":\"could not add ring\"}}");
         }
         goto done;
@@ -6144,15 +6192,15 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         char pane_id_str[64] = {0};
         json_extract_string(args_json, "pane_id", pane_id_str, sizeof pane_id_str);
         if (!pane_id_str[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing pane_id\"}}");
             goto done;
         }
         lmux_id pid = (lmux_id)atol(pane_id_str);
         if (lmux_notification_ring_clear(app, pid)) {
-            written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+            RESULT_SETF( "{\"ok\":true,\"result\":{}}");
         } else {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"ring not found\"}}");
         }
         goto done;
@@ -6161,7 +6209,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
     /* --- notification.ring.list --- */
     if (strcmp(cmd, "notification.ring.list") == 0) {
         size_t count = lmux_notification_ring_count(app);
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"count\":%zu}}", count);
         goto done;
     }
@@ -6174,7 +6222,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         json_extract_string(args_json, "transform", transform, sizeof transform);
         json_extract_string(args_json, "redirect", redirect, sizeof redirect);
         if (!event[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing event\"}}");
             goto done;
         }
@@ -6183,10 +6231,10 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             transform[0] ? transform : NULL,
             redirect[0] ? redirect : NULL);
         if (idx >= 0) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":true,\"result\":{\"index\":%d}}", idx);
         } else {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"hook_failed\",\"message\":\"could not add hook\"}}");
         }
         goto done;
@@ -6197,14 +6245,14 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         char event[64] = {0};
         json_extract_string(args_json, "event", event, sizeof event);
         if (!event[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing event\"}}");
             goto done;
         }
         if (lmux_notification_hook_remove(app, event)) {
-            written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+            RESULT_SETF( "{\"ok\":true,\"result\":{}}");
         } else {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"hook not found\"}}");
         }
         goto done;
@@ -6213,7 +6261,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
     /* --- notification.hooks.list --- */
     if (strcmp(cmd, "notification.hooks.list") == 0) {
         size_t count = lmux_notification_hook_count(app);
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"count\":%zu}}", count);
         goto done;
     }
@@ -6224,7 +6272,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         json_extract_string(args_json, "id", s_id, sizeof s_id);
         json_extract_string(args_json, "workspace_id", ws_id, sizeof ws_id);
         if (!s_id[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing id\"}}");
             goto done;
         }
@@ -6255,7 +6303,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             }
         }
         if (!found || !found_ws) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"surface not found\"}}");
             goto done;
         }
@@ -6264,7 +6312,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         }
         found->focused = true;
         lmux_event_push(app, "surface.focused", "surface", "\"id\":%u", found->id);
-        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+        RESULT_SETF( "{\"ok\":true,\"result\":{}}");
         goto done;
     }
 
@@ -6277,7 +6325,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         lmux_workspace *ws = ws_id[0] ? lmux_workspace_by_id(app, (lmux_id)atol(ws_id))
                                       : lmux_workspace_focused(app);
         if (!ws) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"workspace not found\"}}");
             goto done;
         }
@@ -6294,12 +6342,12 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             s = lmux_surface_focused(ws);
         }
         if (!s) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"surface not found\"}}");
             goto done;
         }
         if (!text[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing text\"}}");
             goto done;
         }
@@ -6311,9 +6359,9 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         if (!p && s->panes.len > 0) p = s->panes.items[0];
         if (p) {
             lmux_pane_send_keys(p, text);
-            written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+            RESULT_SETF( "{\"ok\":true,\"result\":{}}");
         } else {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no panes\"}}");
         }
         goto done;
@@ -6325,7 +6373,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         json_extract_string(args_json, "from_index", from_str, sizeof from_str);
         json_extract_string(args_json, "to_index", to_str, sizeof to_str);
         if (!from_str[0] || !to_str[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing from_index and/or to_index\"}}");
             goto done;
         }
@@ -6333,12 +6381,12 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         size_t to = (size_t)atol(to_str);
         size_t len = app->workspaces.len;
         if (from >= len || to >= len) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"out_of_range\",\"message\":\"index out of range\"}}");
             goto done;
         }
         if (from == to) {
-            written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+            RESULT_SETF( "{\"ok\":true,\"result\":{}}");
             goto done;
         }
         void *tmp = app->workspaces.items[from];
@@ -6351,7 +6399,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         }
         lmux_event_push(app, "workspace.reordered", "workspace", NULL);
         app->workspaces.items[to] = tmp;
-        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+        RESULT_SETF( "{\"ok\":true,\"result\":{}}");
         goto done;
     }
 
@@ -6372,21 +6420,21 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             snprintf(resolved, sizeof resolved, "%s/snapshot.json", root);
         } else {
             if (req[0] == '~' || !is_safe_path(req, root)) {
-                written = snprintf(result, result_cap,
+                RESULT_SETF(
                     "{\"ok\":false,\"error\":{\"code\":\"invalid_params\","
                     "\"message\":\"snapshot path must be relative and inside %s\"}}",
-                    root);
+                    lmux_json_esc(root));
                 goto done;
             }
             snprintf(resolved, sizeof resolved, "%s/%s", root, req);
         }
         if (!lmux_snapshot_save(app, resolved)) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"save_failed\",\"message\":\"failed to save snapshot\"}}");
             goto done;
         }
         json_escape_str(esc, sizeof esc, resolved);
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"path\":\"%s\"}}", esc);
         goto done;
     }
@@ -6411,26 +6459,26 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         if (!req[0]) {
             snprintf(resolved, sizeof resolved, "%s/snapshot.json", root);
         } else if (req[0] == '~') {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\","
                 "\"message\":\"snapshot path must be relative and inside %s\"}}",
-                root);
+                lmux_json_esc(root));
             goto done;
         } else if (req[0] == '/') {
             if (!path_inside_root(req, root)) {
-                written = snprintf(result, result_cap,
+                RESULT_SETF(
                     "{\"ok\":false,\"error\":{\"code\":\"invalid_params\","
                     "\"message\":\"snapshot path must be relative and inside %s\"}}",
-                    root);
+                    lmux_json_esc(root));
                 goto done;
             }
             snprintf(resolved, sizeof resolved, "%s", req);
         } else {
             if (!is_safe_path(req, root)) {
-                written = snprintf(result, result_cap,
+                RESULT_SETF(
                     "{\"ok\":false,\"error\":{\"code\":\"invalid_params\","
                     "\"message\":\"snapshot path must be relative and inside %s\"}}",
-                    root);
+                    lmux_json_esc(root));
                 goto done;
             }
             snprintf(resolved, sizeof resolved, "%s/%s", root, req);
@@ -6438,10 +6486,10 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         bool ok = lmux_snapshot_load(app, resolved);
         if (ok) {
             json_escape_str(esc, sizeof esc, resolved);
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":true,\"result\":{\"path\":\"%s\"}}", esc);
         } else {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"load_failed\",\"message\":\"failed to load snapshot\"}}");
         }
         goto done;
@@ -6454,7 +6502,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         json_extract_string(args_json, "target_workspace_id", target_ws_id, sizeof target_ws_id);
         json_extract_string(args_json, "workspace_id", source_ws_id, sizeof source_ws_id);
         if (!s_id[0] || !target_ws_id[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing id and/or target_workspace_id\"}}");
             goto done;
         }
@@ -6463,7 +6511,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                                                 : NULL;
         lmux_workspace *dst_ws = lmux_workspace_by_id(app, (lmux_id)atol(target_ws_id));
         if (!dst_ws) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"target workspace not found\"}}");
             goto done;
         }
@@ -6482,12 +6530,12 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             }
         }
         if (!found_s || !found_ws) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"surface not found\"}}");
             goto done;
         }
         if (found_ws == dst_ws) {
-            written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+            RESULT_SETF( "{\"ok\":true,\"result\":{}}");
             goto done;
         }
         /* Remove from source workspace */
@@ -6500,7 +6548,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         /* Add to target workspace */
         vec_push(&dst_ws->surfaces, found_s);
         lmux_event_push(app, "surface.moved", "surface", "\"id\":%u,\"target_ws\":%u", found_s->id, dst_ws->id);
-        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+        RESULT_SETF( "{\"ok\":true,\"result\":{}}");
         goto done;
     }
 
@@ -6511,7 +6559,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         json_extract_string(args_json, "title", title, sizeof title);
         json_extract_string(args_json, "workspace_id", ws_id, sizeof ws_id);
         if (!s_id[0] || !title[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing id and/or title\"}}");
             goto done;
         }
@@ -6539,13 +6587,13 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             }
         }
         if (!found) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"surface not found\"}}");
             goto done;
         }
         snprintf(found->title, sizeof found->title, "%s", title);
         lmux_event_push(app, "surface.renamed", "surface", "\"id\":%u,\"title\":\"%s\"", found->id, lmux_json_esc(title));
-        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+        RESULT_SETF( "{\"ok\":true,\"result\":{}}");
         goto done;
     }
 
@@ -6565,7 +6613,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         json_extract_string(args_json, "workspace_id", ws_id, sizeof ws_id);
         json_extract_bool(args_json, "enabled", &enabled);
         if (sid == 0) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing id\"}}");
             goto done;
         }
@@ -6592,7 +6640,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             }
         }
         if (!found) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"surface not found\"}}");
             goto done;
         }
@@ -6607,7 +6655,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                 control_emit("pane", line);
             }
         }
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"synchronize_panes\":%s}}", enabled ? "true" : "false");
         goto done;
     }
@@ -6627,7 +6675,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         json_extract_string(args_json, "workspace_id", ws_id, sizeof ws_id);
         json_extract_string(args_json, "policy", policy_str, sizeof policy_str);
         if (sid == 0 || !policy_str[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing id and/or policy\"}}");
             goto done;
         }
@@ -6637,7 +6685,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         else if (strcmp(policy_str, "latest") == 0) policy = LMUX_WINDOW_SIZE_LATEST;
         else if (strcmp(policy_str, "manual") == 0) policy = LMUX_WINDOW_SIZE_MANUAL;
         else {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"policy must be manual|largest|smallest|latest\"}}");
             goto done;
         }
@@ -6664,7 +6712,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             }
         }
         if (!found) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"surface not found\"}}");
             goto done;
         }
@@ -6679,7 +6727,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                 control_emit("pane", line);
             }
         }
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"window_size_policy\":%d}}", policy);
         goto done;
     }
@@ -6704,36 +6752,36 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             if (tmp) result = tmp;
         }
         /* Build hierarchy: workspaces -> surfaces -> panes */
-        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{\"windows\":[{\"id\":1,\"workspaces\":[");
+        RESULT_SETF( "{\"ok\":true,\"result\":{\"windows\":[{\"id\":1,\"workspaces\":[");
         int first_ws = 1;
         for (size_t i = 0; i < ws_count; i++) {
             lmux_workspace *ws = app->workspaces.items[i];
-            if (!first_ws) written += snprintf(result + written, result_cap - written, ",");
+            if (!first_ws) RESULT_APPENDF( ",");
             first_ws = 0;
             char _we[512];
-            written += snprintf(result + written, result_cap - written,
+            RESULT_APPENDF(
                 "{\"id\":%u,\"title\":\"%s\",\"surfaces\":[", ws->id, json_escape_str(_we, sizeof _we, ws->title));
             int first_s = 1;
             for (size_t j = 0; j < ws->surfaces.len; j++) {
                 lmux_surface *s = ws->surfaces.items[j];
-                if (!first_s) written += snprintf(result + written, result_cap - written, ",");
+                if (!first_s) RESULT_APPENDF( ",");
                 first_s = 0;
                 char _se[512];
-                written += snprintf(result + written, result_cap - written,
+                RESULT_APPENDF(
                     "{\"id\":%u,\"title\":\"%s\",\"panes\":[", s->id, json_escape_str(_se, sizeof _se, s->title));
                 int first_p = 1;
                 for (size_t k = 0; k < s->panes.len; k++) {
                     lmux_pane *p = s->panes.items[k];
-                    if (!first_p) written += snprintf(result + written, result_cap - written, ",");
+                    if (!first_p) RESULT_APPENDF( ",");
                     first_p = 0;
-                    written += snprintf(result + written, result_cap - written,
+                    RESULT_APPENDF(
                         "{\"id\":%u,\"pty_pid\":%d}", p->id, (int)p->child_pid);
                 }
-                written += snprintf(result + written, result_cap - written, "]}");
+                RESULT_APPENDF( "]}");
             }
-            written += snprintf(result + written, result_cap - written, "]}");
+            RESULT_APPENDF( "]}");
         }
-        written += snprintf(result + written, result_cap - written, "]}]}}");
+        RESULT_APPENDF( "]}]}}");
         goto done;
     }
 
@@ -6744,7 +6792,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         json_extract_string(args_json, "port", port_str, sizeof port_str);
 
         if (!host[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing host\"}}");
             goto done;
         }
@@ -6753,12 +6801,12 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         lmux_workspace *ws = lmux_workspace_ssh_create(app, host, port);
 
         if (!ws) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"create_failed\",\"message\":\"failed to create SSH workspace\"}}");
             goto done;
         }
         char _te[512], _he[512];
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"workspace_id\":%u,\"title\":\"%s\",\"command\":\"ssh %s\"}}",
             ws->id, json_escape_str(_te, sizeof _te, ws->title), json_escape_str(_he, sizeof _he, host));
         goto done;
@@ -6769,7 +6817,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         char msg[1024] = {0};
         json_extract_string(args_json, "message", msg, sizeof msg);
         char _me[2048];
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"message\":\"%s\"}}", json_escape_str(_me, sizeof _me, msg));
         goto done;
     }
@@ -6799,7 +6847,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                             }
                             s->focused = true;
                             lmux_pane_focus(ws, p);
-                            written = snprintf(result, result_cap,
+                            RESULT_SETF(
                                 "{\"ok\":true,\"result\":{\"pane_id\":%u}}", p->id);
                             goto done;
                         }
@@ -6807,7 +6855,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                 }
             }
         }
-        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+        RESULT_SETF( "{\"ok\":true,\"result\":{}}");
         goto done;
     }
 
@@ -6828,7 +6876,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             app->ws_current = app->workspaces.items[idx];
             app->ws_current->focused = true;
         }
-        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+        RESULT_SETF( "{\"ok\":true,\"result\":{}}");
         goto done;
     }
 
@@ -6849,7 +6897,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             app->ws_current = app->workspaces.items[idx];
             app->ws_current->focused = true;
         }
-        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+        RESULT_SETF( "{\"ok\":true,\"result\":{}}");
         goto done;
     }
 
@@ -6863,19 +6911,19 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             app->ws_current->focused = true;
             app->ws_last = NULL;
         }
-        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+        RESULT_SETF( "{\"ok\":true,\"result\":{}}");
         goto done;
     }
     /* --- ping --- */
     if (strcmp(cmd, "ping") == 0) {
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"version\":\"%s\"}}", LMUX_VERSION);
         goto done;
     }
 
     /* --- health.live --- Process is responding. */
     if (strcmp(cmd, "health.live") == 0) {
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"status\":\"alive\",\"pid\":%d,\"uptime_seconds\":%ld}}",
             (int)getpid(), (long)(time(NULL) - app->start_time));
         goto done;
@@ -6885,7 +6933,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
     if (strcmp(cmd, "health.ready") == 0) {
         /* Check: app running, workspaces accessible, server listening. */
         bool ready = app->running && app->listen_fd >= 0;
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":%s,\"result\":{\"status\":\"%s\",\"workspaces\":%zu,\"surfaces\":%zu}}",
             ready ? "true" : "false",
             ready ? "ready" : "not_ready",
@@ -6896,7 +6944,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
 
     /* --- metrics --- Server metrics (Prometheus-style). */
     if (strcmp(cmd, "metrics") == 0) {
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{"
             "\"requests\":%llu,\"errors\":%llu,\"connections\":%llu,"
             "\"uptime_seconds\":%ld,\"workspaces\":%zu}}",
@@ -6986,7 +7034,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         }
 
         /* Build JSON response with lines (proper JSON strings, escaped). */
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"lines\":[");
         /* ISS-0010: grow the heap result buffer up front to the worst
          * case (each escaped line can approach 8KB plus quote/comma
@@ -7012,17 +7060,17 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             }
         }
         for (int k = 0; k < count; k++) {
-            if (k > 0) written += snprintf(result + written, result_cap - written, ",");
+            if (k > 0) RESULT_APPENDF( ",");
             /* Escape the line for JSON */
             char escaped[8192] = {0};
             int idx = (start + k) % log_limit;
             log_json_escape(lines[idx], escaped, sizeof(escaped));
-            written += snprintf(result + written, result_cap - written,
+            RESULT_APPENDF(
                 "\"%s\"", escaped);
             free(lines[idx]);
         }
         free(lines);
-        written += snprintf(result + written, result_cap - written, "]");
+        RESULT_APPENDF( "]");
         /* ISS-0006: advertise the SSE stream when the caller asked to
          * follow — the CLI only streams (sse_stream_logs) while this
          * endpoint is present in the response. */
@@ -7030,10 +7078,10 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         json_extract_bool(args_json, "follow", &follow);
         if (follow) {
             RESULT_GROW;
-            written += snprintf(result + written, result_cap - written,
+            RESULT_APPENDF(
                 ",\"sse_endpoint\":\"/api/logs/stream\"");
         }
-        written += snprintf(result + written, result_cap - written, "}}");
+        RESULT_APPENDF( "}}");
         goto done;
     }
 
@@ -7048,7 +7096,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                 (void)unused_write;
             }
         }
-        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+        RESULT_SETF( "{\"ok\":true,\"result\":{}}");
         goto done;
     }
 
@@ -7073,9 +7121,9 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         }
         if (p) {
             bool ok = lmux_pane_respawn(p);
-            written = snprintf(result, result_cap, "{\"ok\":%s,\"result\":{}}", ok ? "true" : "false");
+            RESULT_SETF( "{\"ok\":%s,\"result\":{}}", ok ? "true" : "false");
         } else {
-            written = snprintf(result, result_cap, "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"pane not found\"}}");
+            RESULT_SETF( "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"pane not found\"}}");
         }
         goto done;
     }
@@ -7110,7 +7158,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                 }
             }
         }
-        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+        RESULT_SETF( "{\"ok\":true,\"result\":{}}");
         goto done;
     }
 
@@ -7163,7 +7211,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                 lmux_event_push(app, "pane.swapped", "pane", "\"id1\":%u,\"id2\":%u", p1->id, p2->id);
             }
         }
-        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+        RESULT_SETF( "{\"ok\":true,\"result\":{}}");
         goto done;
     }
 
@@ -7197,7 +7245,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             lmux_event_push(app, "pane.broken", "pane", "\"id\":%u,\"new_workspace_id\":%u",
                 p->id, nws->id);
         }
-        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+        RESULT_SETF( "{\"ok\":true,\"result\":{}}");
         goto done;
     }
 
@@ -7228,7 +7276,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                     src->id, dst->id);
             }
         }
-        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+        RESULT_SETF( "{\"ok\":true,\"result\":{}}");
         goto done;
     }
     /* --- workspace.env --- */
@@ -7242,7 +7290,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         if (ws_id_str[0]) ws = lmux_workspace_by_id(app, (lmux_id)atol(ws_id_str));
 
         if (!ws) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"workspace not found\"}}");
             goto done;
         }
@@ -7263,7 +7311,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                 }
             }
             if (!found) vec_push(&ws->env_vars, strdup(entry));
-            written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+            RESULT_SETF( "{\"ok\":true,\"result\":{}}");
             goto done;
         } else if (key[0]) {
             /* Get */
@@ -7276,23 +7324,22 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                     break;
                 }
             }
-            written = snprintf(result, result_cap,
-                "{\"ok\":true,\"result\":{\"value\":\"%s\"}}", val);
+            RESULT_SETF(
+                "{\"ok\":true,\"result\":{\"value\":\"%s\"}}", lmux_json_esc(val));
             goto done;
         } else {
-            /* List all */
-            char buf[8192];
-            int n = snprintf(buf, sizeof buf, "{\"ok\":true,\"result\":{\"env\":[");
+            /* List all. Each key is cut at '=' BEFORE escaping: taking the
+             * length from the raw string and applying it to the escaped one
+             * printed the wrong length and could split an escape. */
+            RESULT_SETF("{\"ok\":true,\"result\":{\"env\":[");
             for (size_t ei = 0; ei < ws->env_vars.len; ei++) {
-                if (ei > 0) n += snprintf(buf + n, sizeof buf - n, ",");
-                char *eq = strchr(ws->env_vars.items[ei], '=');
-                n += snprintf(buf + n, sizeof buf - n,
-                    "{\"key\":\"%.*s\"}",
-                    eq ? (int)(eq - (char*)ws->env_vars.items[ei]) : 0,
-                    (char*)ws->env_vars.items[ei]);
+                const char *kv = ws->env_vars.items[ei];
+                const char *eq = strchr(kv, '=');
+                char key[512];
+                snprintf(key, sizeof key, "%.*s", eq ? (int)(eq - kv) : 0, kv);
+                RESULT_APPENDF("%s{\"key\":\"%s\"}", ei ? "," : "", lmux_json_esc(key));
             }
-            n += snprintf(buf + n, sizeof buf - n, "]}}");
-            snprintf(result, result_cap, "%s", buf);
+            RESULT_APPENDF("]}}");
             goto done;
         }
     }
@@ -7300,17 +7347,17 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
     /* --- auth --- */
     if (strcmp(cmd, "auth") == 0 || strcmp(cmd, "auth_status") == 0) {
         /* Auth status stub */
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"authenticated\":false,\"method\":\"none\"}}");
         goto done;
     }
     if (strcmp(cmd, "auth.login") == 0 || strcmp(cmd, "auth_login") == 0) {
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"note\":\"auth.login acknowledged (UI-based login pending)\"}}");
         goto done;
     }
     if (strcmp(cmd, "auth.logout") == 0 || strcmp(cmd, "auth_logout") == 0) {
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"note\":\"auth.logout acknowledged (UI-based logout pending)\"}}");
         goto done;
     }
@@ -7322,21 +7369,19 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         json_extract_string(args_json, "name", name_filter, sizeof name_filter);
         json_extract_string(args_json, "category", cat_filter, sizeof cat_filter);
         json_extract_string(args_json, "after_seq", after_seq_str, sizeof after_seq_str);
-        /* Build result with optional filters encoded */
-        char result_buf[2048];
-        int n = snprintf(result_buf, sizeof result_buf,
-            "{\"ok\":true,\"result\":{\"stream\":\"events\"");
+        /* after_seq is emitted as a bare JSON number, so only digits may
+         * pass; anything else could add fields to the reply (which the
+         * server then re-reads to set up the stream). */
+        for (const char *d = after_seq_str; *d; d++)
+            if (*d < '0' || *d > '9') { after_seq_str[0] = 0; break; }
+        RESULT_SETF("{\"ok\":true,\"result\":{\"stream\":\"events\"");
         if (name_filter[0])
-            n += snprintf(result_buf + n, sizeof result_buf - n,
-                ",\"name_filter\":\"%s\"", name_filter);
+            RESULT_APPENDF(",\"name_filter\":\"%s\"", lmux_json_esc(name_filter));
         if (cat_filter[0])
-            n += snprintf(result_buf + n, sizeof result_buf - n,
-                ",\"category_filter\":\"%s\"", cat_filter);
+            RESULT_APPENDF(",\"category_filter\":\"%s\"", lmux_json_esc(cat_filter));
         if (after_seq_str[0])
-            n += snprintf(result_buf + n, sizeof result_buf - n,
-                ",\"after_seq\":%s", after_seq_str);
-        n += snprintf(result_buf + n, sizeof result_buf - n, "}}");
-        snprintf(result, result_cap, "%s", result_buf);
+            RESULT_APPENDF(",\"after_seq\":%s", after_seq_str);
+        RESULT_APPENDF("}}");
         goto done;
     }
 
@@ -7346,7 +7391,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
          * connection is control.attach, serve_client() keeps the connection
          * open and frames every reply as %begin/payload/%end. The dispatch
          * itself only acknowledges. One-shot clients get plain JSON. */
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"control\":true,\"protocol\":1}}");
         goto done;
     }
@@ -7403,19 +7448,19 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                     char _cl[128];
                     snprintf(_cl, sizeof _cl, "%%subscription-changed %s 1", name);
                     lmux_control_notify("subscription", _cl);
-                    written = snprintf(result, result_cap,
-                        "{\"ok\":true,\"result\":{\"subscribed\":\"%s\"}}", name);
+                    RESULT_SETF(
+                        "{\"ok\":true,\"result\":{\"subscribed\":\"%s\"}}", lmux_json_esc(name));
                 } else {
-                    written = snprintf(result, result_cap,
+                    RESULT_SETF(
                         "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"subscribe failed\"}}");
                 }
             } else if (slot < 0) {
                 /* One-shot client: ack without effect. */
-                written = snprintf(result, result_cap,
+                RESULT_SETF(
                     "{\"ok\":true,\"result\":{\"subscribed\":\"%s\"}}",
-                    name[0] ? name : sub);
+                    lmux_json_esc(name[0] ? name : sub));
             } else {
-                written = snprintf(result, result_cap,
+                RESULT_SETF(
                     "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing subscription name\"}}");
             }
             goto done;
@@ -7427,18 +7472,18 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                 snprintf(_cl, sizeof _cl, "%%subscription-changed %s 0", unsub);
                 lmux_control_notify("subscription", _cl);
             }
-            written = snprintf(result, result_cap,
-                "{\"ok\":true,\"result\":{\"unsubscribed\":\"%s\"}}", unsub);
+            RESULT_SETF(
+                "{\"ok\":true,\"result\":{\"unsubscribed\":\"%s\"}}", lmux_json_esc(unsub));
             goto done;
         }
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"subscriptions\":[]}}");
         goto done;
     }
 
     /* --- help / list commands --- */
     if (strcmp(cmd, "help") == 0) {
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"commands\":["
             "\"workspace.create\",\"workspace.list\",\"workspace.close\","
             "\"workspace.select\",\"workspace.current\",\"workspace.rename\","
@@ -7472,16 +7517,16 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
     /* --- session.save --- */
     if (strcmp(cmd, "session.save") == 0) {
         lmux_app_auto_save(app);
-        written = snprintf(result, result_cap,
-            "{\"ok\":true,\"result\":{\"path\":\"%s\"}}", app->auto_save_path);
+        RESULT_SETF(
+            "{\"ok\":true,\"result\":{\"path\":\"%s\"}}", lmux_json_esc(app->auto_save_path));
         goto done;
     }
 
     /* --- session.restore --- */
     if (strcmp(cmd, "session.restore") == 0) {
         lmux_app_auto_restore(app);
-        written = snprintf(result, result_cap,
-            "{\"ok\":true,\"result\":{\"path\":\"%s\"}}", app->auto_save_path);
+        RESULT_SETF(
+            "{\"ok\":true,\"result\":{\"path\":\"%s\"}}", lmux_json_esc(app->auto_save_path));
         goto done;
     }
 
@@ -7490,13 +7535,13 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         char key[256] = {0};
         json_extract_string(args_json, "key", key, sizeof key);
         if (!app->config) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"no_config\",\"message\":\"config not loaded\"}}");
             goto done;
         }
         if (!key[0]) {
             /* Return full config as JSON */
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":true,\"result\":{\"font_family\":\"%s\",\"font_size\":%d,"
                 "\"theme\":\"%s\",\"scrollback_lines\":%d,"
                 "\"show_sidebar\":%s,\"show_notifications_panel\":%s,"
@@ -7505,31 +7550,31 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                 "\"agent_claude_code\":\"%s\",\"agent_opencode\":\"%s\","
                 "\"agent_codex\":\"%s\",\"agent_aider\":\"%s\",\"agent_goose\":\"%s\","
                 "\"log_file\":\"%s\"}}",
-                app->config->font_family, app->config->font_size,
-                app->config->theme, app->config->scrollback_lines,
+                lmux_json_esc(app->config->font_family), app->config->font_size,
+                lmux_json_esc(app->config->theme), app->config->scrollback_lines,
                 app->config->show_sidebar ? "true" : "false",
                 app->config->show_notifications_panel ? "true" : "false",
                 app->config->auto_save_session ? "true" : "false",
                 app->config->auto_save_interval_sec,
-                app->config->default_shell,
-                app->config->agent_paths[0], app->config->agent_paths[1],
-                app->config->agent_paths[2], app->config->agent_paths[3],
-                app->config->agent_paths[4], app->config->log_file);
+                lmux_json_esc(app->config->default_shell),
+                lmux_json_esc(app->config->agent_paths[0]), lmux_json_esc(app->config->agent_paths[1]),
+                lmux_json_esc(app->config->agent_paths[2]), lmux_json_esc(app->config->agent_paths[3]),
+                lmux_json_esc(app->config->agent_paths[4]), lmux_json_esc(app->config->log_file));
         } else {
             /* Return single key value */
             char val[1024] = {0};
-            if (strcmp(key, "font_family") == 0) snprintf(val, sizeof val, "\"%s\"", app->config->font_family);
+            if (strcmp(key, "font_family") == 0) snprintf(val, sizeof val, "\"%s\"", lmux_json_esc(app->config->font_family));
             else if (strcmp(key, "font_size") == 0) snprintf(val, sizeof val, "%d", app->config->font_size);
-            else if (strcmp(key, "theme") == 0) snprintf(val, sizeof val, "\"%s\"", app->config->theme);
+            else if (strcmp(key, "theme") == 0) snprintf(val, sizeof val, "\"%s\"", lmux_json_esc(app->config->theme));
             else if (strcmp(key, "scrollback_lines") == 0) snprintf(val, sizeof val, "%d", app->config->scrollback_lines);
             else if (strcmp(key, "show_sidebar") == 0) snprintf(val, sizeof val, "%s", app->config->show_sidebar ? "true" : "false");
             else if (strcmp(key, "auto_save_session") == 0) snprintf(val, sizeof val, "%s", app->config->auto_save_session ? "true" : "false");
             else if (strcmp(key, "auto_save_interval_sec") == 0) snprintf(val, sizeof val, "%d", app->config->auto_save_interval_sec);
-            else if (strcmp(key, "default_shell") == 0) snprintf(val, sizeof val, "\"%s\"", app->config->default_shell);
-            else if (strcmp(key, "log_file") == 0) snprintf(val, sizeof val, "\"%s\"", app->config->log_file);
+            else if (strcmp(key, "default_shell") == 0) snprintf(val, sizeof val, "\"%s\"", lmux_json_esc(app->config->default_shell));
+            else if (strcmp(key, "log_file") == 0) snprintf(val, sizeof val, "\"%s\"", lmux_json_esc(app->config->log_file));
         else snprintf(val, sizeof val, "null");
-            written = snprintf(result, result_cap,
-                "{\"ok\":true,\"result\":{\"key\":\"%s\",\"value\":%s}}", key, val);
+            RESULT_SETF(
+                "{\"ok\":true,\"result\":{\"key\":\"%s\",\"value\":%s}}", lmux_json_esc(key), val);
         }
         goto done;
     }
@@ -7540,7 +7585,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         json_extract_string(args_json, "key", key, sizeof key);
         json_extract_string(args_json, "value", value, sizeof value);
         if (!key[0] || !value[0] || !app->config) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing key and/or value\"}}");
             goto done;
         }
@@ -7553,7 +7598,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
              * so an unvalidated value was accepted, persisted, then silently
              * ignored. Reject it at the boundary instead. */
             if (strcmp(value, "dark") != 0 && strcmp(value, "light") != 0) {
-                written = snprintf(result, result_cap,
+                RESULT_SETF(
                     "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"theme must be 'dark' or 'light'\"}}");
                 goto done;
             }
@@ -7583,9 +7628,9 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             lmux_data_root(logroot, sizeof logroot);
             if (value[0] == '~' || value[0] != '/' ||
                 !path_inside_root(value, logroot)) {
-                written = snprintf(result, result_cap,
+                RESULT_SETF(
                     "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"log_file must be absolute and inside %s\"}}",
-                    logroot);
+                    lmux_json_esc(logroot));
                 goto done;
             }
             snprintf(app->config->log_file, sizeof app->config->log_file, "%s", value);
@@ -7595,7 +7640,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             /* #6: unknown keys used to fall through and still report
              * {"ok":true}, so typos silently discarded the value while
              * telling the user the setting had been applied. */
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"unknown config key\"}}");
             goto done;
         }
@@ -7603,7 +7648,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         char cpath[512];
         lmux_config_path(cpath, sizeof cpath);
         lmux_config_save(app->config, cpath);
-        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+        RESULT_SETF( "{\"ok\":true,\"result\":{}}");
         goto done;
     }
 
@@ -7612,39 +7657,39 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         char name[128] = {0};
         json_extract_string(args_json, "name", name, sizeof name);
         if (!name[0] || !app->config) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing name\"}}");
             goto done;
         }
         lmux_workspace_group *g = lmux_workspace_group_create(app->config, name);
         if (g) model_save_config(app);
-        written = snprintf(result, result_cap,
-            "{\"ok\":true,\"result\":{\"name\":\"%s\"}}", g ? g->name : name);
+        RESULT_SETF(
+            "{\"ok\":true,\"result\":{\"name\":\"%s\"}}", lmux_json_esc(g ? g->name : name));
         goto done;
     }
 
     /* --- workspace.group.list --- */
     if (strcmp(cmd, "workspace.group.list") == 0) {
-        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{\"groups\":[");
+        RESULT_SETF( "{\"ok\":true,\"result\":{\"groups\":[");
         if (app->config) {
             for (size_t i = 0; i < app->config->workspace_groups.len; i++) {
                 lmux_workspace_group *g = app->config->workspace_groups.items[i];
                 RESULT_GROW;
-                if (i > 0) written += snprintf(result + written, result_cap - written, ",");
-                written += snprintf(result + written, result_cap - written,
+                if (i > 0) RESULT_APPENDF( ",");
+                RESULT_APPENDF(
                     "{\"name\":\"%s\",\"workspace_count\":%zu,\"workspace_ids\":[",
-                    g->name, g->workspace_ids.len);
+                    lmux_json_esc(g->name), g->workspace_ids.len);
                 for (size_t j = 0; j < g->workspace_ids.len; j++) {
                     RESULT_GROW;
                     lmux_id *wid = g->workspace_ids.items[j];
-                    written += snprintf(result + written, result_cap - written,
+                    RESULT_APPENDF(
                         "%s%u", j ? "," : "", (unsigned)*wid);
                 }
                 RESULT_GROW;
-                written += snprintf(result + written, result_cap - written, "]}");
+                RESULT_APPENDF( "]}");
             }
         }
-        written += snprintf(result + written, result_cap - written, "]}}");
+        RESULT_APPENDF( "]}}");
         goto done;
     }
 
@@ -7654,14 +7699,14 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         json_extract_string(args_json, "name", name, sizeof name);
         json_extract_string(args_json, "workspace_id", ws_id_str, sizeof ws_id_str);
         if (!name[0] || !ws_id_str[0] || !app->config) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing name and/or workspace_id\"}}");
             goto done;
         }
         lmux_id wid = (lmux_id)atol(ws_id_str);
         bool ok = lmux_workspace_group_add(app->config, name, wid);
         if (ok) model_save_config(app);
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":%s,\"result\":{}}", ok ? "true" : "false");
         goto done;
     }
@@ -7672,14 +7717,14 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         json_extract_string(args_json, "name", name, sizeof name);
         json_extract_string(args_json, "workspace_id", ws_id_str, sizeof ws_id_str);
         if (!name[0] || !ws_id_str[0] || !app->config) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing name and/or workspace_id\"}}");
             goto done;
         }
         lmux_id wid = (lmux_id)atol(ws_id_str);
         bool ok = lmux_workspace_group_remove(app->config, name, wid);
         if (ok) model_save_config(app);
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":%s,\"result\":{}}", ok ? "true" : "false");
         goto done;
     }
@@ -7691,14 +7736,14 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         json_extract_string(args_json, "command", command, sizeof command);
         json_extract_string(args_json, "workspace_id", ws_id_str, sizeof ws_id_str);
         if (!name[0] || !command[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing name and/or command\"}}");
             goto done;
         }
         lmux_workspace *ws = ws_id_str[0] ? lmux_workspace_by_id(app, (lmux_id)atol(ws_id_str))
                                           : lmux_workspace_focused(app);
         if (!ws) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"workspace not found\"}}");
             goto done;
         }
@@ -7707,14 +7752,14 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         if (!s && ws->surfaces.len > 0) s = ws->surfaces.items[0];
         if (!s) s = lmux_surface_create(ws, name);
         if (!s) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"create_failed\",\"message\":\"failed to create surface\"}}");
             goto done;
         }
         /* Split a new pane with the agent command */
         lmux_pane *p = lmux_pane_split(ws, s, LMUX_SPLIT_HORIZONTAL, command, true);
         if (!p) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"create_failed\",\"message\":\"failed to create pane\"}}");
             goto done;
         }
@@ -7730,25 +7775,25 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         ag->started_at = time(NULL);
         vec_push(&app->agents, ag);
         lmux_event_push(app, "agent.spawned", "agent", "\"id\":%u,\"name\":\"%s\",\"pane_id\":%u", ag->id, lmux_json_esc(name), p->id);
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"id\":%u,\"name\":\"%s\",\"pane_id\":%u,\"pid\":%d}}",
-            ag->id, name, p->id, (int)ag->pid);
+            ag->id, lmux_json_esc(name), p->id, (int)ag->pid);
         goto done;
     }
 
     /* --- agent.list --- */
     if (strcmp(cmd, "agent.list") == 0) {
-        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{\"agents\":[");
+        RESULT_SETF( "{\"ok\":true,\"result\":{\"agents\":[");
         for (size_t i = 0; i < app->agents.len; i++) {
             lmux_agent *ag = app->agents.items[i];
             RESULT_GROW;
             char _ne[256];
-            if (i > 0) written += snprintf(result + written, result_cap - written, ",");
-            written += snprintf(result + written, result_cap - written,
+            if (i > 0) RESULT_APPENDF( ",");
+            RESULT_APPENDF(
                 "{\"id\":%u,\"name\":\"%s\",\"status\":%d,\"workspace_id\":%u,\"pane_id\":%u,\"pid\":%d,\"started_at\":%lld}",
                 ag->id, json_escape_str(_ne, sizeof _ne, ag->name), ag->status, ag->workspace_id, ag->pane_id, (int)ag->pid, (long long)ag->started_at);
         }
-        written += snprintf(result + written, result_cap - written, "]}}");
+        RESULT_APPENDF( "]}}");
         goto done;
     }
 
@@ -7757,7 +7802,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         char id_str[64] = {0};
         json_extract_string(args_json, "id", id_str, sizeof id_str);
         if (!id_str[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing id\"}}");
             goto done;
         }
@@ -7768,7 +7813,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             if (ag->id == aid) { found = ag; break; }
         }
         if (!found) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"agent not found\"}}");
             goto done;
         }
@@ -7778,7 +7823,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             found->pid = 0;
         }
         lmux_event_push(app, "agent.stopped", "agent", "\"id\":%u", found->id);
-        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+        RESULT_SETF( "{\"ok\":true,\"result\":{}}");
         goto done;
     }
 
@@ -7787,15 +7832,15 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         char id_str[64] = {0};
         json_extract_string(args_json, "id", id_str, sizeof id_str);
         if (!id_str[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing id\"}}");
             goto done;
         }
         lmux_id aid = (lmux_id)atol(id_str);
         if (lmux_agent_hibernate(app, aid)) {
-            written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+            RESULT_SETF( "{\"ok\":true,\"result\":{}}");
         } else {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"hibernate_failed\",\"message\":\"could not hibernate agent\"}}");
         }
         goto done;
@@ -7806,15 +7851,15 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         char id_str[64] = {0};
         json_extract_string(args_json, "id", id_str, sizeof id_str);
         if (!id_str[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing id\"}}");
             goto done;
         }
         lmux_id aid = (lmux_id)atol(id_str);
         if (lmux_agent_resume(app, aid)) {
-            written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+            RESULT_SETF( "{\"ok\":true,\"result\":{}}");
         } else {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"resume_failed\",\"message\":\"could not resume agent\"}}");
         }
         goto done;
@@ -7828,7 +7873,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             if (a->hibernated) hibernated++;
             else if (a->pid > 0) active++;
         }
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"hibernated\":%zu,\"active\":%zu,\"total\":%zu}}",
             hibernated, active, app->agents.len);
         goto done;
@@ -7855,12 +7900,12 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             if (ws) p = lmux_pane_focused(ws);
         }
         if (!p) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"pane not found\"}}");
             goto done;
         }
         if (p->pty_fd < 0 || !command[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"pane has no pty or missing command\"}}");
             goto done;
         }
@@ -7874,7 +7919,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             _exit(127);
         }
         lmux_event_push(app, "pane.piped", "pane", "\"id\":%u,\"pipe_pid\":%d", p->id, (int)pipe_pid);
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"pid\":%d}}", (int)pipe_pid);
         goto done;
     }
@@ -7887,7 +7932,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         json_extract_string(args_json, "action", action, sizeof action);
         json_extract_bool(args_json, "wake", &do_wake);
         if (!name[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing name\"}}");
             goto done;
         }
@@ -7900,7 +7945,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         if (!wp) {
             wp = wait_point_new(name);
             if (!wp) {
-                written = snprintf(result, result_cap,
+                RESULT_SETF(
                     "{\"ok\":false,\"error\":{\"code\":\"internal_error\",\"message\":\"out of memory\"}}");
                 goto done;
             }
@@ -7915,31 +7960,31 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             char line[256];
             snprintf(line, sizeof line, "%%wait-for-wake %s %d", name, woken);
             lmux_control_notify("sync", line);
-            lmux_event_push(app, "wait.wake", "sync", "\"name\":\"%s\",\"woken\":%d", name, woken);
-            written = snprintf(result, result_cap,
+            lmux_event_push(app, "wait.wake", "sync", "\"name\":\"%s\",\"woken\":%d", lmux_json_esc(name), woken);
+            RESULT_SETF(
                 "{\"ok\":true,\"result\":{\"name\":\"%s\",\"woken\":%d,\"wake_count\":%u}}",
-                name, woken, wp->wake_count);
+                lmux_json_esc(name), woken, wp->wake_count);
         } else if (action[0] && strcmp(action, "signal") == 0) {
             /* Legacy signal action (non-blocking, sets signaled flag) */
             pthread_mutex_lock(&wp->lock);
             wp->signaled = true;
             pthread_mutex_unlock(&wp->lock);
             lmux_event_push(app, "wait.signaled", "sync", "\"name\":\"%s\"", lmux_json_esc(name));
-            written = snprintf(result, result_cap,
-                "{\"ok\":true,\"result\":{\"name\":\"%s\",\"signaled\":true}}", name);
+            RESULT_SETF(
+                "{\"ok\":true,\"result\":{\"name\":\"%s\",\"signaled\":true}}", lmux_json_esc(name));
         } else if (action[0] && strcmp(action, "reset") == 0) {
             /* Reset the signaled flag */
             pthread_mutex_lock(&wp->lock);
             wp->signaled = false;
             pthread_mutex_unlock(&wp->lock);
-            written = snprintf(result, result_cap,
-                "{\"ok\":true,\"result\":{\"name\":\"%s\",\"signaled\":false}}", name);
+            RESULT_SETF(
+                "{\"ok\":true,\"result\":{\"name\":\"%s\",\"signaled\":false}}", lmux_json_esc(name));
         } else {
             /* Wait-for: register as waiter and block until woken (control mode only) */
             if (is_control) {
                 /* Register this client as a waiter */
                 if (!wait_point_register_waiter(wp, slot)) {
-                    written = snprintf(result, result_cap,
+                    RESULT_SETF(
                         "{\"ok\":false,\"error\":{\"code\":\"busy\",\"message\":\"too many waiters on channel\"}}");
                     goto done;
                 }
@@ -7958,11 +8003,11 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                 wait_point_unregister_waiter(wp, slot);
                 
                 if (wait_rc == 0) {
-                    written = snprintf(result, result_cap,
+                    RESULT_SETF(
                         "{\"ok\":true,\"result\":{\"name\":\"%s\",\"woken\":true,\"wake_count\":%u}}",
-                        name, wp->wake_count);
+                        lmux_json_esc(name), wp->wake_count);
                 } else {
-                    written = snprintf(result, result_cap,
+                    RESULT_SETF(
                         "{\"ok\":false,\"error\":{\"code\":\"interrupted\",\"message\":\"wait interrupted\"}}");
                 }
             } else {
@@ -7971,9 +8016,9 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                 pthread_mutex_lock(&wp->lock);
                 signaled = wp->signaled;
                 pthread_mutex_unlock(&wp->lock);
-                written = snprintf(result, result_cap,
+                RESULT_SETF(
                     "{\"ok\":true,\"result\":{\"name\":\"%s\",\"signaled\":%s,\"wake_count\":%u}}",
-                    name, signaled ? "true" : "false", wp->wake_count);
+                    lmux_json_esc(name), signaled ? "true" : "false", wp->wake_count);
             }
         }
         goto done;
@@ -7987,14 +8032,14 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             lmux_config_path(cpath, sizeof cpath);
             ok = lmux_config_load(app->config, cpath);
         }
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"reloaded\":%s}}", ok ? "true" : "false");
         goto done;
     }
 
     /* --- capabilities (updated) --- */
     if (strcmp(cmd, "capabilities") == 0) {
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"capabilities\":["
             "\"workspace.create\",\"workspace.list\",\"workspace.close\","
             "\"workspace.select\",\"workspace.current\",\"workspace.rename\","
@@ -8053,18 +8098,18 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
     if (strcmp(cmd, "list-commands") == 0 || strcmp(cmd, "list_commands") == 0) {
         size_t count = 0;
         const lmux_cmd_entry *entries = lmux_registry_all(&count);
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"commands\":[");
         for (size_t i = 0; i < count; i++) {
             RESULT_GROW;
-            if (i > 0) written += snprintf(result + written, result_cap - written, ",");
+            if (i > 0) RESULT_APPENDF( ",");
             char _ne[128], _se[256];
-            written += snprintf(result + written, result_cap - written,
+            RESULT_APPENDF(
                 "{\"name\":\"%s\",\"summary\":\"%s\"}",
                 json_escape_str(_ne, sizeof _ne, entries[i].name),
                 json_escape_str(_se, sizeof _se, entries[i].summary));
         }
-        written += snprintf(result + written, result_cap - written, "]}}");
+        RESULT_APPENDF( "]}}");
         goto done;
     }
 
@@ -8073,18 +8118,18 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         char url[2048] = {0};
         json_extract_string(args_json, "url", url, sizeof url);
         if (!url[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_args\",\"message\":\"url required\"}}");
             goto done;
         }
         /* Browser is managed by GUI — daemon just acknowledges */
         lmux_event_push(app, "browser.opened", "browser", "\"url\":\"%s\"", lmux_json_esc(url));
-        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{\"url\":\"%s\"}}", lmux_json_esc(url));
+        RESULT_SETF( "{\"ok\":true,\"result\":{\"url\":\"%s\"}}", lmux_json_esc(url));
         goto done;
     }
 
     if (strcmp(cmd, "browser.snapshot") == 0) {
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"status\":\"snapshot_not_implemented\"}}");
         goto done;
     }
@@ -8093,12 +8138,12 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         char selector[512] = {0};
         json_extract_string(args_json, "selector", selector, sizeof selector);
         if (!selector[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_args\",\"message\":\"selector required\"}}");
             goto done;
         }
         lmux_event_push(app, "browser.clicked", "browser", "\"selector\":\"%s\"", lmux_json_esc(selector));
-        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+        RESULT_SETF( "{\"ok\":true,\"result\":{}}");
         goto done;
     }
 
@@ -8107,13 +8152,13 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         json_extract_string(args_json, "selector", selector, sizeof selector);
         json_extract_string(args_json, "value", value, sizeof value);
         if (!selector[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_args\",\"message\":\"selector required\"}}");
             goto done;
         }
         lmux_event_push(app, "browser.filled", "browser",
             "\"selector\":\"%s\",\"value\":\"%s\"", lmux_json_esc(selector), lmux_json_esc(value));
-        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+        RESULT_SETF( "{\"ok\":true,\"result\":{}}");
         goto done;
     }
 
@@ -8121,13 +8166,13 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         char js[4096] = {0};
         json_extract_string(args_json, "js", js, sizeof js);
         if (!js[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_args\",\"message\":\"js required\"}}");
             goto done;
         }
         /* Acknowledge — actual execution happens in GUI */
         lmux_event_push(app, "browser.evaluated", "browser", "\"js_length\":%zu", strlen(js));
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"status\":\"eval_queued\"}}");
         goto done;
     }
@@ -8152,7 +8197,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
              * but it is always a mistake (it would silently become
              * <root>/~/.bashrc). Reject it rather than quietly rewriting it. */
             if (req[0] == '~') {
-                written = snprintf(result, result_cap,
+                RESULT_SETF(
                     "{\"ok\":false,\"error\":{\"code\":\"invalid_params\","
                     "\"message\":\"screenshot path must not start with '~'\"}}");
                 goto done;
@@ -8160,10 +8205,10 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             /* is_safe_path() with a base_dir rejects absolute paths, ".."
              * components, and anything not contained by base_dir. */
             if (!is_safe_path(req, root)) {
-                written = snprintf(result, result_cap,
+                RESULT_SETF(
                     "{\"ok\":false,\"error\":{\"code\":\"invalid_params\","
                     "\"message\":\"screenshot path must be relative and inside %s\"}}",
-                    root);
+                    lmux_json_esc(root));
                 goto done;
             }
             snprintf(resolved, sizeof resolved, "%s/%s", root, req);
@@ -8171,13 +8216,13 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
 
         json_escape_str(esc, sizeof esc, resolved);
         lmux_event_push(app, "browser.screenshot", "browser", "\"path\":\"%s\"", esc);
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"path\":\"%s\"}}", esc);
         goto done;
     }
 
     if (strcmp(cmd, "browser.list") == 0) {
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"browsers\":[]}}");
         goto done;
     }
@@ -8187,14 +8232,14 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         char path[1024] = {0};
         json_extract_string(args_json, "path", path, sizeof path);
         if (!path[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing path\"}}");
             goto done;
         }
 
         FILE *fp = fopen(path, "r");
         if (!fp) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"file_error\",\"message\":\"cannot open file\"}}");
             goto done;
         }
@@ -8203,7 +8248,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         fseek(fp, 0, SEEK_SET);
         if (fsize <= 0 || fsize > 2 * 1024 * 1024) {
             fclose(fp);
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"file_error\",\"message\":\"file too large or empty\"}}");
             goto done;
         }
@@ -8297,7 +8342,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         }
 
         free(fbuf);
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"panel_id\":%u,\"count\":%d}}",
             panel->id, count);
         goto done;
@@ -8311,9 +8356,8 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         snprintf(today_str, sizeof today_str, "%04d-%02d-%02d",
             tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday);
 
-        char buf[8192];
-        int n = snprintf(buf, sizeof buf,
-            "{\"ok\":true,\"result\":{\"date\":\"%s\",\"events\":[", today_str);
+        RESULT_SETF(
+            "{\"ok\":true,\"result\":{\"date\":\"%s\",\"events\":[", lmux_json_esc(today_str));
         int count = 0;
 
         for (size_t pi = 0; pi < app->feed_panels.len; pi++) {
@@ -8325,15 +8369,14 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                 lmux_feed_entry *entry = app->feed_entries.items[ei];
                 if (entry->panel_id != panel->id) continue;
                 if (strstr(entry->text, today_str)) {
-                    if (count > 0) n += snprintf(buf + n, sizeof buf - n, ",");
-                    n += snprintf(buf + n, sizeof buf - n,
+                    if (count > 0) RESULT_APPENDF( ",");
+                    RESULT_APPENDF(
                         "{\"seq\":%lu,\"text\":\"%s\"}", (unsigned long)entry->seq, JESC(entry->text));
                     count++;
                 }
             }
         }
-        n += snprintf(buf + n, sizeof buf - n, "],\"count\":%d}}", count);
-        written = snprintf(result, result_cap, "%s", buf);
+        RESULT_APPENDF( "],\"count\":%d}}", count);
         goto done;
     }
 
@@ -8350,8 +8393,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             if (days > 365) days = 365;
         }
 
-        char buf[16384];
-        int n = snprintf(buf, sizeof buf,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"days\":%d,\"events\":[", days);
         int count = 0;
 
@@ -8362,15 +8404,14 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             for (size_t ei = 0; ei < app->feed_entries.len; ei++) {
                 lmux_feed_entry *entry = app->feed_entries.items[ei];
                 if (entry->panel_id != panel->id) continue;
-                if (count > 0) n += snprintf(buf + n, sizeof buf - n, ",");
-                n += snprintf(buf + n, sizeof buf - n,
+                if (count > 0) RESULT_APPENDF( ",");
+                RESULT_APPENDF(
                     "{\"seq\":%lu,\"text\":\"%s\"}", (unsigned long)entry->seq, JESC(entry->text));
                 count++;
                 if (count >= 100) break; /* safety limit */
             }
         }
-        n += snprintf(buf + n, sizeof buf - n, "],\"count\":%d}}", count);
-        written = snprintf(result, result_cap, "%s", buf);
+        RESULT_APPENDF( "],\"count\":%d}}", count);
         goto done;
     }
 
@@ -8379,14 +8420,14 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         char path[1024] = {0};
         json_extract_string(args_json, "path", path, sizeof path);
         if (!path[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing path\"}}");
             goto done;
         }
 
         FILE *fp = fopen(path, "r");
         if (!fp) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"file_error\",\"message\":\"cannot open file\"}}");
             goto done;
         }
@@ -8395,7 +8436,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         fseek(fp, 0, SEEK_SET);
         if (fsize < 0 || fsize > 2 * 1024 * 1024) {
             fclose(fp);
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"file_error\",\"message\":\"file too large or unreadable\"}}");
             goto done;
         }
@@ -8407,7 +8448,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         int count = 0;
         if (fsize == 0) {
             fclose(fp);
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":true,\"result\":{\"panel_id\":%u,\"count\":0}}",
                 panel->id);
             goto done;
@@ -8481,7 +8522,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         }
 
         free(fbuf);
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"panel_id\":%u,\"count\":%d}}",
             panel->id, count);
         goto done;
@@ -8489,8 +8530,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
 
     /* --- email.list --- */
     if (strcmp(cmd, "email.list") == 0) {
-        char buf[8192];
-        int n = snprintf(buf, sizeof buf,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"emails\":[");
 
         int count = 0;
@@ -8501,15 +8541,14 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             for (size_t ei = 0; ei < app->feed_entries.len; ei++) {
                 lmux_feed_entry *entry = app->feed_entries.items[ei];
                 if (entry->panel_id != panel->id) continue;
-                if (count > 0) n += snprintf(buf + n, sizeof buf - n, ",");
-                n += snprintf(buf + n, sizeof buf - n,
+                if (count > 0) RESULT_APPENDF( ",");
+                RESULT_APPENDF(
                     "{\"seq\":%lu,\"text\":\"%s\"}",
                     (unsigned long)entry->seq, JESC(entry->text));
                 count++;
             }
         }
-        n += snprintf(buf + n, sizeof buf - n, "],\"count\":%d}}", count);
-        written = snprintf(result, result_cap, "%s", buf);
+        RESULT_APPENDF( "],\"count\":%d}}", count);
         goto done;
     }
 
@@ -8518,13 +8557,12 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         char query[256] = {0};
         json_extract_string(args_json, "query", query, sizeof query);
         if (!query[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing query\"}}");
             goto done;
         }
 
-        char buf[8192];
-        int n = snprintf(buf, sizeof buf,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"emails\":[");
 
         int count = 0;
@@ -8536,16 +8574,15 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                 lmux_feed_entry *entry = app->feed_entries.items[ei];
                 if (entry->panel_id != panel->id) continue;
                 if (strstr(entry->text, query)) {
-                    if (count > 0) n += snprintf(buf + n, sizeof buf - n, ",");
-                    n += snprintf(buf + n, sizeof buf - n,
+                    if (count > 0) RESULT_APPENDF( ",");
+                    RESULT_APPENDF(
                         "{\"seq\":%lu,\"text\":\"%s\"}",
                         (unsigned long)entry->seq, JESC(entry->text));
                     count++;
                 }
             }
         }
-        n += snprintf(buf + n, sizeof buf - n, "],\"count\":%d}}", count);
-        written = snprintf(result, result_cap, "%s", buf);
+        RESULT_APPENDF( "],\"count\":%d}}", count);
         goto done;
     }
 
@@ -8554,7 +8591,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         char location[256] = {0};
         json_extract_string(args_json, "location", location, sizeof location);
         if (!location[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing location\"}}");
             goto done;
         }
@@ -8576,10 +8613,10 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             lmux_feed_entry_add(app, panel->id, "weather", "weather", text);
         }
 
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"location\":\"%s\",\"temperature\":%d,"
             "\"condition\":\"%s\",\"humidity\":%d,\"wind_kph\":%d}}",
-            JESC(location), temp_c, cond, humidity, wind_kph);
+            JESC(location), temp_c, lmux_json_esc(cond), humidity, wind_kph);
         goto done;
     }
 
@@ -8588,12 +8625,12 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         char location[256] = {0};
         json_extract_string(args_json, "location", location, sizeof location);
         if (!location[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing location\"}}");
             goto done;
         }
         lmux_event_push(app, "weather.location_set", "weather", "\"location\":\"%s\"", lmux_json_esc(location));
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"location\":\"%s\"}}", JESC(location));
         goto done;
     }
@@ -8602,7 +8639,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
     if (strcmp(cmd, "weather.refresh") == 0) {
         /* Refresh is a no-op for simulated weather */
         lmux_event_push(app, "weather.refreshed", "weather", "");
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"status\":\"refreshed\"}}");
         goto done;
     }
@@ -8612,7 +8649,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         char text[2048] = {0};
         json_extract_string(args_json, "text", text, sizeof text);
         if (!text[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing text\"}}");
             goto done;
         }
@@ -8620,7 +8657,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         snprintf(app->clipboard[idx], sizeof app->clipboard[idx], "%s", text);
         app->clipboard_head = (app->clipboard_head + 1) % 100;
         if (app->clipboard_count < 100) app->clipboard_count++;
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"index\":%d,\"count\":%d}}",
             idx, app->clipboard_count);
         goto done;
@@ -8629,7 +8666,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
     /* --- clipboard.paste --- */
     if (strcmp(cmd, "clipboard.paste") == 0) {
         if (app->clipboard_count == 0) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"empty\",\"message\":\"clipboard is empty\"}}");
             goto done;
         }
@@ -8647,14 +8684,14 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             actual = (app->clipboard_head - 1 + 100) % 100;
         } else {
             if (index >= app->clipboard_count) {
-                written = snprintf(result, result_cap,
+                RESULT_SETF(
                     "{\"ok\":false,\"error\":{\"code\":\"invalid_index\",\"message\":\"index out of range\"}}");
                 goto done;
             }
             /* Convert logical index to physical: 0 = oldest */
             actual = (app->clipboard_head - app->clipboard_count + index + 100) % 100;
         }
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"text\":\"%s\",\"index\":%d}}",
             JESC(app->clipboard[actual]), index < 0 ? app->clipboard_count - 1 : index);
         goto done;
@@ -8662,18 +8699,16 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
 
     /* --- clipboard.list --- */
     if (strcmp(cmd, "clipboard.list") == 0) {
-        char buf[32768];
-        int n = snprintf(buf, sizeof buf,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"entries\":[");
         int start = (app->clipboard_head - app->clipboard_count + 100) % 100;
         for (int i = 0; i < app->clipboard_count; i++) {
             int idx = (start + i) % 100;
-            if (i > 0) n += snprintf(buf + n, sizeof buf - n, ",");
-            n += snprintf(buf + n, sizeof buf - n,
+            if (i > 0) RESULT_APPENDF( ",");
+            RESULT_APPENDF(
                 "{\"index\":%d,\"text\":\"%s\"}", i, JESC(app->clipboard[idx]));
         }
-        n += snprintf(buf + n, sizeof buf - n, "],\"count\":%d}}", app->clipboard_count);
-        written = snprintf(result, result_cap, "%s", buf);
+        RESULT_APPENDF( "],\"count\":%d}}", app->clipboard_count);
         goto done;
     }
 
@@ -8681,7 +8716,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
     if (strcmp(cmd, "clipboard.clear") == 0) {
         app->clipboard_count = 0;
         app->clipboard_head = 0;
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{}}");
         goto done;
     }
@@ -8691,21 +8726,19 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         /* Built-in templates */
         const char *builtins[] = {"development", "devops", "data-science", "web-dev", "minimal"};
         int nbuiltin = 5;
-        char buf[4096];
-        int n = snprintf(buf, sizeof buf,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"templates\":[");
         for (int i = 0; i < nbuiltin; i++) {
-            if (i > 0) n += snprintf(buf + n, sizeof buf - n, ",");
-            n += snprintf(buf + n, sizeof buf - n,
-                "{\"name\":\"%s\",\"type\":\"builtin\"}", builtins[i]);
+            if (i > 0) RESULT_APPENDF( ",");
+            RESULT_APPENDF(
+                "{\"name\":\"%s\",\"type\":\"builtin\"}", lmux_json_esc(builtins[i]));
         }
         for (int i = 0; i < app->template_count; i++) {
-            n += snprintf(buf + n, sizeof buf - n, ",");
-            n += snprintf(buf + n, sizeof buf - n,
-                "{\"name\":\"%s\",\"type\":\"custom\"}", app->templates[i]);
+            RESULT_APPENDF( ",");
+            RESULT_APPENDF(
+                "{\"name\":\"%s\",\"type\":\"custom\"}", lmux_json_esc(app->templates[i]));
         }
-        n += snprintf(buf + n, sizeof buf - n, "]}}");
-        written = snprintf(result, result_cap, "%s", buf);
+        RESULT_APPENDF( "]}}");
         goto done;
     }
 
@@ -8714,7 +8747,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         char name[64] = {0};
         json_extract_string(args_json, "template", name, sizeof name);
         if (!name[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing template name\"}}");
             goto done;
         }
@@ -8731,7 +8764,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             }
         }
         if (!found) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"template not found\"}}");
             goto done;
         }
@@ -8741,7 +8774,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         snprintf(ws_title, sizeof ws_title, "%s workspace", name);
         lmux_workspace *ws = lmux_workspace_create(app, ws_title);
         if (!ws) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"create_failed\",\"message\":\"could not create workspace\"}}");
             goto done;
         }
@@ -8775,7 +8808,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             vec_push(&s3->panes, p3);
         }
 
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"workspace_id\":%u,\"title\":\"%s\",\"template\":\"%s\"}}",
             ws->id, JESC(ws_title), JESC(name));
         goto done;
@@ -8786,18 +8819,18 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         char name[64] = {0};
         json_extract_string(args_json, "name", name, sizeof name);
         if (!name[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing name\"}}");
             goto done;
         }
         if (app->template_count >= 32) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"limit_reached\",\"message\":\"too many templates\"}}");
             goto done;
         }
         snprintf(app->templates[app->template_count], sizeof app->templates[0], "%s", name);
         app->template_count++;
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"name\":\"%s\"}}", JESC(name));
         goto done;
     }
@@ -8807,7 +8840,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         char name[64] = {0};
         json_extract_string(args_json, "name", name, sizeof name);
         if (!name[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing name\"}}");
             goto done;
         }
@@ -8815,7 +8848,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         const char *builtins[] = {"development", "devops", "data-science", "web-dev", "minimal"};
         for (int i = 0; i < 5; i++) {
             if (strcmp(name, builtins[i]) == 0) {
-                written = snprintf(result, result_cap,
+                RESULT_SETF(
                     "{\"ok\":false,\"error\":{\"code\":\"forbidden\",\"message\":\"cannot delete built-in template\"}}");
                 goto done;
             }
@@ -8835,11 +8868,11 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             }
         }
         if (!found) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"template not found\"}}");
             goto done;
         }
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{}}");
         goto done;
     }
@@ -8853,7 +8886,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             elapsed = (now.tv_sec - app->profile_start.tv_sec) * 1000 +
                       (now.tv_nsec - app->profile_start.tv_nsec) / 1000000;
         }
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"active\":%s,\"label\":\"%s\",\"elapsed_ms\":%ld}}",
             app->profile_active ? "true" : "false",
             JESC(app->profile_label), elapsed);
@@ -8865,19 +8898,19 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         char label[128] = {0};
         json_extract_string(args_json, "label", label, sizeof label);
         if (!label[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing label\"}}");
             goto done;
         }
         if (app->profile_active) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"already_active\",\"message\":\"profiling already active\"}}");
             goto done;
         }
         app->profile_active = true;
         snprintf(app->profile_label, sizeof app->profile_label, "%s", label);
         clock_gettime(CLOCK_MONOTONIC, &app->profile_start);
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"label\":\"%s\"}}", JESC(label));
         goto done;
     }
@@ -8885,7 +8918,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
     /* --- profile.stop --- */
     if (strcmp(cmd, "profile.stop") == 0) {
         if (!app->profile_active) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_active\",\"message\":\"no profiling session active\"}}");
             goto done;
         }
@@ -8902,7 +8935,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         app->profile_result_count++;
 
         app->profile_active = false;
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"label\":\"%s\",\"elapsed_ms\":%ld}}",
             JESC(app->profile_label), elapsed);
         goto done;
@@ -8910,21 +8943,19 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
 
     /* --- profile.list --- */
     if (strcmp(cmd, "profile.list") == 0) {
-        char buf[8192];
-        int n = snprintf(buf, sizeof buf,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"results\":[");
         int count = app->profile_result_count < 32 ? app->profile_result_count : 32;
         int start = (app->profile_result_count - count + 32) % 32;
         for (int i = 0; i < count; i++) {
             int idx = (start + i) % 32;
-            if (i > 0) n += snprintf(buf + n, sizeof buf - n, ",");
-            n += snprintf(buf + n, sizeof buf - n,
+            if (i > 0) RESULT_APPENDF( ",");
+            RESULT_APPENDF(
                 "{\"label\":\"%s\",\"elapsed_ms\":%ld}",
                 JESC(app->profile_results[idx].label),
                 app->profile_results[idx].elapsed_ms);
         }
-        n += snprintf(buf + n, sizeof buf - n, "],\"count\":%d}}", count);
-        written = snprintf(result, result_cap, "%s", buf);
+        RESULT_APPENDF( "],\"count\":%d}}", count);
         goto done;
     }
 
@@ -8932,21 +8963,19 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
     if (strcmp(cmd, "cloud.vms.list") == 0) {
         char provider[32] = {0};
         json_extract_string(args_json, "provider", provider, sizeof provider);
-        char buf[8192];
-        int n = snprintf(buf, sizeof buf,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"vms\":[");
         int count = 0;
         for (int i = 0; i < app->vm_count; i++) {
             if (provider[0] && strcmp(provider, app->vms[i].provider) != 0) continue;
-            if (count > 0) n += snprintf(buf + n, sizeof buf - n, ",");
-            n += snprintf(buf + n, sizeof buf - n,
+            if (count > 0) RESULT_APPENDF( ",");
+            RESULT_APPENDF(
                 "{\"id\":\"%s\",\"name\":\"%s\",\"provider\":\"%s\",\"size\":\"%s\",\"status\":\"%s\"}",
-                app->vms[i].id, app->vms[i].name, app->vms[i].provider,
-                app->vms[i].size, app->vms[i].status);
+                lmux_json_esc(app->vms[i].id), lmux_json_esc(app->vms[i].name), lmux_json_esc(app->vms[i].provider),
+                lmux_json_esc(app->vms[i].size), lmux_json_esc(app->vms[i].status));
             count++;
         }
-        n += snprintf(buf + n, sizeof buf - n, "],\"count\":%d}}", count);
-        written = snprintf(result, result_cap, "%s", buf);
+        RESULT_APPENDF( "],\"count\":%d}}", count);
         goto done;
     }
 
@@ -8957,19 +8986,19 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         json_extract_string(args_json, "provider", provider, sizeof provider);
         json_extract_string(args_json, "size", size, sizeof size);
         if (!name[0] || !provider[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing name or provider\"}}");
             goto done;
         }
         if (app->vm_count >= 32) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"limit_reached\",\"message\":\"too many VMs\"}}");
             goto done;
         }
         /* Check for duplicate name */
         for (int i = 0; i < app->vm_count; i++) {
             if (strcmp(name, app->vms[i].name) == 0) {
-                written = snprintf(result, result_cap,
+                RESULT_SETF(
                     "{\"ok\":false,\"error\":{\"code\":\"already_exists\",\"message\":\"VM name already exists\"}}");
                 goto done;
             }
@@ -8981,9 +9010,9 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         snprintf(app->vms[idx].size, sizeof app->vms[idx].size, "%s", size[0] ? size : "e2-medium");
         snprintf(app->vms[idx].status, sizeof app->vms[idx].status, "running");
         app->vm_count++;
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"vm_id\":\"%s\",\"name\":\"%s\",\"provider\":\"%s\",\"status\":\"running\"}}",
-            app->vms[idx].id, JESC(name), JESC(provider));
+            lmux_json_esc(app->vms[idx].id), JESC(name), JESC(provider));
         goto done;
     }
 
@@ -8992,7 +9021,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         char vm_id[64] = {0};
         json_extract_string(args_json, "vm_id", vm_id, sizeof vm_id);
         if (!vm_id[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing vm_id\"}}");
             goto done;
         }
@@ -9009,11 +9038,11 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             }
         }
         if (!found) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"VM not found\"}}");
             goto done;
         }
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{}}");
         goto done;
     }
@@ -9023,7 +9052,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         char vm_id[64] = {0};
         json_extract_string(args_json, "vm_id", vm_id, sizeof vm_id);
         if (!vm_id[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing vm_id\"}}");
             goto done;
         }
@@ -9033,32 +9062,32 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                 found = true;
                 /* Create a pane for SSH connection */
                 if (app->workspaces.len == 0) {
-                    written = snprintf(result, result_cap,
+                    RESULT_SETF(
                         "{\"ok\":false,\"error\":{\"code\":\"no_workspace\",\"message\":\"no active workspace\"}}");
                     goto done;
                 }
                 lmux_workspace *ws = app->ws_current;
                 if (!ws) {
-                    written = snprintf(result, result_cap,
+                    RESULT_SETF(
                         "{\"ok\":false,\"error\":{\"code\":\"no_workspace\",\"message\":\"no active workspace\"}}");
                     goto done;
                 }
                 lmux_surface *surf = lmux_surface_focused(ws);
                 if (!surf) {
-                    written = snprintf(result, result_cap,
+                    RESULT_SETF(
                         "{\"ok\":false,\"error\":{\"code\":\"no_surface\",\"message\":\"no active surface\"}}");
                     goto done;
                 }
                 lmux_pane *pane = pane_new(ws, surf, "terminal");
                 vec_push(&surf->panes, pane);
-                written = snprintf(result, result_cap,
+                RESULT_SETF(
                     "{\"ok\":true,\"result\":{\"pane_id\":%u,\"vm_id\":\"%s\",\"host\":\"%s\"}}",
-                    pane->id, vm_id, app->vms[i].name);
+                    pane->id, lmux_json_esc(vm_id), lmux_json_esc(app->vms[i].name));
                 goto done;
             }
         }
         if (!found) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"VM not found\"}}");
             goto done;
         }
@@ -9072,12 +9101,12 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         json_extract_string(args_json, "device_name", device_name, sizeof device_name);
         json_extract_string(args_json, "platform", platform, sizeof platform);
         if (!device_id[0] || !device_name[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing device_id or device_name\"}}");
             goto done;
         }
         if (app->companion_count >= 16) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"limit_reached\",\"message\":\"too many companions\"}}");
             goto done;
         }
@@ -9089,8 +9118,8 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                 snprintf(app->companions[i].platform, sizeof app->companions[i].platform, "%s", platform[0] ? platform : "ios");
                 app->companions[i].connected = true;
                 clock_gettime(CLOCK_MONOTONIC, (struct timespec *)&app->companions[i].last_seen);
-                written = snprintf(result, result_cap,
-                    "{\"ok\":true,\"result\":{\"companion_id\":\"%s\",\"status\":\"updated\"}}", device_id);
+                RESULT_SETF(
+                    "{\"ok\":true,\"result\":{\"companion_id\":\"%s\",\"status\":\"updated\"}}", lmux_json_esc(device_id));
                 goto done;
             }
         }
@@ -9101,8 +9130,8 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         app->companions[idx].connected = true;
         clock_gettime(CLOCK_MONOTONIC, (struct timespec *)&app->companions[idx].last_seen);
         app->companion_count++;
-        written = snprintf(result, result_cap,
-            "{\"ok\":true,\"result\":{\"companion_id\":\"%s\",\"status\":\"registered\"}}", device_id);
+        RESULT_SETF(
+            "{\"ok\":true,\"result\":{\"companion_id\":\"%s\",\"status\":\"registered\"}}", lmux_json_esc(device_id));
         goto done;
     }
 
@@ -9110,21 +9139,19 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
     if (strcmp(cmd, "companion.status") == 0) {
         char companion_id[64] = {0};
         json_extract_string(args_json, "companion_id", companion_id, sizeof companion_id);
-        char buf[4096];
-        int n = snprintf(buf, sizeof buf,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"companions\":[");
         int count = 0;
         for (int i = 0; i < app->companion_count; i++) {
             if (companion_id[0] && strcmp(companion_id, app->companions[i].id) != 0) continue;
-            if (count > 0) n += snprintf(buf + n, sizeof buf - n, ",");
-            n += snprintf(buf + n, sizeof buf - n,
+            if (count > 0) RESULT_APPENDF( ",");
+            RESULT_APPENDF(
                 "{\"id\":\"%s\",\"name\":\"%s\",\"platform\":\"%s\",\"connected\":%s}",
-                app->companions[i].id, app->companions[i].name, app->companions[i].platform,
+                lmux_json_esc(app->companions[i].id), lmux_json_esc(app->companions[i].name), lmux_json_esc(app->companions[i].platform),
                 app->companions[i].connected ? "true" : "false");
             count++;
         }
-        n += snprintf(buf + n, sizeof buf - n, "],\"count\":%d}}", count);
-        written = snprintf(result, result_cap, "%s", buf);
+        RESULT_APPENDF( "],\"count\":%d}}", count);
         goto done;
     }
 
@@ -9135,7 +9162,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         json_extract_string(args_json, "title", title, sizeof title);
         json_extract_string(args_json, "message", message, sizeof message);
         if (!companion_id[0] || !title[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing companion_id or title\"}}");
             goto done;
         }
@@ -9144,14 +9171,14 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             if (strcmp(companion_id, app->companions[i].id) == 0) {
                 found = true;
                 /* In production, this would send push notification */
-                written = snprintf(result, result_cap,
+                RESULT_SETF(
                     "{\"ok\":true,\"result\":{\"companion_id\":\"%s\",\"title\":\"%s\",\"status\":\"sent\"}}",
-                    companion_id, JESC(title));
+                    lmux_json_esc(companion_id), JESC(title));
                 goto done;
             }
         }
         if (!found) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"companion not found\"}}");
             goto done;
         }
@@ -9163,7 +9190,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         char companion_id[64] = {0};
         json_extract_string(args_json, "companion_id", companion_id, sizeof companion_id);
         if (!companion_id[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing companion_id\"}}");
             goto done;
         }
@@ -9179,11 +9206,11 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             }
         }
         if (!found) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"companion not found\"}}");
             goto done;
         }
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{}}");
         goto done;
     }
@@ -9193,12 +9220,12 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         char name[64] = {0};
         json_extract_string(args_json, "name", name, sizeof name);
         if (!name[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing name\"}}");
             goto done;
         }
         if (app->team_count >= 16) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"limit_reached\",\"message\":\"too many teams\"}}");
             goto done;
         }
@@ -9207,9 +9234,9 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         snprintf(app->teams[idx].name, sizeof app->teams[idx].name, "%s", name);
         app->teams[idx].member_count = 0;
         app->team_count++;
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"team_id\":\"%s\",\"name\":\"%s\"}}",
-            app->teams[idx].id, JESC(name));
+            lmux_json_esc(app->teams[idx].id), JESC(name));
         goto done;
     }
 
@@ -9220,7 +9247,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         json_extract_string(args_json, "agent_name", agent_name, sizeof agent_name);
         json_extract_string(args_json, "role", role, sizeof role);
         if (!team_id[0] || !agent_name[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing team_id or agent_name\"}}");
             goto done;
         }
@@ -9228,7 +9255,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         for (int i = 0; i < app->team_count; i++) {
             if (strcmp(team_id, app->teams[i].id) == 0) {
                 if (app->teams[i].member_count >= 8) {
-                    written = snprintf(result, result_cap,
+                    RESULT_SETF(
                         "{\"ok\":false,\"error\":{\"code\":\"limit_reached\",\"message\":\"team is full\"}}");
                     goto done;
                 }
@@ -9237,14 +9264,14 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                 snprintf(app->teams[i].members[midx].role, sizeof app->teams[i].members[midx].role, "%s", role[0] ? role : "member");
                 app->teams[i].member_count++;
                 found = true;
-                written = snprintf(result, result_cap,
+                RESULT_SETF(
                     "{\"ok\":true,\"result\":{\"team_id\":\"%s\",\"agent_name\":\"%s\",\"role\":\"%s\"}}",
-                    team_id, JESC(agent_name), JESC(role[0] ? role : "member"));
+                    lmux_json_esc(team_id), JESC(agent_name), JESC(role[0] ? role : "member"));
                 goto done;
             }
         }
         if (!found) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"team not found\"}}");
             goto done;
         }
@@ -9257,7 +9284,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         json_extract_string(args_json, "team_id", team_id, sizeof team_id);
         json_extract_string(args_json, "agent_name", agent_name, sizeof agent_name);
         if (!team_id[0] || !agent_name[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing team_id or agent_name\"}}");
             goto done;
         }
@@ -9279,11 +9306,11 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             }
         }
         if (!found) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"team or agent not found\"}}");
             goto done;
         }
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{}}");
         goto done;
     }
@@ -9292,32 +9319,30 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
     if (strcmp(cmd, "team.list") == 0) {
         char team_id[64] = {0};
         json_extract_string(args_json, "team_id", team_id, sizeof team_id);
-        char buf[8192];
-        int n = snprintf(buf, sizeof buf,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"teams\":[");
         int count = 0;
         for (int i = 0; i < app->team_count; i++) {
             if (team_id[0] && strcmp(team_id, app->teams[i].id) != 0) continue;
-            if (count > 0) n += snprintf(buf + n, sizeof buf - n, ",");
-            n += snprintf(buf + n, sizeof buf - n,
+            if (count > 0) RESULT_APPENDF( ",");
+            RESULT_APPENDF(
                 "{\"id\":\"%s\",\"name\":\"%s\",\"member_count\":%d",
-                app->teams[i].id, app->teams[i].name, app->teams[i].member_count);
+                lmux_json_esc(app->teams[i].id), lmux_json_esc(app->teams[i].name), app->teams[i].member_count);
             /* Include members if listing specific team */
             if (team_id[0]) {
-                n += snprintf(buf + n, sizeof buf - n, ",\"members\":[");
+                RESULT_APPENDF( ",\"members\":[");
                 for (int j = 0; j < app->teams[i].member_count; j++) {
-                    if (j > 0) n += snprintf(buf + n, sizeof buf - n, ",");
-                    n += snprintf(buf + n, sizeof buf - n,
+                    if (j > 0) RESULT_APPENDF( ",");
+                    RESULT_APPENDF(
                         "{\"name\":\"%s\",\"role\":\"%s\"}",
-                        app->teams[i].members[j].name, app->teams[i].members[j].role);
+                        lmux_json_esc(app->teams[i].members[j].name), lmux_json_esc(app->teams[i].members[j].role));
                 }
-                n += snprintf(buf + n, sizeof buf - n, "]");
+                RESULT_APPENDF( "]");
             }
-            n += snprintf(buf + n, sizeof buf - n, "}");
+            RESULT_APPENDF( "}");
             count++;
         }
-        n += snprintf(buf + n, sizeof buf - n, "],\"count\":%d}}", count);
-        written = snprintf(result, result_cap, "%s", buf);
+        RESULT_APPENDF( "],\"count\":%d}}", count);
         goto done;
     }
 
@@ -9327,7 +9352,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         json_extract_string(args_json, "team_id", team_id, sizeof team_id);
         json_extract_string(args_json, "task", task, sizeof task);
         if (!team_id[0] || !task[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing team_id or task\"}}");
             goto done;
         }
@@ -9338,14 +9363,14 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                 /* Generate dispatch ID */
                 char dispatch_id[64];
                 snprintf(dispatch_id, sizeof dispatch_id, "dispatch-%d-%d", i + 1, app->team_count);
-                written = snprintf(result, result_cap,
+                RESULT_SETF(
                     "{\"ok\":true,\"result\":{\"dispatch_id\":\"%s\",\"team_id\":\"%s\",\"task\":\"%s\",\"status\":\"dispatched\"}}",
-                    dispatch_id, team_id, JESC(task));
+                    lmux_json_esc(dispatch_id), lmux_json_esc(team_id), JESC(task));
                 goto done;
             }
         }
         if (!found) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"team not found\"}}");
             goto done;
         }
@@ -9357,7 +9382,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         char team_id[64] = {0};
         json_extract_string(args_json, "team_id", team_id, sizeof team_id);
         if (!team_id[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing team_id\"}}");
             goto done;
         }
@@ -9373,11 +9398,11 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             }
         }
         if (!found) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"team not found\"}}");
             goto done;
         }
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{}}");
         goto done;
     }
@@ -9389,12 +9414,12 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         json_extract_string(args_json, "path", path, sizeof path);
 
         if (!source[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing source\"}}");
             goto done;
         }
         if (!path[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing path\"}}");
             goto done;
         }
@@ -9402,7 +9427,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         /* Read file */
         FILE *fp = fopen(path, "r");
         if (!fp) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"file_error\",\"message\":\"cannot open file\"}}");
             goto done;
         }
@@ -9411,7 +9436,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         fseek(fp, 0, SEEK_SET);
         if (fsize <= 0 || fsize > 1024 * 1024) {
             fclose(fp);
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"file_error\",\"message\":\"file too large or empty\"}}");
             goto done;
         }
@@ -9427,7 +9452,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         lmux_feed_panel *panel = lmux_feed_panel_create(app, panel_title, "bookmark");
         if (!panel) {
             free(fbuf);
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"create_failed\",\"message\":\"could not create panel\"}}");
             goto done;
         }
@@ -9516,7 +9541,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         }
 
         free(fbuf);
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"panel_id\":%u,\"count\":%d}}",
             panel->id, count);
         goto done;
@@ -9528,28 +9553,26 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         json_extract_string(args_json, "title", title, sizeof title);
         lmux_window *w = lmux_window_create(app, title[0] ? title : NULL);
         if (w) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":true,\"result\":{\"window_id\":%u,\"title\":\"%s\"}}",
-                w->id, w->title);
+                w->id, lmux_json_esc(w->title));
         } else {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"create_failed\",\"message\":\"could not create window\"}}");
         }
         goto done;
     }
 
     if (strcmp(cmd, "window.list") == 0) {
-        char buf[8192];
-        int n = snprintf(buf, sizeof buf, "{\"ok\":true,\"result\":{\"windows\":[");
+        RESULT_SETF( "{\"ok\":true,\"result\":{\"windows\":[");
         for (size_t i = 0; i < app->windows.len; i++) {
             lmux_window *w = app->windows.items[i];
-            if (i > 0) n += snprintf(buf + n, sizeof buf - n, ",");
-            n += snprintf(buf + n, sizeof buf - n,
+            if (i > 0) RESULT_APPENDF( ",");
+            RESULT_APPENDF(
                 "{\"id\":%u,\"title\":\"%s\",\"workspace_count\":%zu}",
-                w->id, w->title, w->workspace_count);
+                w->id, lmux_json_esc(w->title), w->workspace_count);
         }
-        n += snprintf(buf + n, sizeof buf - n, "]}}");
-        written = snprintf(result, result_cap, "%s", buf);
+        RESULT_APPENDF( "]}}");
         goto done;
     }
 
@@ -9557,16 +9580,16 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         char w_id[64] = {0};
         json_extract_string(args_json, "id", w_id, sizeof w_id);
         if (!w_id[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing id\"}}");
             goto done;
         }
         lmux_id wid = (lmux_id)atol(w_id);
         if (lmux_window_by_id(app, wid)) {
             lmux_window_close(app, wid);
-            written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+            RESULT_SETF( "{\"ok\":true,\"result\":{}}");
         } else {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"window not found\"}}");
         }
         goto done;
@@ -9576,15 +9599,15 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         char w_id[64] = {0};
         json_extract_string(args_json, "id", w_id, sizeof w_id);
         if (!w_id[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing id\"}}");
             goto done;
         }
         lmux_id wid = (lmux_id)atol(w_id);
         if (lmux_window_focus(app, wid)) {
-            written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+            RESULT_SETF( "{\"ok\":true,\"result\":{}}");
         } else {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"window not found\"}}");
         }
         goto done;
@@ -9595,16 +9618,16 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         json_extract_string(args_json, "window_id", w_id, sizeof w_id);
         json_extract_string(args_json, "workspace_id", ws_id, sizeof ws_id);
         if (!w_id[0] || !ws_id[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing window_id or workspace_id\"}}");
             goto done;
         }
         lmux_id wid = (lmux_id)atol(w_id);
         lmux_id wsid = (lmux_id)atol(ws_id);
         if (lmux_window_move_workspace(app, wid, wsid)) {
-            written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+            RESULT_SETF( "{\"ok\":true,\"result\":{}}");
         } else {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"move_failed\",\"message\":\"could not move workspace\"}}");
         }
         goto done;
@@ -9617,35 +9640,33 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         json_extract_string(args_json, "user", user, sizeof user);
         json_extract_string(args_json, "key_path", key_path, sizeof key_path);
         if (!host[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing host\"}}");
             goto done;
         }
         lmux_ssh_session *s = lmux_ssh_session_create(app, host,
             user[0] ? user : NULL, key_path[0] ? key_path : NULL);
         if (s) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":true,\"result\":{\"session_id\":%u,\"host\":\"%s\"}}",
-                s->id, s->host);
+                s->id, lmux_json_esc(s->host));
         } else {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"create_failed\",\"message\":\"could not create session\"}}");
         }
         goto done;
     }
 
     if (strcmp(cmd, "ssh.session.list") == 0) {
-        char buf[8192];
-        int n = snprintf(buf, sizeof buf, "{\"ok\":true,\"result\":{\"sessions\":[");
+        RESULT_SETF( "{\"ok\":true,\"result\":{\"sessions\":[");
         for (size_t i = 0; i < app->ssh_sessions.len; i++) {
             lmux_ssh_session *s = app->ssh_sessions.items[i];
-            if (i > 0) n += snprintf(buf + n, sizeof buf - n, ",");
-            n += snprintf(buf + n, sizeof buf - n,
+            if (i > 0) RESULT_APPENDF( ",");
+            RESULT_APPENDF(
                 "{\"id\":%u,\"host\":\"%s\",\"user\":\"%s\",\"active\":%s}",
-                s->id, s->host, s->user, s->active ? "true" : "false");
+                s->id, lmux_json_esc(s->host), lmux_json_esc(s->user), s->active ? "true" : "false");
         }
-        n += snprintf(buf + n, sizeof buf - n, "]}}");
-        written = snprintf(result, result_cap, "%s", buf);
+        RESULT_APPENDF( "]}}");
         goto done;
     }
 
@@ -9653,15 +9674,15 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         char s_id[64] = {0};
         json_extract_string(args_json, "id", s_id, sizeof s_id);
         if (!s_id[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing id\"}}");
             goto done;
         }
         lmux_id sid = (lmux_id)atol(s_id);
         if (lmux_ssh_session_kill(app, sid)) {
-            written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+            RESULT_SETF( "{\"ok\":true,\"result\":{}}");
         } else {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"session not found\"}}");
         }
         goto done;
@@ -9676,10 +9697,10 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                 home ? home : "/tmp");
         }
         if (lmux_ssh_session_save(app, path)) {
-            written = snprintf(result, result_cap,
-                "{\"ok\":true,\"result\":{\"path\":\"%s\"}}", path);
+            RESULT_SETF(
+                "{\"ok\":true,\"result\":{\"path\":\"%s\"}}", lmux_json_esc(path));
         } else {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"save_failed\",\"message\":\"could not save sessions\"}}");
         }
         goto done;
@@ -9694,10 +9715,10 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                 home ? home : "/tmp");
         }
         if (lmux_ssh_session_restore(app, path)) {
-            written = snprintf(result, result_cap,
-                "{\"ok\":true,\"result\":{\"path\":\"%s\"}}", path);
+            RESULT_SETF(
+                "{\"ok\":true,\"result\":{\"path\":\"%s\"}}", lmux_json_esc(path));
         } else {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"restore_failed\",\"message\":\"could not restore sessions\"}}");
         }
         goto done;
@@ -9711,28 +9732,26 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         lmux_feed_panel *p = lmux_feed_panel_create(app, title[0] ? title : NULL,
             filter[0] ? filter : NULL);
         if (p) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":true,\"result\":{\"panel_id\":%u,\"title\":\"%s\"}}",
-                p->id, p->title);
+                p->id, lmux_json_esc(p->title));
         } else {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"create_failed\",\"message\":\"could not create panel\"}}");
         }
         goto done;
     }
 
     if (strcmp(cmd, "feed.panel.list") == 0) {
-        char buf[8192];
-        int n = snprintf(buf, sizeof buf, "{\"ok\":true,\"result\":{\"panels\":[");
+        RESULT_SETF( "{\"ok\":true,\"result\":{\"panels\":[");
         for (size_t i = 0; i < app->feed_panels.len; i++) {
             lmux_feed_panel *p = app->feed_panels.items[i];
-            if (i > 0) n += snprintf(buf + n, sizeof buf - n, ",");
-            n += snprintf(buf + n, sizeof buf - n,
+            if (i > 0) RESULT_APPENDF( ",");
+            RESULT_APPENDF(
                 "{\"id\":%u,\"title\":\"%s\",\"filter\":\"%s\",\"entry_count\":%zu}",
-                p->id, p->title, p->filter, lmux_feed_entry_count(app, p->id));
+                p->id, lmux_json_esc(p->title), lmux_json_esc(p->filter), lmux_feed_entry_count(app, p->id));
         }
-        n += snprintf(buf + n, sizeof buf - n, "]}}");
-        written = snprintf(result, result_cap, "%s", buf);
+        RESULT_APPENDF( "]}}");
         goto done;
     }
 
@@ -9740,15 +9759,15 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         char p_id[64] = {0};
         json_extract_string(args_json, "id", p_id, sizeof p_id);
         if (!p_id[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing id\"}}");
             goto done;
         }
         lmux_id pid = (lmux_id)atol(p_id);
         if (lmux_feed_panel_close(app, pid)) {
-            written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+            RESULT_SETF( "{\"ok\":true,\"result\":{}}");
         } else {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"panel not found\"}}");
         }
         goto done;
@@ -9761,16 +9780,16 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         json_extract_string(args_json, "source", source, sizeof source);
         json_extract_string(args_json, "text", text, sizeof text);
         if (!p_id[0] || !text[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing panel_id or text\"}}");
             goto done;
         }
         lmux_id pid = (lmux_id)atol(p_id);
         if (lmux_feed_entry_add(app, pid, event_type[0] ? event_type : NULL,
             source[0] ? source : NULL, text)) {
-            written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+            RESULT_SETF( "{\"ok\":true,\"result\":{}}");
         } else {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"add_failed\",\"message\":\"could not add entry\"}}");
         }
         goto done;
@@ -9780,13 +9799,13 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         char p_id[64] = {0};
         json_extract_string(args_json, "panel_id", p_id, sizeof p_id);
         if (!p_id[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing panel_id\"}}");
             goto done;
         }
         lmux_id pid = (lmux_id)atol(p_id);
         size_t count = lmux_feed_entry_count(app, pid);
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"count\":%zu}}", count);
         goto done;
     }
@@ -9795,15 +9814,15 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         char p_id[64] = {0};
         json_extract_string(args_json, "panel_id", p_id, sizeof p_id);
         if (!p_id[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing panel_id\"}}");
             goto done;
         }
         lmux_id pid = (lmux_id)atol(p_id);
         if (lmux_feed_panel_clear(app, pid)) {
-            written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+            RESULT_SETF( "{\"ok\":true,\"result\":{}}");
         } else {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"clear_failed\",\"message\":\"could not clear panel\"}}");
         }
         goto done;
@@ -9817,7 +9836,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         lmux_workspace *ws = ws_id[0] ? lmux_workspace_by_id(app, (lmux_id)atol(ws_id))
                                       : lmux_workspace_focused(app);
         if (!ws) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no workspaces\"}}");
             goto done;
         }
@@ -9839,7 +9858,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             p = lmux_pane_focused(ws);
         }
         if (!p) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no focused pane\"}}");
             goto done;
         }
@@ -9857,7 +9876,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         snprintf(notify_line, sizeof notify_line,
             "%%copy-mode-changed %u 1", p->id);
         lmux_control_notify("pane", notify_line);
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"pane_id\":%u,\"active\":true}}", p->id);
         goto done;
     }
@@ -9870,7 +9889,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         lmux_workspace *ws = ws_id[0] ? lmux_workspace_by_id(app, (lmux_id)atol(ws_id))
                                       : lmux_workspace_focused(app);
         if (!ws) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no workspaces\"}}");
             goto done;
         }
@@ -9892,7 +9911,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             p = lmux_pane_focused(ws);
         }
         if (!p) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no focused pane\"}}");
             goto done;
         }
@@ -9910,7 +9929,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         snprintf(notify_line, sizeof notify_line,
             "%%copy-mode-changed %u 0", p->id);
         lmux_control_notify("pane", notify_line);
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"pane_id\":%u,\"was_active\":%s}}",
             p->id, was_active ? "true" : "false");
         goto done;
@@ -9948,7 +9967,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             ws = lmux_workspace_focused(app);
         }
         if (!ws) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no workspaces\"}}");
             goto done;
         }
@@ -9970,17 +9989,17 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             p = lmux_pane_focused(ws);
         }
         if (!p) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no focused pane\"}}");
             goto done;
         }
         if (!p->copy_mode_active) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_state\",\"message\":\"copy mode not active\"}}");
             goto done;
         }
         if (!key[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing key\"}}");
             goto done;
         }
@@ -10034,14 +10053,14 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                 }
             }
         } else {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"unknown key: %s\"}}",
-                key);
+                lmux_json_esc(key));
             goto done;
         }
         if (p->copy_cursor_row < 0) p->copy_cursor_row = 0;
         if (p->copy_cursor_col < 0) p->copy_cursor_col = 0;
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"pane_id\":%u,\"row\":%d,\"col\":%d}}",
             p->id, p->copy_cursor_row, p->copy_cursor_col);
         goto done;
@@ -10055,7 +10074,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         lmux_workspace *ws = ws_id[0] ? lmux_workspace_by_id(app, (lmux_id)atol(ws_id))
                                       : lmux_workspace_focused(app);
         if (!ws) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no workspaces\"}}");
             goto done;
         }
@@ -10077,12 +10096,12 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             p = lmux_pane_focused(ws);
         }
         if (!p) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no focused pane\"}}");
             goto done;
         }
         if (!p->copy_mode_active) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_state\",\"message\":\"copy mode not active\"}}");
             goto done;
         }
@@ -10094,7 +10113,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         snprintf(notify_line, sizeof notify_line,
             "%%selection-changed %u %d %d", p->id, p->copy_sel_start_row, p->copy_sel_start_col);
         lmux_control_notify("pane", notify_line);
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"pane_id\":%u,\"selecting\":true,\"start_row\":%d,\"start_col\":%d}}",
             p->id, p->copy_sel_start_row, p->copy_sel_start_col);
         goto done;
@@ -10108,7 +10127,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         lmux_workspace *ws = ws_id[0] ? lmux_workspace_by_id(app, (lmux_id)atol(ws_id))
                                       : lmux_workspace_focused(app);
         if (!ws) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no workspaces\"}}");
             goto done;
         }
@@ -10130,12 +10149,12 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             p = lmux_pane_focused(ws);
         }
         if (!p) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no focused pane\"}}");
             goto done;
         }
         if (!p->copy_mode_active) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_state\",\"message\":\"copy mode not active\"}}");
             goto done;
         }
@@ -10157,7 +10176,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         snprintf(notify_line, sizeof notify_line,
             "%%selection-changed %u %d %d", p->id, start_row, start_col);
         lmux_control_notify("pane", notify_line);
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"pane_id\":%u,\"selecting\":false,"
             "\"start_row\":%d,\"start_col\":%d,\"end_row\":%d,\"end_col\":%d}}",
             p->id, start_row, start_col, end_row, end_col);
@@ -10172,7 +10191,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         lmux_workspace *ws = ws_id[0] ? lmux_workspace_by_id(app, (lmux_id)atol(ws_id))
                                       : lmux_workspace_focused(app);
         if (!ws) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no workspaces\"}}");
             goto done;
         }
@@ -10194,12 +10213,12 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             p = lmux_pane_focused(ws);
         }
         if (!p) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no focused pane\"}}");
             goto done;
         }
         if (!p->copy_mode_active) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_state\",\"message\":\"copy mode not active\"}}");
             goto done;
         }
@@ -10211,7 +10230,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             p->copy_sel_start_row, p->copy_sel_start_col,
             p->copy_cursor_row, p->copy_cursor_col);
         if (n > 0) lmux_clipboard_set(yank_buf, (size_t)n);
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"pane_id\":%u,\"yanked\":true,\"len\":%d}}",
             p->id, n);
         goto done;
@@ -10225,7 +10244,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         lmux_workspace *ws = ws_id[0] ? lmux_workspace_by_id(app, (lmux_id)atol(ws_id))
                                       : lmux_workspace_focused(app);
         if (!ws) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no workspaces\"}}");
             goto done;
         }
@@ -10247,12 +10266,12 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             p = lmux_pane_focused(ws);
         }
         if (!p) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no focused pane\"}}");
             goto done;
         }
         if (!p->copy_mode_active) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_state\",\"message\":\"copy mode not active\"}}");
             goto done;
         }
@@ -10261,7 +10280,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         paste_buf[paste_len] = '\0';
         /* In a real terminal, we'd send paste_buf to the pty. Here we just
          * report what was pasted. */
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"pane_id\":%u,\"pasted\":true,\"len\":%zu}}",
             p->id, paste_len);
         goto done;
@@ -10279,7 +10298,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         lmux_workspace *ws = ws_id[0] ? lmux_workspace_by_id(app, (lmux_id)atol(ws_id))
                                       : lmux_workspace_focused(app);
         if (!ws) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no workspaces\"}}");
             goto done;
         }
@@ -10301,17 +10320,17 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             p = lmux_pane_focused(ws);
         }
         if (!p) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no focused pane\"}}");
             goto done;
         }
         
         char formatted[1024] = {0};
         if (lmux_format_expand(app, p, template, formatted, sizeof formatted)) {
-            written = snprintf(result, result_cap,
-                "{\"ok\":true,\"result\":{\"formatted\":\"%s\"}}", formatted);
+            RESULT_SETF(
+                "{\"ok\":true,\"result\":{\"formatted\":\"%s\"}}", lmux_json_esc(formatted));
         } else {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"format expansion failed\"}}");
         }
         goto done;
@@ -10327,7 +10346,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         lmux_workspace *ws = ws_id[0] ? lmux_workspace_by_id(app, (lmux_id)atol(ws_id))
                                       : lmux_workspace_focused(app);
         if (!ws) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no workspaces\"}}");
             goto done;
         }
@@ -10349,17 +10368,17 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             p = lmux_pane_focused(ws);
         }
         if (!p) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no focused pane\"}}");
             goto done;
         }
         if (!p->copy_mode_active) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_state\",\"message\":\"copy mode not active\"}}");
             goto done;
         }
         if (!pattern[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing pattern\"}}");
             goto done;
         }
@@ -10368,7 +10387,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         p->copy_search_pattern = strdup(pattern);
         p->copy_search_backward = false;
         /* Simplified: just report match found */
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"pane_id\":%u,\"pattern\":\"%s\",\"matches\":1}}",
             p->id, JESC(pattern));
         goto done;
@@ -10384,7 +10403,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         lmux_workspace *ws = ws_id[0] ? lmux_workspace_by_id(app, (lmux_id)atol(ws_id))
                                       : lmux_workspace_focused(app);
         if (!ws) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no workspaces\"}}");
             goto done;
         }
@@ -10406,24 +10425,24 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             p = lmux_pane_focused(ws);
         }
         if (!p) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no focused pane\"}}");
             goto done;
         }
         if (!p->copy_mode_active) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_state\",\"message\":\"copy mode not active\"}}");
             goto done;
         }
         if (!pattern[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing pattern\"}}");
             goto done;
         }
         if (p->copy_search_pattern) free(p->copy_search_pattern);
         p->copy_search_pattern = strdup(pattern);
         p->copy_search_backward = true;
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"pane_id\":%u,\"pattern\":\"%s\",\"matches\":1}}",
             p->id, JESC(pattern));
         goto done;
@@ -10437,7 +10456,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         lmux_workspace *ws = ws_id[0] ? lmux_workspace_by_id(app, (lmux_id)atol(ws_id))
                                       : lmux_workspace_focused(app);
         if (!ws) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no workspaces\"}}");
             goto done;
         }
@@ -10459,23 +10478,23 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             p = lmux_pane_focused(ws);
         }
         if (!p) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no focused pane\"}}");
             goto done;
         }
         if (!p->copy_mode_active) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_state\",\"message\":\"copy mode not active\"}}");
             goto done;
         }
         if (!p->copy_search_pattern) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_state\",\"message\":\"no active search\"}}");
             goto done;
         }
         /* Simplified: move cursor to next match */
         p->copy_cursor_row++;
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"pane_id\":%u,\"row\":%d,\"col\":%d}}",
             p->id, p->copy_cursor_row, p->copy_cursor_col);
         goto done;
@@ -10489,7 +10508,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         lmux_workspace *ws = ws_id[0] ? lmux_workspace_by_id(app, (lmux_id)atol(ws_id))
                                       : lmux_workspace_focused(app);
         if (!ws) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no workspaces\"}}");
             goto done;
         }
@@ -10511,22 +10530,22 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             p = lmux_pane_focused(ws);
         }
         if (!p) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no focused pane\"}}");
             goto done;
         }
         if (!p->copy_mode_active) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_state\",\"message\":\"copy mode not active\"}}");
             goto done;
         }
         if (!p->copy_search_pattern) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_state\",\"message\":\"no active search\"}}");
             goto done;
         }
         if (p->copy_cursor_row > 0) p->copy_cursor_row--;
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"pane_id\":%u,\"row\":%d,\"col\":%d}}",
             p->id, p->copy_cursor_row, p->copy_cursor_col);
         goto done;
@@ -10543,7 +10562,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         lmux_workspace *ws = ws_id[0] ? lmux_workspace_by_id(app, (lmux_id)atol(ws_id))
                                       : lmux_workspace_focused(app);
         if (!ws) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no workspaces\"}}");
             goto done;
         }
@@ -10565,19 +10584,19 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             p = lmux_pane_focused(ws);
         }
         if (!p) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no focused pane\"}}");
             goto done;
         }
         if (!p->copy_mode_active) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_state\",\"message\":\"copy mode not active\"}}");
             goto done;
         }
         if (line < 0) line = 0;
         p->copy_cursor_row = line;
         p->copy_cursor_col = 0;
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"pane_id\":%u,\"row\":%d,\"col\":%d}}",
             p->id, p->copy_cursor_row, p->copy_cursor_col);
         goto done;
@@ -10591,7 +10610,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         lmux_workspace *ws = ws_id[0] ? lmux_workspace_by_id(app, (lmux_id)atol(ws_id))
                                       : lmux_workspace_focused(app);
         if (!ws) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no workspaces\"}}");
             goto done;
         }
@@ -10613,17 +10632,17 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             p = lmux_pane_focused(ws);
         }
         if (!p) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no focused pane\"}}");
             goto done;
         }
         if (!p->copy_mode_active) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_state\",\"message\":\"copy mode not active\"}}");
             goto done;
         }
         p->copy_rectangle = !p->copy_rectangle;
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"pane_id\":%u,\"rectangle\":%s}}",
             p->id, p->copy_rectangle ? "true" : "false");
         goto done;
@@ -10639,7 +10658,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         lmux_workspace *ws = ws_id[0] ? lmux_workspace_by_id(app, (lmux_id)atol(ws_id))
                                       : lmux_workspace_focused(app);
         if (!ws) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no workspaces\"}}");
             goto done;
         }
@@ -10661,22 +10680,22 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             p = lmux_pane_focused(ws);
         }
         if (!p) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no focused pane\"}}");
             goto done;
         }
         if (!p->copy_mode_active) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_state\",\"message\":\"copy mode not active\"}}");
             goto done;
         }
         if (!command[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing command\"}}");
             goto done;
         }
         /* Simplified: just report success */
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"pane_id\":%u,\"piped\":true}}",
             p->id);
         goto done;
@@ -10690,7 +10709,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         lmux_workspace *ws = ws_id[0] ? lmux_workspace_by_id(app, (lmux_id)atol(ws_id))
                                       : lmux_workspace_focused(app);
         if (!ws) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no workspaces\"}}");
             goto done;
         }
@@ -10712,12 +10731,12 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             p = lmux_pane_focused(ws);
         }
         if (!p) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no focused pane\"}}");
             goto done;
         }
         if (!p->copy_mode_active) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_state\",\"message\":\"copy mode not active\"}}");
             goto done;
         }
@@ -10729,7 +10748,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         snprintf(notify_line, sizeof notify_line,
             "%%selection-changed %u %d %d", p->id, p->copy_sel_start_row, p->copy_sel_start_col);
         lmux_control_notify("pane", notify_line);
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"pane_id\":%u,\"selecting\":true,\"start_row\":%d,\"start_col\":%d}}",
             p->id, p->copy_sel_start_row, p->copy_sel_start_col);
         goto done;
@@ -10743,7 +10762,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         lmux_workspace *ws = ws_id[0] ? lmux_workspace_by_id(app, (lmux_id)atol(ws_id))
                                       : lmux_workspace_focused(app);
         if (!ws) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no workspaces\"}}");
             goto done;
         }
@@ -10765,12 +10784,12 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             p = lmux_pane_focused(ws);
         }
         if (!p) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no focused pane\"}}");
             goto done;
         }
         if (!p->copy_mode_active) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_state\",\"message\":\"copy mode not active\"}}");
             goto done;
         }
@@ -10787,7 +10806,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         snprintf(notify_line, sizeof notify_line,
             "%%selection-changed %u %d %d", p->id, p->copy_sel_start_row, p->copy_sel_start_col);
         lmux_control_notify("pane", notify_line);
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"pane_id\":%u,\"copied\":true,\"len\":%d}}",
             p->id, n);
         goto done;
@@ -10801,7 +10820,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         lmux_workspace *ws = ws_id[0] ? lmux_workspace_by_id(app, (lmux_id)atol(ws_id))
                                       : lmux_workspace_focused(app);
         if (!ws) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no workspaces\"}}");
             goto done;
         }
@@ -10823,12 +10842,12 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             p = lmux_pane_focused(ws);
         }
         if (!p) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no focused pane\"}}");
             goto done;
         }
         if (!p->copy_mode_active) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_state\",\"message\":\"copy mode not active\"}}");
             goto done;
         }
@@ -10852,7 +10871,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         snprintf(notify_line, sizeof notify_line,
             "%%selection-changed %u %d %d", p->id, p->copy_sel_start_row, p->copy_sel_start_col);
         lmux_control_notify("pane", notify_line);
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"pane_id\":%u,\"copied\":true,\"exited\":true,\"was_active\":%s,\"len\":%d}}",
             p->id, was_active ? "true" : "false", n);
         goto done;
@@ -10861,30 +10880,30 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
     /* --- file_explorer.navigate --- */
     if (strcmp(cmd, "file_explorer.navigate") == 0) {
         if (!app->file_explorer.active) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_state\",\"message\":\"file explorer not open\"}}");
             goto done;
         }
         char path[1024] = {0};
         json_extract_string(args_json, "path", path, sizeof path);
         if (!path[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing path\"}}");
             goto done;
         }
         /* Validate path exists and is a directory */
         struct stat st;
         if (stat(path, &st) != 0 || !S_ISDIR(st.st_mode)) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"directory not found: %s\"}}",
-                path);
+                lmux_json_esc(path));
             goto done;
         }
         file_explorer_scan_dir(&app->file_explorer, path);
         file_explorer_apply_sort(&app->file_explorer);
         app->file_explorer.active = true;
         app->file_explorer.selected_index = 0;
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"path\":\"%s\",\"count\":%d}}",
             JESC(app->file_explorer.current_path), app->file_explorer.entry_count);
         goto done;
@@ -10893,11 +10912,11 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
     /* --- file_explorer.list --- */
     if (strcmp(cmd, "file_explorer.list") == 0) {
         if (!app->file_explorer.active) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_state\",\"message\":\"file explorer not open\"}}");
             goto done;
         }
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"path\":\"%s\",\"entries\":[",
             JESC(app->file_explorer.current_path));
         int visible = 0;
@@ -10909,8 +10928,8 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                 continue;
             RESULT_GROW;
             char _ne[512], _pe[1024];
-            if (visible > 0) written += snprintf(result + written, result_cap - written, ",");
-            written += snprintf(result + written, result_cap - written,
+            if (visible > 0) RESULT_APPENDF( ",");
+            RESULT_APPENDF(
                 "{\"name\":\"%s\",\"path\":\"%s\",\"is_dir\":%s,\"size\":%lld,\"mtime\":%lld}",
                 json_escape_str(_ne, sizeof _ne, e->name),
                 json_escape_str(_pe, sizeof _pe, e->path),
@@ -10918,7 +10937,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                 (long long)e->size, (long long)e->mtime);
             visible++;
         }
-        written += snprintf(result + written, result_cap - written,
+        RESULT_APPENDF(
             "],\"count\":%d,\"selected\":%d,\"filter\":\"%s\",\"sort_mode\":%d}}",
             visible, app->file_explorer.selected_index,
             JESC(app->file_explorer.filter), app->file_explorer.sort_mode);
@@ -10941,9 +10960,9 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         /* Validate path exists and is a directory */
         struct stat st;
         if (stat(path, &st) != 0 || !S_ISDIR(st.st_mode)) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"directory not found: %s\"}}",
-                path);
+                lmux_json_esc(path));
             goto done;
         }
         file_explorer_scan_dir(&app->file_explorer, path);
@@ -10951,7 +10970,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         app->file_explorer.active = true;
         app->file_explorer.selected_index = 0;
         app->file_explorer.filter[0] = '\0';
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"path\":\"%s\",\"count\":%d}}",
             JESC(app->file_explorer.current_path), app->file_explorer.entry_count);
         goto done;
@@ -10960,7 +10979,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
     /* --- file_explorer.refresh --- */
     if (strcmp(cmd, "file_explorer.refresh") == 0) {
         if (!app->file_explorer.active) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_state\",\"message\":\"file explorer not open\"}}");
             goto done;
         }
@@ -10969,7 +10988,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         snprintf(refresh_path, sizeof refresh_path, "%s", app->file_explorer.current_path);
         file_explorer_scan_dir(&app->file_explorer, refresh_path);
         file_explorer_apply_sort(&app->file_explorer);
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"path\":\"%s\",\"count\":%d}}",
             JESC(app->file_explorer.current_path), app->file_explorer.entry_count);
         goto done;
@@ -10978,7 +10997,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
     /* --- file_explorer.filter --- */
     if (strcmp(cmd, "file_explorer.filter") == 0) {
         if (!app->file_explorer.active) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_state\",\"message\":\"file explorer not open\"}}");
             goto done;
         }
@@ -10986,7 +11005,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         json_extract_string(args_json, "filter", filter, sizeof filter);
         snprintf(app->file_explorer.filter, sizeof app->file_explorer.filter, "%s", filter);
         app->file_explorer.selected_index = 0;
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"filter\":\"%s\",\"count\":%d}}",
             JESC(app->file_explorer.filter), file_explorer_entry_count(&app->file_explorer));
         goto done;
@@ -10995,7 +11014,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
     /* --- file_explorer.sort --- */
     if (strcmp(cmd, "file_explorer.sort") == 0) {
         if (!app->file_explorer.active) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_state\",\"message\":\"file explorer not open\"}}");
             goto done;
         }
@@ -11005,13 +11024,13 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         else if (strcmp(mode, "size") == 0) app->file_explorer.sort_mode = FILE_SORT_SIZE;
         else if (strcmp(mode, "time") == 0) app->file_explorer.sort_mode = FILE_SORT_TIME;
         else {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"invalid sort mode: %s\"}}",
-                mode);
+                lmux_json_esc(mode));
             goto done;
         }
         file_explorer_apply_sort(&app->file_explorer);
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"sort_mode\":%d}}", app->file_explorer.sort_mode);
         goto done;
     }
@@ -11019,14 +11038,14 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
     /* --- file_explorer.open_file --- */
     if (strcmp(cmd, "file_explorer.open_file") == 0) {
         if (!app->file_explorer.active) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_state\",\"message\":\"file explorer not open\"}}");
             goto done;
         }
         char name[256] = {0};
         json_extract_string(args_json, "name", name, sizeof name);
         if (!name[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing name\"}}");
             goto done;
         }
@@ -11039,9 +11058,9 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             }
         }
         if (idx < 0) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"entry not found: %s\"}}",
-                name);
+                lmux_json_esc(name));
             goto done;
         }
         lmux_file_entry *e = &app->file_explorer.entries[idx];
@@ -11050,11 +11069,11 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             file_explorer_scan_dir(&app->file_explorer, e->path);
             file_explorer_apply_sort(&app->file_explorer);
             app->file_explorer.selected_index = 0;
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":true,\"result\":{\"type\":\"directory\",\"path\":\"%s\",\"count\":%d}}",
                 JESC(app->file_explorer.current_path), app->file_explorer.entry_count);
         } else {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":true,\"result\":{\"type\":\"file\",\"name\":\"%s\",\"path\":\"%s\",\"size\":%lld}}",
                 JESC(e->name), JESC(e->path), (long long)e->size);
         }
@@ -11064,20 +11083,20 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
     /* --- file_explorer.create_dir --- */
     if (strcmp(cmd, "file_explorer.create_dir") == 0) {
         if (!app->file_explorer.active) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_state\",\"message\":\"file explorer not open\"}}");
             goto done;
         }
         char dirname[256] = {0};
         json_extract_string(args_json, "name", dirname, sizeof dirname);
         if (!dirname[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing name\"}}");
             goto done;
         }
         /* Security: reject path traversal in directory name */
         if (!is_safe_path(dirname, app->file_explorer.current_path)) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"directory name contains traversal sequences\"}}");
             goto done;
         }
@@ -11088,9 +11107,9 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         else
             snprintf(fullpath, sizeof fullpath, "%s/%s", app->file_explorer.current_path, dirname);
         if (mkdir(fullpath, 0755) != 0) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"create_failed\",\"message\":\"failed to create directory: %s\"}}",
-                dirname);
+                lmux_json_esc(dirname));
             goto done;
         }
         /* Refresh directory listing — copy path first since scan_dir overwrites current_path */
@@ -11100,7 +11119,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             file_explorer_scan_dir(&app->file_explorer, _rp);
         }
         file_explorer_apply_sort(&app->file_explorer);
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"name\":\"%s\",\"path\":\"%s\"}}",
             JESC(dirname), JESC(fullpath));
         goto done;
@@ -11109,20 +11128,20 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
     /* --- file_explorer.delete --- */
     if (strcmp(cmd, "file_explorer.delete") == 0) {
         if (!app->file_explorer.active) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_state\",\"message\":\"file explorer not open\"}}");
             goto done;
         }
         char name[256] = {0};
         json_extract_string(args_json, "name", name, sizeof name);
         if (!name[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing name\"}}");
             goto done;
         }
         /* Security: reject path traversal in file name */
         if (strchr(name, '/') || strstr(name, "..")) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"file name contains path separators\"}}");
             goto done;
         }
@@ -11135,9 +11154,9 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             }
         }
         if (idx < 0) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"entry not found: %s\"}}",
-                name);
+                lmux_json_esc(name));
             goto done;
         }
         lmux_file_entry *e = &app->file_explorer.entries[idx];
@@ -11148,9 +11167,9 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             ret = unlink(e->path);
         }
         if (ret != 0) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"delete_failed\",\"message\":\"failed to delete: %s\"}}",
-                name);
+                lmux_json_esc(name));
             goto done;
         }
         /* Refresh directory listing — copy path first since scan_dir overwrites current_path */
@@ -11160,7 +11179,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             file_explorer_scan_dir(&app->file_explorer, _rp);
         }
         file_explorer_apply_sort(&app->file_explorer);
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"name\":\"%s\"}}", JESC(name));
         goto done;
     }
@@ -11168,7 +11187,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
     /* --- file_explorer.rename --- */
     if (strcmp(cmd, "file_explorer.rename") == 0) {
         if (!app->file_explorer.active) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_state\",\"message\":\"file explorer not open\"}}");
             goto done;
         }
@@ -11176,14 +11195,14 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         json_extract_string(args_json, "old_name", old_name, sizeof old_name);
         json_extract_string(args_json, "new_name", new_name, sizeof new_name);
         if (!old_name[0] || !new_name[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing old_name or new_name\"}}");
             goto done;
         }
         /* Security: reject path traversal in file names */
         if (strchr(old_name, '/') || strstr(old_name, "..") ||
             strchr(new_name, '/') || strstr(new_name, "..")) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"file name contains path separators\"}}");
             goto done;
         }
@@ -11196,9 +11215,9 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             }
         }
         if (idx < 0) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"entry not found: %s\"}}",
-                old_name);
+                lmux_json_esc(old_name));
             goto done;
         }
         lmux_file_entry *e = &app->file_explorer.entries[idx];
@@ -11209,9 +11228,9 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         else
             snprintf(newpath, sizeof newpath, "%s/%s", app->file_explorer.current_path, new_name);
         if (rename(e->path, newpath) != 0) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"rename_failed\",\"message\":\"failed to rename: %s\"}}",
-                old_name);
+                lmux_json_esc(old_name));
             goto done;
         }
         /* Refresh directory listing — copy path first since scan_dir overwrites current_path */
@@ -11223,7 +11242,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         file_explorer_apply_sort(&app->file_explorer);
         {
             char _old[256], _new[256];
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":true,\"result\":{\"old_name\":\"%s\",\"new_name\":\"%s\"}}",
                 json_escape_str(_old, sizeof _old, old_name),
                 json_escape_str(_new, sizeof _new, new_name));
@@ -11234,19 +11253,19 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
     /* --- file_explorer.search --- */
     if (strcmp(cmd, "file_explorer.search") == 0) {
         if (!app->file_explorer.active) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_state\",\"message\":\"file explorer not open\"}}");
             goto done;
         }
         char query[256] = {0};
         json_extract_string(args_json, "query", query, sizeof query);
         if (!query[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing query\"}}");
             goto done;
         }
         /* Search entries matching query */
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"query\":\"%s\",\"matches\":[", JESC(query));
         int match_count = 0;
         for (int i = 0; i < app->file_explorer.entry_count; i++) {
@@ -11254,8 +11273,8 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             if (strcasestr(e->name, query)) {
                 RESULT_GROW;
                 char _ne[512], _pe[1024];
-                if (match_count > 0) written += snprintf(result + written, result_cap - written, ",");
-                written += snprintf(result + written, result_cap - written,
+                if (match_count > 0) RESULT_APPENDF( ",");
+                RESULT_APPENDF(
                     "{\"name\":\"%s\",\"path\":\"%s\",\"is_dir\":%s}",
                     json_escape_str(_ne, sizeof _ne, e->name),
                     json_escape_str(_pe, sizeof _pe, e->path),
@@ -11263,7 +11282,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                 match_count++;
             }
         }
-        written += snprintf(result + written, result_cap - written, "],\"count\":%d}}", match_count);
+        RESULT_APPENDF( "],\"count\":%d}}", match_count);
         goto done;
     }
 
@@ -11272,7 +11291,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         app->file_explorer.active = false;
         app->file_explorer.entry_count = 0;
         app->file_explorer.filter[0] = '\0';
-        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+        RESULT_SETF( "{\"ok\":true,\"result\":{}}");
         goto done;
     }
 
@@ -11311,7 +11330,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             }
         }
         if (!surf) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"surface not found\"}}");
             goto done;
         }
@@ -11331,7 +11350,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                 surf->canvas_pane_z[i] = i;
             }
         }
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"canvas_mode\":true}}");
         goto done;
     }
@@ -11368,12 +11387,12 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             }
         }
         if (!surf) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"surface not found\"}}");
             goto done;
         }
         surf->canvas_mode = false;
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"canvas_mode\":false}}");
         goto done;
     }
@@ -11419,23 +11438,23 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             }
         }
         if (!surf) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"surface not found\"}}");
             goto done;
         }
         if (!surf->canvas_mode) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_state\",\"message\":\"canvas mode not enabled\"}}");
             goto done;
         }
         if (pane_index < 0 || pane_index >= 64 || pane_index >= surf->canvas_pane_count) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"invalid pane_index\"}}");
             goto done;
         }
         surf->canvas_pane_x[pane_index] = x;
         surf->canvas_pane_y[pane_index] = y;
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"pane_index\":%d,\"x\":%d,\"y\":%d}}",
             pane_index, x, y);
         goto done;
@@ -11482,28 +11501,28 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             }
         }
         if (!surf) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"surface not found\"}}");
             goto done;
         }
         if (!surf->canvas_mode) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_state\",\"message\":\"canvas mode not enabled\"}}");
             goto done;
         }
         if (pane_index < 0 || pane_index >= 64 || pane_index >= surf->canvas_pane_count) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"invalid pane_index\"}}");
             goto done;
         }
         if (w < 1 || h < 1) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"w and h must be positive\"}}");
             goto done;
         }
         surf->canvas_pane_w[pane_index] = w;
         surf->canvas_pane_h[pane_index] = h;
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"pane_index\":%d,\"w\":%d,\"h\":%d}}",
             pane_index, w, h);
         goto done;
@@ -11547,22 +11566,22 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             }
         }
         if (!surf) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"surface not found\"}}");
             goto done;
         }
         if (!surf->canvas_mode) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_state\",\"message\":\"canvas mode not enabled\"}}");
             goto done;
         }
         if (pane_index < 0 || pane_index >= 64 || pane_index >= surf->canvas_pane_count) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"invalid pane_index\"}}");
             goto done;
         }
         surf->canvas_pane_z[pane_index] = z;
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"pane_index\":%d,\"z\":%d}}",
             pane_index, z);
         goto done;
@@ -11600,18 +11619,18 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             }
         }
         if (!surf) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"surface not found\"}}");
             goto done;
         }
         /* Build layout JSON */
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"canvas_mode\":%s,\"pane_count\":%d,\"panes\":[",
             surf->canvas_mode ? "true" : "false",
             surf->canvas_pane_count);
         for (int i = 0; i < surf->canvas_pane_count && i < 64; i++) {
-            if (i > 0) written += snprintf(result + written, result_cap - written, ",");
-            written += snprintf(result + written, result_cap - written,
+            if (i > 0) RESULT_APPENDF( ",");
+            RESULT_APPENDF(
                 "{\"index\":%d,\"x\":%d,\"y\":%d,\"w\":%d,\"h\":%d,\"z\":%d}",
                 i,
                 surf->canvas_pane_x[i],
@@ -11620,7 +11639,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                 surf->canvas_pane_h[i],
                 surf->canvas_pane_z[i]);
         }
-        written += snprintf(result + written, result_cap - written, "]}}");
+        RESULT_APPENDF( "]}}");
         goto done;
     }
 
@@ -11656,21 +11675,21 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             }
         }
         if (!surf) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"surface not found\"}}");
             goto done;
         }
         /* Parse panes array from args */
         const char *panes_arr = json_find_key(args_json, "panes");
         if (!panes_arr) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing panes array\"}}");
             goto done;
         }
         /* Find the opening bracket */
         const char *p = strchr(panes_arr, '[');
         if (!p) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"invalid panes array\"}}");
             goto done;
         }
@@ -11722,7 +11741,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         }
         surf->canvas_pane_count = count;
         surf->canvas_mode = true;
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"pane_count\":%d}}", count);
         goto done;
     }
@@ -11741,20 +11760,20 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         json_extract_string(args_json, "scope", scope, sizeof scope);
 
         if (!query[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"missing query\"}}");
             goto done;
         }
 
         lmux_workspace *ws = lmux_workspace_focused(app);
         if (!ws) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no workspaces\"}}");
             goto done;
         }
         lmux_pane *p = lmux_pane_focused(ws);
         if (!p) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no focused pane\"}}");
             goto done;
         }
@@ -11770,21 +11789,21 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         app->search_match_count = 0;  /* simplified: no actual content search */
         app->search_current_match = 0;
 
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"pane_id\":%u,\"query\":\"%s\",\"active\":true,"
             "\"case_sensitive\":%s,\"whole_words\":%s,\"regex\":%s,\"scope\":\"%s\"}}",
             p->id, JESC(query),
             case_sensitive ? "true" : "false",
             whole_words ? "true" : "false",
             regex ? "true" : "false",
-            scope);
+            lmux_json_esc(scope));
         goto done;
     }
 
     /* --- search.next --- */
     if (strcmp(cmd, "search.next") == 0) {
         if (!app->search_active) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_state\",\"message\":\"no active search\"}}");
             goto done;
         }
@@ -11792,7 +11811,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         if (app->search_match_count > 0) {
             app->search_current_match = (app->search_current_match + 1) % app->search_match_count;
         }
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"match_index\":%d,\"match_count\":%d}}",
             app->search_current_match, app->search_match_count);
         goto done;
@@ -11801,7 +11820,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
     /* --- search.prev --- */
     if (strcmp(cmd, "search.prev") == 0) {
         if (!app->search_active) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_state\",\"message\":\"no active search\"}}");
             goto done;
         }
@@ -11811,7 +11830,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             if (app->search_current_match < 0)
                 app->search_current_match = app->search_match_count - 1;
         }
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"match_index\":%d,\"match_count\":%d}}",
             app->search_current_match, app->search_match_count);
         goto done;
@@ -11825,7 +11844,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         app->search_match_count = 0;
         app->search_current_match = 0;
         app->search_pane = NULL;
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"active\":false,\"was_active\":%s}}",
             was_active ? "true" : "false");
         goto done;
@@ -11834,7 +11853,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
     /* --- search.status --- */
     if (strcmp(cmd, "search.status") == 0) {
         if (app->search_active) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":true,\"result\":{\"active\":true,\"query\":\"%s\","
                 "\"match_count\":%d,\"current_match\":%d,"
                 "\"case_sensitive\":%s,\"whole_words\":%s,\"regex\":%s,\"scope\":\"%s\"}}",
@@ -11843,9 +11862,9 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                 app->search_case_sensitive ? "true" : "false",
                 app->search_whole_words ? "true" : "false",
                 app->search_regex ? "true" : "false",
-                app->search_scope);
+                lmux_json_esc(app->search_scope));
         } else {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":true,\"result\":{\"active\":false}}");
         }
         goto done;
@@ -11858,17 +11877,15 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
 
     /* ssh.list — same payload as the already-working ssh.session.list */
     if (strcmp(cmd, "ssh.list") == 0 || strcmp(cmd, "ssh_list") == 0) {
-        char buf[8192];
-        int n = snprintf(buf, sizeof buf, "{\"ok\":true,\"result\":{\"sessions\":[");
+        RESULT_SETF( "{\"ok\":true,\"result\":{\"sessions\":[");
         for (size_t i = 0; i < app->ssh_sessions.len; i++) {
             lmux_ssh_session *s = app->ssh_sessions.items[i];
-            if (i > 0) n += snprintf(buf + n, sizeof buf - n, ",");
-            n += snprintf(buf + n, sizeof buf - n,
+            if (i > 0) RESULT_APPENDF( ",");
+            RESULT_APPENDF(
                 "{\"id\":%u,\"host\":\"%s\",\"user\":\"%s\",\"active\":%s}",
-                s->id, s->host, s->user, s->active ? "true" : "false");
+                s->id, lmux_json_esc(s->host), lmux_json_esc(s->user), s->active ? "true" : "false");
         }
-        n += snprintf(buf + n, sizeof buf - n, "]}}");
-        written = snprintf(result, result_cap, "%s", buf);
+        RESULT_APPENDF( "]}}");
         goto done;
     }
 
@@ -11880,7 +11897,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         json_extract_string(args_json, "key_path", key, sizeof key);
         json_extract_string(args_json, "pane_id", pane_id, sizeof pane_id);
         if (!host[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"host required\"}}");
             goto done;
         }
@@ -11888,12 +11905,12 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
                                                       user[0] ? user : NULL,
                                                       key[0] ? key : NULL);
         if (!s) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"internal\",\"message\":\"ssh session create failed\"}}");
             goto done;
         }
         if (pane_id[0]) lmux_ssh_session_attach(s, (lmux_id)atol(pane_id));
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"id\":%u,\"host\":\"%s\",\"user\":\"%s\"}}",
             s->id, lmux_json_esc(s->host), lmux_json_esc(s->user));
         goto done;
@@ -11904,16 +11921,16 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         char sid[64] = {0};
         json_extract_string(args_json, "session_id", sid, sizeof sid);
         if (!sid[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"session_id required\"}}");
             goto done;
         }
         if (!lmux_ssh_session_detach(app, (lmux_id)atol(sid))) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"ssh session not found\"}}");
             goto done;
         }
-        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+        RESULT_SETF( "{\"ok\":true,\"result\":{}}");
         goto done;
     }
 
@@ -11928,36 +11945,36 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
             json_extract_string(args_json, "command", command, sizeof command);
         int e = hook_event_from_name(ev);
         if (e < 0 || !command[0]) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"valid event and command required\"}}");
             goto done;
         }
         lmux_hook_script *h = hook_add(app, e, command);
         if (!h) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"internal\",\"message\":\"hooks registry full\"}}");
             goto done;
         }
-        written = snprintf(result, result_cap,
+        RESULT_SETF(
             "{\"ok\":true,\"result\":{\"id\":%u,\"event\":\"%s\"}}",
-            h->id, HOOK_EVENT_NAMES[h->event]);
+            h->id, lmux_json_esc(HOOK_EVENT_NAMES[h->event]));
         goto done;
     }
 
     /* hooks.list */
     if (strcmp(cmd, "hooks.list") == 0 || strcmp(cmd, "hooks_list") == 0) {
         RESULT_GROW;
-        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{\"hooks\":[");
+        RESULT_SETF( "{\"ok\":true,\"result\":{\"hooks\":[");
         if (written < 0) written = 0;
         for (size_t i = 0; i < app->hooks.len; i++) {
             lmux_hook_script *h = app->hooks.items[i];
             RESULT_GROW;
-            written += snprintf(result + written, result_cap - (size_t)written,
+            RESULT_APPENDF(
                 "%s{\"id\":%u,\"event\":\"%s\",\"command\":\"%s\"}",
-                i ? "," : "", h->id, HOOK_EVENT_NAMES[h->event], h->command);
+                i ? "," : "", h->id, lmux_json_esc(HOOK_EVENT_NAMES[h->event]), lmux_json_esc(h->command));
         }
         RESULT_GROW;
-        written += snprintf(result + written, result_cap - (size_t)written, "]}}");
+        RESULT_APPENDF( "]}}");
         result[written] = 0;
         goto done;
     }
@@ -11968,16 +11985,16 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         json_extract_string(args_json, "event", ev, sizeof ev);
         int e = hook_event_from_name(ev);
         if (e < 0) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"invalid_params\",\"message\":\"valid event required\"}}");
             goto done;
         }
         if (!hook_remove(app, e)) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no hook for that event\"}}");
             goto done;
         }
-        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+        RESULT_SETF( "{\"ok\":true,\"result\":{}}");
         goto done;
     }
 
@@ -11993,18 +12010,18 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         struct lmux_focus_entry entries[100];
         int got = lmux_focus_history_recent(&app->focus_history, want, entries);
         RESULT_GROW;
-        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{\"entries\":[");
+        RESULT_SETF( "{\"ok\":true,\"result\":{\"entries\":[");
         if (written < 0) written = 0;
         for (int i = 0; i < got; i++) {
             RESULT_GROW;
-            written += snprintf(result + written, result_cap - (size_t)written,
+            RESULT_APPENDF(
                 "%s{\"pane_id\":\"%s\",\"workspace_id\":\"%s\",\"timestamp\":%lld,"
                 "\"duration_ms\":%lld}",
-                i ? "," : "", entries[i].pane_id, entries[i].workspace_id,
+                i ? "," : "", lmux_json_esc(entries[i].pane_id), lmux_json_esc(entries[i].workspace_id),
                 (long long)entries[i].timestamp, (long long)entries[i].duration_ms);
         }
         RESULT_GROW;
-        written += snprintf(result + written, result_cap - (size_t)written, "]}}");
+        RESULT_APPENDF( "]}}");
         result[written] = 0;
         goto done;
     }
@@ -12022,7 +12039,7 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         const char *cached = naming_cache_get(app, cwd, &fp);
         if (cached) {
             RESULT_GROW;
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":true,\"result\":{\"suggestions\":[%s]}}", cached);
             result[written] = 0;
             goto done;
@@ -12070,24 +12087,27 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         }
 
         RESULT_GROW;
-        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{\"suggestions\":[");
+        RESULT_SETF( "{\"ok\":true,\"result\":{\"suggestions\":[");
         if (written < 0) written = 0;
         /* Build the comma-joined body once: it is both the response payload
          * and the value memoised for repeat calls. */
         char joined[1024] = {0};
         size_t jl = 0;
         for (size_t i = 0; i < n; i++) {
-            RESULT_GROW;
-            int k = snprintf(result + written, result_cap - (size_t)written,
-                "%s\"%s\"", i ? "," : "", names[i]);
-            if (k > 0) written += k;
-            jl += (size_t)snprintf(joined + jl, sizeof joined - jl, "%s\"%s\"",
-                                   i ? "," : "", names[i]);
-            if (jl >= sizeof joined - 1) break;
+            char item[600];
+            int k = snprintf(item, sizeof item, "%s\"%s\"",
+                             i ? "," : "", lmux_json_esc(names[i]));
+            if (k < 0 || (size_t)k >= sizeof item) continue;
+            /* Only whole elements go into the cached copy: a truncated one
+             * would be replayed later as invalid JSON. */
+            if (jl + (size_t)k >= sizeof joined) break;
+            memcpy(joined + jl, item, (size_t)k + 1);
+            jl += (size_t)k;
+            RESULT_APPENDF("%s", item);
         }
         naming_cache_store(app, cwd, joined, &fp);
         RESULT_GROW;
-        written += snprintf(result + written, result_cap - (size_t)written, "]}}");
+        RESULT_APPENDF( "]}}");
         result[written] = 0;
         goto done;
     }
@@ -12096,21 +12116,19 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
      * spellings advertised in --help; the plural forms dispatch above. */
     if (strcmp(cmd, "notification.hook.list") == 0 ||
         strcmp(cmd, "notification_hook_list") == 0) {
-        char buf[8192];
-        int n = snprintf(buf, sizeof buf, "{\"ok\":true,\"result\":{\"hooks\":[");
+        RESULT_SETF( "{\"ok\":true,\"result\":{\"hooks\":[");
         for (size_t i = 0; i < app->notification_hooks.len; i++) {
             lmux_notification_hook *h = app->notification_hooks.items[i];
-            if (i > 0) n += snprintf(buf + n, sizeof buf - n, ",");
+            if (i > 0) RESULT_APPENDF( ",");
             /* lmux_notification_hook_remove() disables rather than deletes, so
              * surface `enabled` rather than implying the entry vanished. */
-            n += snprintf(buf + n, sizeof buf - n,
+            RESULT_APPENDF(
                 "{\"event\":\"%s\",\"filter\":\"%s\",\"transform\":\"%s\","
                 "\"redirect\":\"%s\",\"enabled\":%s}",
-                h->event, h->filter, h->transform, h->redirect,
+                lmux_json_esc(h->event), lmux_json_esc(h->filter), lmux_json_esc(h->transform), lmux_json_esc(h->redirect),
                 h->enabled ? "true" : "false");
         }
-        n += snprintf(buf + n, sizeof buf - n, "]}}");
-        written = snprintf(result, result_cap, "%s", buf);
+        RESULT_APPENDF( "]}}");
         goto done;
     }
 
@@ -12119,18 +12137,18 @@ static char *dispatch_command(lmux_app *app, const char *cmd, const char *args_j
         char ev[128] = {0};
         json_extract_string(args_json, "event", ev, sizeof ev);
         if (!ev[0] || !lmux_notification_hook_remove(app, ev)) {
-            written = snprintf(result, result_cap,
+            RESULT_SETF(
                 "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no notification hook for that event\"}}");
             goto done;
         }
-        written = snprintf(result, result_cap, "{\"ok\":true,\"result\":{}}");
+        RESULT_SETF( "{\"ok\":true,\"result\":{}}");
         goto done;
     }
 
     /* --- unknown command --- */
-    written = snprintf(result, result_cap,
+    RESULT_SETF(
         "{\"ok\":false,\"error\":{\"code\":\"unknown_command\",\"message\":\"unknown command: %s\"}}",
-        cmd);
+        lmux_json_esc(cmd));
 
 done:
     /* Fire command-error hook on error responses */
@@ -12317,15 +12335,19 @@ bool canvas_layout_load(lmux_surface *surf, const char *path) {
 static char *make_error_response(const char *type, const char *title,
                                   const char *code, const char *detail,
                                   const char *trace_id) {
-    char *resp = malloc(1024);
+    static const char fmt[] =
+        "{\"ok\":false,\"error\":{\"type\":\"%s\",\"title\":\"%s\",\"code\":\"%s\",\"detail\":\"%s\",\"trace_id\":\"%s\"}}";
+    const char *e_type  = lmux_json_esc(type ? type : "about:blank");
+    const char *e_title = lmux_json_esc(title ? title : "Error");
+    const char *e_code  = lmux_json_esc(code ? code : "unknown");
+    const char *e_det   = lmux_json_esc(detail ? detail : "");
+    const char *e_trace = lmux_json_esc(trace_id ? trace_id : "null");
+    /* Size the buffer to the escaped text, so a long detail cannot be cut
+     * off mid-JSON the way a fixed 1 KiB buffer could. */
+    int need = snprintf(NULL, 0, fmt, e_type, e_title, e_code, e_det, e_trace);
+    char *resp = need > 0 ? malloc((size_t)need + 1) : NULL;
     if (!resp) return strdup("{\"ok\":false,\"error\":{\"code\":\"oom\",\"title\":\"Out of Memory\"}}");
-    snprintf(resp, 1024,
-        "{\"ok\":false,\"error\":{\"type\":\"%s\",\"title\":\"%s\",\"code\":\"%s\",\"detail\":\"%s\",\"trace_id\":\"%s\"}}",
-        type ? type : "about:blank",
-        title ? title : "Error",
-        code ? code : "unknown",
-        detail ? detail : "",
-        trace_id ? trace_id : "null");
+    snprintf(resp, (size_t)need + 1, fmt, e_type, e_title, e_code, e_det, e_trace);
     return resp;
 }
 

@@ -313,6 +313,107 @@ static void test_dispatch_outputs_valid_json(lmux_app *app) {
     PASS();
 }
 
+/* Every command name the dispatcher matches, read from the source so a new
+ * handler is covered automatically. The unit runner executes from the repo
+ * root. Returns the count (0 if the source is not reachable). */
+#define MAX_CMDS 512
+static int load_dispatch_commands(char names[][64]) {
+    FILE *f = fopen("src/core/model.c", "r");
+    if (!f) return 0;
+    static char line[4096];
+    int n = 0;
+    while (fgets(line, sizeof line, f) && n < MAX_CMDS) {
+        for (char *p = line; (p = strstr(p, "strcmp(cmd, \"")) != NULL; ) {
+            p += 13;
+            char *q = strchr(p, '"');
+            if (!q || q - p >= 63) break;
+            char name[64];
+            memcpy(name, p, (size_t)(q - p));
+            name[q - p] = 0;
+            int dup = 0;
+            for (int i = 0; i < n; i++) if (!strcmp(names[i], name)) { dup = 1; break; }
+            if (!dup && n < MAX_CMDS) strcpy(names[n++], name);
+            p = q;
+        }
+    }
+    fclose(f);
+    return n;
+}
+
+/* Commands with effects outside this process: running hook or agent
+ * commands, ssh/browser/cloud/companion calls, writing files, sending keys
+ * into shells, quitting. Everything else is fair game. */
+static int has_outside_effects(const char *c) {
+    static const char *deny[] = {
+        "hook", "agent", "spawn", "ssh", "browser", "cloud", "companion",
+        "quit", "kill", "shutdown", "exit", "snapshot", "session.save",
+        "session.restore", "save", "load", "import", "export", "file_explorer",
+        "pipe", "respawn", "attach", "send", "config.set", "reload", "auth",
+        "email", "calendar", "weather.refresh", "team.dispatch", "open",
+        "vpn", "update", "install", "notify", "run", "exec", NULL };
+    for (int i = 0; deny[i]; i++) if (strstr(c, deny[i])) return 1;
+    return 0;
+}
+
+static void test_every_command_replies_valid_json(lmux_app *app) {
+    TEST("every command replies valid JSON for hostile string arguments");
+    static char names[MAX_CMDS][64];
+    int n = load_dispatch_commands(names);
+    CHECK(n > 150, "found only %d command names in src/core/model.c", n);
+    /* Values that break naive JSON building or format strings. */
+    static char longv[3200];
+    memset(longv, '"', 1500);
+    memset(longv + 1500, '\\', 1500);
+    memcpy(longv + 3000, "\xE2\x82\xAC\n\t\x01", 6);
+    longv[3006] = 0;
+    const char *vals[] = {
+        "q\"uote", "back\\slash\\", "ctl\x01\x1f\n\r\t", "%s%n%x%p",
+        "\",\"ok\":true,\"x\":\"", "</script>\xE2\x82\xAC\xF0\x9F\x98\x80", longv };
+    static const char *keys[] = {
+        "title", "name", "text", "path", "cwd", "key", "value", "url",
+        "command", "event", "format", "template", "query", "filter",
+        "location", "scope", "data", "label", "provider", "size", "role",
+        "platform", "device_id", "team_id", "vm_id", "group", "old_name",
+        "new_name", "dir", "mode", "selector", "content", "message", "host",
+        "user", "category", "id", "workspace_id", "surface_id", "pane_id" };
+    uint64_t cursor = lmux_app_event_seq(app);
+    static char esc[24000], req[64000];
+    int tested = 0;
+    for (int c = 0; c < n; c++) {
+        if (has_outside_effects(names[c])) continue;
+        for (size_t v = 0; v < sizeof vals / sizeof *vals; v++) {
+            lmux_json_escape(esc, sizeof esc, vals[v]);
+            int len = snprintf(req, sizeof req, "{\"cmd\":\"%s\",\"args\":{", names[c]);
+            /* Stay under the dispatcher's 64 KiB request cap: add keys only
+             * while the next one (plus the closing braces) still fits. */
+            for (size_t k = 0; k < sizeof keys / sizeof *keys; k++) {
+                int need = snprintf(NULL, 0, "%s\"%s\":\"%s\"", k ? "," : "", keys[k], esc);
+                if ((size_t)len + (size_t)need + 3 >= 60000) break;
+                len += snprintf(req + len, sizeof req - (size_t)len, "%s\"%s\":\"%s\"",
+                                k ? "," : "", keys[k], esc);
+            }
+            snprintf(req + len, sizeof req - (size_t)len, "}}");
+            char *resp = lmux_dispatch_json(app, req);
+            if (!json_valid(resp)) {
+                FAIL("%s: invalid JSON reply for value #%zu\n  -> %.300s",
+                     names[c], v, resp ? resp : "(null)");
+                free(resp);
+                return;
+            }
+            free(resp);
+            char *ev;
+            while ((ev = lmux_event_next(app, &cursor)) != NULL) {
+                int ok = json_valid(ev);
+                if (!ok) { FAIL("%s: invalid event\n  -> %.300s", names[c], ev); free(ev); return; }
+                free(ev);
+            }
+        }
+        tested++;
+    }
+    printf("(%d commands) ", tested);
+    PASS();
+}
+
 static void test_dispatch_random_garbage(lmux_app *app) {
     TEST("random request bodies never crash the dispatcher (3000 iterations)");
     static const char *cmds[] = { "workspace.create", "workspace.list", "surface.rename",
@@ -350,6 +451,7 @@ int main(void) {
     if (!app) { printf("FAIL: lmux_app_new\n"); return 1; }
     test_dispatch_outputs_valid_json(app);
     test_dispatch_random_garbage(app);
+    test_every_command_replies_valid_json(app);
     lmux_app_free(app);
     char cmd[256];
     snprintf(cmd, sizeof cmd, "rm -rf '%s'", home);

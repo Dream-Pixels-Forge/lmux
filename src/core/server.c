@@ -493,29 +493,21 @@ static void serve_client(lmux_app *app, int client_fd) {
     lmux_metrics_inc_requests(app);
 
     /* Check for event streaming response. */
-    int is_events = response && strstr(response, "\"stream\":\"events\"") != NULL;
+    /* Parse the reply's own fields rather than pattern-matching its text:
+     * a token-aware lookup cannot be fooled by user text inside a value. */
+    char stream_kind[16] = {0};
+    int is_events = response &&
+        lmux_json_extract_string(response, "stream", stream_kind, sizeof stream_kind) &&
+        strcmp(stream_kind, "events") == 0;
     char name_filter[128] = {0}, cat_filter[128] = {0};
     /* Each subscriber reads the replay ring through its own cursor: start
      * after everything already published, or after an explicit after_seq. */
     uint64_t ev_cursor = lmux_app_event_seq(app);
-    if (is_events && response) {
-        const char *as = strstr(response, "\"after_seq\":");
-        if (as) ev_cursor = strtoull(as + 12, NULL, 10);
-        /* Extract filter values from the response JSON */
-        const char *nf = strstr(response, "\"name_filter\":\"");
-        if (nf) {
-            nf += 15;
-            size_t k = 0;
-            while (*nf && *nf != '"' && k < sizeof name_filter - 1)
-                name_filter[k++] = *nf++;
-        }
-        const char *cf = strstr(response, "\"category_filter\":\"");
-        if (cf) {
-            cf += 19;
-            size_t k = 0;
-            while (*cf && *cf != '"' && k < sizeof cat_filter - 1)
-                cat_filter[k++] = *cf++;
-        }
+    if (is_events) {
+        const char *as = lmux_json_find_key(response, "after_seq");
+        if (as && *as >= '0' && *as <= '9') ev_cursor = strtoull(as, NULL, 10);
+        lmux_json_extract_string(response, "name_filter", name_filter, sizeof name_filter);
+        lmux_json_extract_string(response, "category_filter", cat_filter, sizeof cat_filter);
     }
 
     /* Write response + newline. */
