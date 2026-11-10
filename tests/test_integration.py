@@ -7599,6 +7599,56 @@ class TestCliListOutput(unittest.TestCase):
             daemon.stop()
             shutil.rmtree(home, ignore_errors=True)
 
+
+# ====================================================================
+# Snapshot string decoding: \u escapes and over-long values
+# ====================================================================
+
+class TestSnapshotStringDecoding(unittest.TestCase):
+    r"""snap_read_string kept only the letter after a backslash, so the
+    writer's \u00XX escapes for control characters loaded back as the text
+    "u00XX", and an over-long value was cut silently, possibly in the middle
+    of a multi-byte character."""
+
+    def _restart(self, home, daemon):
+        daemon.stop()
+        return _isolated_client(home=home)
+
+    def _titles(self, client):
+        return [w["title"] for w in client.assert_ok("workspace.list", {})["workspaces"]]
+
+    def test_control_characters_and_emoji_survive_save_and_restore(self):
+        client, daemon, home = _isolated_client()
+        title = "bell\x07tab\tend \U0001F600"
+        try:
+            client.assert_ok("workspace.create", {"title": title})
+            client, daemon, _ = self._restart(home, daemon)
+            self.assertIn(title, self._titles(client))
+        finally:
+            daemon.stop()
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_overlong_value_is_cut_at_a_character_boundary(self):
+        home = Path(tempfile.mkdtemp(prefix="lmux-iso-home-"))
+        snap_dir = home / ".local" / "share" / "lmux"
+        snap_dir.mkdir(parents=True)
+        long_title = "\u00e9" * 200          # 400 bytes of UTF-8, raw (unescaped)
+        snapshot = {"version": 1, "workspaces": [{
+            "id": 1, "title": long_title, "cwd": "/tmp", "git_branch": "",
+            "surfaces": [{"id": 1, "title": "s", "panes": [
+                {"id": 1, "kind": "terminal", "command": "/bin/sh"}]}]}]}
+        (snap_dir / "snapshot.json").write_text(json.dumps(snapshot, ensure_ascii=False))
+        client, daemon, _ = _isolated_client(home=home)
+        try:
+            titles = self._titles(client)
+            t = next((x for x in titles if x.startswith("\u00e9")), None)
+            self.assertIsNotNone(t, titles)
+            self.assertLess(len(t.encode()), 400)                 # was truncated
+            self.assertEqual(set(t), {"\u00e9"})                    # whole characters only
+        finally:
+            daemon.stop()
+            shutil.rmtree(home, ignore_errors=True)
+
 if __name__ == "__main__":
     # Clean up leftover test sockets — only the dead ones (#38): never
     # unlink a socket that still answers, it may belong to a live runner.

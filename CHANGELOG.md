@@ -35,6 +35,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `stat()`ing the socket path; concurrent connections are capped (256).
 
 ### Fixed
+- In the daemon, `pane-died` / `pane-exited` hooks now fire and pane exit
+  codes are kept. The daemon's SIGCHLD handler reaped every child with
+  `waitpid(-1)`, so the per-pane check found nothing to read. The handler now
+  only wakes the main loop. Each tick checks panes first and then reaps only
+  children no pane owns (pipe-pane, notifications, resumed agents), so nothing
+  is left as a zombie.
+- Snapshot loading decodes `\uXXXX` escapes. Titles with control characters
+  used to come back as the literal text `u0007`. An over-long value is
+  truncated at a whole UTF-8 character and logged, instead of being cut
+  silently.
 - Turning **Auto-save session** off now works. The daemon always restored
   the last snapshot at startup (the setting's `restore_on_start` was set but
   never read) and always saved one on quit, so an old session kept coming
