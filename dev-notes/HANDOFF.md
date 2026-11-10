@@ -1,119 +1,83 @@
-# Handoff — lmux @ master
+# Handoff — lmux @ main
 
-**Date:** 2026-10-05 (evening update — memorius session)
-**Branch state:** `master` @ `db369af` (PR #41), clean, in sync with origin
-**Version:** 1.2.0
-**Tests:** 314 integration (311 + 3 new) + 23 model + 8 osc + 12 config unit,
-fuzz 0 errors — all re-run fresh for the goal-met audits (gate PASS, 10/10).
-Sanitizer jobs run in CI only; not re-run locally this session.
+**Date:** 2026-11-10
+**Branch state:** `main` @ `0a3fd37` (PR #65), CI green (CI, Nightly Build,
+Dependency Scanning)
+**Version:** 1.2.0 (an Unreleased section in CHANGELOG.md collects everything below)
+**Tests:** 428 integration (5 skipped), C unit suites incl. `test_json_fuzz`
+(149 commands fuzzed for valid-JSON replies/events), sanitizer run clean (no
+ASan/UBSan errors, no leaks), GUI tests run under Xvfb.
 
 ---
 
 ## Where things stand
 
-Merged since the previous handoff:
+Merged since the previous handoff (oldest first):
 
-| PR | Commit | What |
-|----|--------|------|
-| #32 | `3b2f156` | flatpak runtime 46 → 50 (GNOME 46 EOL was 2025-04-17); cp313 wheel pins + loud Python preflight assertion |
-| #33 | `a87ee34` | the previous handoff document |
-| #34 | `2717706` | rate limiter guarded with a mutex |
-| #35 | `22cf3ce` | updater rejects tar members escaping the extraction directory |
-| #36 | `f28331a` | **the flatpak-CI goal** — CI builds the manifest; `make flatpak` manifest path fixed; wrapper runtime derived from manifest; 3 new tests (goal-loop MET, 10/10) |
-| #39 | `4a50768` | handoff correction (orphan-daemon claim) + issues #37/#38 filed |
-| #40 | `44ef100` | **harness fixes #37/#38** — `test_restore_forks_no_pty` finally reaps the traced daemon; `__main__` cleanup probes sockets before unlinking (only dead ones) |
-| #41 | `db369af` | **integration suite in CI** — new `integration` job builds core+CLI and runs the 314-test suite serially (strace+zsh deps, 20-min timeout). CI's first run caught a real portability bug: R1 hardcoded 'zsh' but runners spawn bash; test fixed to assert repeatability shell-agnostically. |
+| PR | What |
+|----|------|
+| #62 | Shortcuts no longer eat capital letters (GDK `0x2` is Caps Lock, not Ctrl); agent notifications reach the sidebar (`pane_id` attribution, per-workspace unread/waiting) |
+| #63 | **Daemon crash**: one request with a `\uXXXX` escape at the end of a field overflowed a stack buffer and killed `lmuxd` and every pane. JSON helpers moved to `src/core/json.c` (bounds-safe, surrogate pairs, keys never matched inside values); event-stream payloads escaped; socket auth vs `geteuid()`; 256-client cap; HTTP log-server fixes. **GUI**: the window can be resized (min 1121×698 → 447×148); browser panel actually hides; canvas toggle works |
+| #54 | Copy mode (vi/emacs key tables, `send-keys -X`) — merged with current main |
+| #57 | Session groups + linked windows — sanitizer leaks fixed (`lmux_app_free` never freed session groups) |
+| #58 | `wait-for` barriers + `command-error` hook |
+| #59 | **Closed, superseded** — everything it adds was already on main |
+| #64 | Every command reply JSON-escapes user strings (112 were raw); replies grow to fit via `RESULT_SETF`/`RESULT_APPENDF` (the old `written += snprintf` could overflow the heap); `JESC` no longer prints one value twice; `events` `after_seq` injection closed |
+| #65 | "Auto-save session" actually controls restore and save-on-quit; `lmux workspace.list` lists every workspace; the duplicate "Files" sidebar tab removed |
 
-Previous session executed the flatpak-CI open item (spec:
-`dev-notes/GOAL_FLATPAK_CI.md`, verdict MET via goal-loop):
+This branch (next PR) — "remaining items" pass:
 
-- **CI now builds the flatpak manifest.** New `flatpak` job in
-  `.github/workflows/ci.yml`: installs the toolchain, adds Flathub (user),
-  caches `~/.local/share/flatpak` keyed on the manifest with a fallback
-  restore key, runs `flatpak-builder --user … packaging/io.github.lmux.lmux.yml`,
-  then installs the result and smoke-tests `flatpak run … --version`. The
-  root-cause fix for all three #31 defects. The new job caught a real bug on
-  its first live run (broken relative-path `flatpak install` usage) — fixed
-  and re-verified in CI.
-- **`make flatpak` pointed at a manifest that does not exist**
-  (`packaging/io.lmux.lmux.yml`) — it never could have worked. Now points at
-  the real file.
-- **`packaging/flatpak-wrapper.sh` still installed runtime 46** after PR #32
-  moved to 50. It now derives `RUNTIME_VERSION` from the manifest's
-  `runtime-version` key and fails loudly if it cannot read it.
-- Three new tests in `TestPackagingEntryPoints` pin all three (TDD: RED
-  reproduced independently against pristine `HEAD` in a throwaway worktree).
+- **Pane exit under the daemon's SIGCHLD handler.** The handler reaped every
+  child with `waitpid(-1)`, so `check_pane_child_exit()` got `ECHILD`: in the
+  real daemon `pane-died`/`pane-exited` hooks never fired and exit codes were
+  lost (unit tests don't install the handler, which is why nothing caught it).
+  The handler now only wakes the loop; `lmux_app_tick()` checks each pane's
+  own child first, then `reap_stray_children()` peeks with `WNOWAIT` and reaps
+  only children no pane owns (pipe-pane, notify-send, resumed agents).
+- **Snapshot strings.** `snap_read_string` now decodes `\uXXXX` (control
+  characters in titles used to come back as the text `u0007`), truncates an
+  over-long value at a whole UTF-8 character, and logs a warning instead of
+  cutting silently.
 
-## master was red at session start — fixed
+## How to work on it
 
-`test_no_stale_github_repo_url` failed on `master` because the PR #33 handoff
-**itself** contained the literal old-org URL twice, in prose about the bug —
-the exact anti-pattern the previous handoff warned about (a test grepping its
-own documentation). Fixed by rewording the two lines; the test is untouched at
-full strength.
+- `node scripts/build-core.mjs && node scripts/build-cli.mjs` (or `make build`).
+  Rebuild the CLI whenever you rebuild the core (static-library trap).
+- Fast checks: `node scripts/test.mjs --unit`, then `--sanitize --unit`.
+  Full gate: `python3 tests/test_integration.py` (~65 s).
+- GUI tests need a display: `xvfb-run -a python3 tests/test_gui_startup.py`.
+  On a box without GTK bindings they skip, which looks like a pass.
+- **Command replies**: build them with `RESULT_SETF(...)` / `RESULT_APPENDF(...)`
+  and wrap every user string in `lmux_json_esc()` (`JESC()` is the same thing).
+  `test_json_fuzz` will fail a new handler that forgets either.
+- **Children**: don't install a SIGCHLD reaper and don't `waitpid(-1)`; the tick
+  owns reaping (see `reap_stray_children`). Code that forks and waits for its
+  own child must do so under the model lock, like the tick.
+- Local cppcheck over `model.c` takes many minutes; CI's `lint` job runs it.
 
-**CI never caught it: `ci.yml` runs `node scripts/test.mjs --unit` only — the
-309-test Python suite runs solely via `make test`, locally.** (Now fixed by #41.)
+## Open items
 
-## Proven this session (evidence, not theory)
-
-1. **Two concurrent integration runners destroy each other.** The runner's
-   `__main__` block unlinks *all* `/tmp/lmux-integration-*.sock` on startup —
-   so a second runner deletes a live runner's active socket. A/B experiment:
-   runner A started, runner B at t+45 s → **A: FAILED (errors=60, all
-   `FileNotFoundError` from that instant on), B: OK (309)**. An audit run
-   failed this way while the RED-reproduction runner ran concurrently — the
-   red was an artifact of the audit procedure, not the deliverable.
-   **Never run two suites at once** (the python-side twin of the ETXTBSY
-   rule). Fix candidate: only unlink sockets that refuse a connection.
-2. **Every integration run leaks one `lmux-ptyd-*` daemon** — green exit or
-   SIGKILL alike (filed as issue #37; 14 orphans from Oct 4–5 were found and
-   killed, all with dead owner PIDs). Normal exit does clean up the
-   `lmux-integration-*` and `lmux-iso-*` daemons; `kill -9` strands those too.
-   The concurrent-runner socket unlink (Proven #1) is issue #38.
-
-## Both harness defects now FIXED and merged (PR #40)
-
-- **#37:** `test_restore_forks_no_pty` finally now calls `_reap_strace_daemon(proc, sock)` — kills the strace wrapper, then TERM→KILL any pid still serving the exact socket path, then unlinks. Root cause: killing strace alone orphans the traced daemon (pid survived, socket file gone — so T2 asserts on pid via pgrep, not on the socket).
-- **#38:** `__main__` cleanup now probes each `/tmp/lmux-integration-*.sock` with an AF_UNIX connect (`_socket_is_live`) and unlinks only dead ones. Helpers: `_socket_is_live()`, `_cleanup_stale_integration_sockets()`.
-
-Evidence: mutation-checked in a pristine worktree — MUT-T1 and MUT-T2 both reproduced on master, both pass on branch. Full suite serially: **313 tests OK (309 + 4)**, unit+fuzz pass, zero `lmux-ptyd` strays. Issues #37, #38 auto-closed.
-
-## Integration suite now runs in CI (PR #41)
-
-- New `integration` job in `.github/workflows/ci.yml`: builds core+CLI, installs `strace` + `zsh`, runs `python3 tests/test_integration.py` serially (20-min timeout). No matrix — shared-socket assumptions + Proven #1 require serial runs.
-- T1 `test_ci_runs_the_integration_suite` pins the job the same way `test_ci_builds_the_flatpak_manifest` pins the flatpak job.
-- CI first run caught a **real portability defect**: R1 `test_repeated_read_screen_keeps_returning_content` asserted `'zsh'` in capture text, but GitHub runners spawn `$SHELL` (bash). Fixed test-only to assert repeatability shell-agnostically (`second` retains `first`'s content). Verified locally under zsh (3 OK) and `SHELL=/bin/bash` (1 OK).
-- Re-run: **`integration` PASS** — 314 tests OK in ~31s on the runner.
-
-**All 8 CI checks green at merge.** The only full gate (314-test suite) now runs on every PR and push to master.
-
-## Behaviour changes users may notice
-
-- `make flatpak` now actually builds (it referenced a nonexistent manifest
-  before); output dir unchanged: `dist/flatpak/build`.
-- `packaging/flatpak-wrapper.sh` installs whatever runtime the manifest
-  declares instead of a hardcoded one.
-- CI has a new `flatpak` job; PRs now build and smoke-test the flatpak.
-- **CI now runs the full Python integration suite (314 tests) on every PR and push** — the only full gate is no longer local-only.
+None blocking. Optional polish, not done:
+- The sidebar's minimum width (~316 px) is set by the extension tab switcher.
+- `lmux_json_esc()` slots are 4 KiB, so a single escaped value over ~4 KiB is
+  truncated (cleanly, never mid-escape) in a reply.
+- The JSON fuzz test skips ~100 commands with outside effects (hooks, agents,
+  ssh, browser, file writes, send-keys); their reply code was fixed by the
+  static scan but is not exercised end to end.
+- tmux-style hooks (`pane-died`, `pane-exited`, `monitor-*`) can only be
+  registered through the C API (`lmux_hook_add`); there is no socket command.
 
 ## Practices now enforced
 
 - Run `make test`, `make test-fuzz`, `make test-unit` **serially** — and never
-  start a second Python integration runner while one is live (Proven #1).
-- `git fetch` before any `merge --ff-only origin/master`; verify the sha.
+  start a second Python integration runner while one is live (they share
+  socket paths).
+- `git fetch` before any `merge --ff-only origin/main`; verify the sha.
 - If you rebuild the core you **must** rebuild the CLI (stale-static-library
   trap).
 - `goal-loop` after every goal: `goal-writer` → execute (TDD) → `goal-met`.
 
-## Open items — NONE
-
-All handoff backlog items are resolved. The only remaining work is routine:
-- Periodic GNOME runtime attention (wheel tags pinned to SDK Python).
-- `snap_read_string` silent clamp (cosmetic).
-- Restored-pane PTY contract (uninvestigated; see Known gaps below).
-
-## Environment notes
+## Environment notes (developer machine, from the 2026-10-05 session)
 
 - Flatpak toolchain is installed **user-level** (`org.flatpak.Builder` +
   GNOME 46 and 50 SDKs, ~9 GB in `~/.local/share/flatpak`); `appimagetool` is
@@ -153,14 +117,14 @@ published package (unlike the dev repo's `local-embeddings` extra).
 pick up the new MCP entry.** If `memorius_*` tools are still absent, restart
 the extension host. Verify with `memorius_status` as the first call.
 
-## Known gaps, deliberately left open
+## Known gaps
 
-1. **Restored panes get no pty at all.** `lmux_pane_split()` is called during
-   restore with `spawn_pty = false`. Predates the placeholder-fork fix and is
-   not covered by it. May be intentional (the host attaches panes later) or may
-   mean a restored terminal is dead. **Uninvestigated.**
-2. **`snap_read_string` clamps at `cap` silently.** No worse than before, but an
-   over-long value is dropped without warning.
+1. ~~Restored panes get no pty at all.~~ **Resolved** (verified 2026-11-10): a
+   restored pane's shell is spawned on first use (#61's lazy spawn in
+   `pane_view_attach` / send-keys); `send-keys` + `read-screen` on a restored
+   pane returns the command's output.
+2. ~~`snap_read_string` clamps at `cap` silently.~~ **Fixed**: truncation is
+   logged and never splits a UTF-8 character; `\uXXXX` is decoded.
 3. **The GNOME runtime needs periodic attention.** Wheel tags are pinned to the
    SDK's Python and cannot be derived automatically — hence the preflight
    assertion in the manifest, which fails loudly and tells the next person to

@@ -2751,6 +2751,39 @@ static void check_pane_child_exit(lmux_app *a, lmux_pane *p) {
     }
 }
 
+/* Reap children no pane owns (pipe-pane commands, desktop notifications,
+ * resumed agents, ...) so they do not linger as zombies.
+ *
+ * The daemon's SIGCHLD handler used to do this with waitpid(-1), which also
+ * reaped pane children before check_pane_child_exit() saw them. Its
+ * waitpid(child_pid) then failed with ECHILD, so the pane-died/pane-exited
+ * hooks never fired and the exit code was lost. Now panes are checked first,
+ * and this peeks with WNOWAIT so it never takes a pane's child: an exited
+ * pane child goes to check_pane_child_exit(), anything else is reaped here.
+ * Runs under the model write lock, like the rest of the tick. */
+static void reap_stray_children(lmux_app *a) {
+    for (int guard = 0; guard < 256; guard++) {
+        siginfo_t si;
+        memset(&si, 0, sizeof si);
+        if (waitid(P_ALL, 0, &si, WEXITED | WNOHANG | WNOWAIT) != 0 || si.si_pid == 0)
+            return;
+        pid_t pid = si.si_pid;
+        lmux_pane *owner = NULL;
+        for (size_t w = 0; w < a->workspaces.len && !owner; w++) {
+            lmux_workspace *ws = a->workspaces.items[w];
+            for (size_t s = 0; s < ws->surfaces.len && !owner; s++) {
+                lmux_surface *surf = ws->surfaces.items[s];
+                for (size_t k = 0; k < surf->panes.len; k++) {
+                    lmux_pane *p = surf->panes.items[k];
+                    if (p->child_pid == pid) { owner = p; break; }
+                }
+            }
+        }
+        if (owner) check_pane_child_exit(a, owner);   /* reaps it */
+        else       waitpid(pid, NULL, WNOHANG);
+    }
+}
+
 /* Check activity/bell/silence monitoring for a pane */
 static void check_pane_monitoring(lmux_app *a, lmux_pane *p) {
     if (!p) return;
@@ -2795,6 +2828,7 @@ void lmux_app_tick(lmux_app *a) {
             }
         }
     }
+    reap_stray_children(a);
     pthread_rwlock_unlock(&a->rw_lock);
     
     /* Auto-save if enabled */
@@ -12725,29 +12759,95 @@ static bool snap_eat(snap_rd *r, char c) {
 
 /* Read a JSON string, resolving escapes. Fails on an unterminated value so a
  * truncated document is rejected rather than half-applied. */
+/* Four hex digits at r->p (bounds-checked), or -1. */
+static long snap_hex4(const snap_rd *r, const char *at) {
+    if (r->end - at < 4) return -1;
+    long v = 0;
+    for (int k = 0; k < 4; k++) {
+        char h = at[k];
+        int d = (h >= '0' && h <= '9') ? h - '0' :
+                (h >= 'a' && h <= 'f') ? h - 'a' + 10 :
+                (h >= 'A' && h <= 'F') ? h - 'A' + 10 : -1;
+        if (d < 0) return -1;
+        v = (v << 4) | d;
+    }
+    return v;
+}
+
+/* Read a JSON string. Decodes every JSON escape, including \uXXXX and
+ * surrogate pairs: the writer escapes control characters as \u00XX, and these
+ * used to load as the literal text "u00XX". A value longer than `cap` is
+ * truncated at a whole UTF-8 character (never mid-sequence) and logged,
+ * instead of being cut silently. */
 static bool snap_read_string(snap_rd *r, char *out, size_t cap) {
     snap_ws(r);
     if (r->p >= r->end || *r->p != '"') return false;
     r->p++;
     size_t i = 0;
+    bool truncated = false;
     while (r->p < r->end && *r->p != '"') {
+        char buf[4];
+        size_t len = 1;
         char c = *r->p++;
+        buf[0] = c;
         if (c == '\\' && r->p < r->end) {
             char e = *r->p++;
             switch (e) {
-            case 'n': c = '\n'; break;
-            case 't': c = '\t'; break;
-            case 'r': c = '\r'; break;
-            case 'b': c = '\b'; break;
-            case 'f': c = '\f'; break;
-            case '"': case '\\': case '/': c = e; break;
-            default: c = e; break;
+            case 'n': buf[0] = '\n'; break;
+            case 't': buf[0] = '\t'; break;
+            case 'r': buf[0] = '\r'; break;
+            case 'b': buf[0] = '\b'; break;
+            case 'f': buf[0] = '\f'; break;
+            case 'u': {
+                long cp = snap_hex4(r, r->p);
+                if (cp < 0) { cp = 0xFFFD; }
+                else {
+                    r->p += 4;
+                    if (cp >= 0xD800 && cp <= 0xDBFF) {
+                        long lo = (r->end - r->p >= 6 && r->p[0] == '\\' && r->p[1] == 'u')
+                                  ? snap_hex4(r, r->p + 2) : -1;
+                        if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                            cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                            r->p += 6;
+                        } else cp = 0xFFFD;
+                    } else if (cp >= 0xDC00 && cp <= 0xDFFF) cp = 0xFFFD;
+                }
+                if (cp == 0) continue;               /* keep a C string */
+                if (cp <= 0x7F)       { buf[0] = (char)cp; len = 1; }
+                else if (cp <= 0x7FF) { buf[0] = (char)(0xC0 | (cp >> 6));
+                                        buf[1] = (char)(0x80 | (cp & 0x3F)); len = 2; }
+                else if (cp <= 0xFFFF){ buf[0] = (char)(0xE0 | (cp >> 12));
+                                        buf[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                                        buf[2] = (char)(0x80 | (cp & 0x3F)); len = 3; }
+                else                  { buf[0] = (char)(0xF0 | (cp >> 18));
+                                        buf[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+                                        buf[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                                        buf[3] = (char)(0x80 | (cp & 0x3F)); len = 4; }
+                break;
+            }
+            default: buf[0] = e; break;              /* \" \\ \/ and unknowns */
             }
         }
-        if (i + 1 < cap) out[i++] = c;
+        if (truncated) continue;                     /* keep consuming input */
+        if (i + len < cap) { memcpy(out + i, buf, len); i += len; }
+        else truncated = true;
     }
     if (r->p >= r->end) return false;   /* unterminated string */
     r->p++;                              /* closing quote */
+    if (truncated) {
+        /* Raw (unescaped) multi-byte characters arrive one byte at a time;
+         * drop a trailing partial sequence so the value stays valid UTF-8. */
+        size_t k = i, cont = 0;
+        while (k > 0 && cont < 3 && ((unsigned char)out[k - 1] & 0xC0) == 0x80) { k--; cont++; }
+        if (k > 0) {
+            unsigned char lead = (unsigned char)out[k - 1];
+            size_t need = (lead & 0xE0) == 0xC0 ? 2 : (lead & 0xF0) == 0xE0 ? 3 :
+                          (lead & 0xF8) == 0xF0 ? 4 : 1;
+            if (need > 1 && cont + 1 < need) i = k - 1;
+        }
+        lmux_log(LMUX_LOG_WARN, "snapshot: a string value was longer than %zu bytes and was truncated",
+                 cap ? cap - 1 : 0);
+    }
     out[i] = '\0';
     return true;
 }

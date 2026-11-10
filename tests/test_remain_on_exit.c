@@ -9,6 +9,9 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <errno.h>
+#include <sys/wait.h>
+#include <signal.h>
 
 static int tests_run = 0;
 static int tests_pass = 0;
@@ -417,6 +420,46 @@ static void test_monitor_settings_getters(void) {
     lmux_app_free(app); teardown(); PASS();
 }
 
+/* The daemon's SIGCHLD handler used to reap every child with waitpid(-1),
+ * stealing pane children before check_pane_child_exit() could read them, so
+ * pane-died never fired in the real daemon. The tick now checks panes first,
+ * then reaps only children no pane owns. A stray child and a pane child that
+ * exit together must both be handled: the stray reaped, the pane's hook fired. */
+static void noop_sigchld(int sig) { (void)sig; }
+static void test_stray_children_reaped_without_stealing_panes(void) {
+    TEST("tick reaps stray children and still fires pane-died for pane children");
+    struct sigaction sa, old;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = noop_sigchld;          /* what the daemon installs now */
+    sigaction(SIGCHLD, &sa, &old);
+    lmux_app *app = make_app();
+    lmux_workspace *ws = lmux_workspace_create(app, "ws");
+    lmux_surface *surf = lmux_surface_create(ws, "surf");
+    lmux_hook_add(app, "pane-died", "true");
+    uint64_t cur = lmux_app_event_seq(app);
+    pid_t stray = fork();
+    if (stray == 0) _exit(0);
+    lmux_pane_split(ws, surf, LMUX_SPLIT_HORIZONTAL, "sh -c 'exit 3'", true);
+    int died = 0;
+    for (int i = 0; i < 100 && !died; i++) {
+        usleep(20000);
+        lmux_app_tick(app);
+        char *ev;
+        while ((ev = lmux_event_next(app, &cur)) != NULL) {
+            if (strstr(ev, "hook-fired") && strstr(ev, "pane-died")) died = 1;
+            free(ev);
+        }
+    }
+    int st;
+    pid_t r = waitpid(stray, &st, WNOHANG);
+    int stray_reaped = (r == -1 && errno == ECHILD);
+    sigaction(SIGCHLD, &old, NULL);
+    lmux_app_free(app); teardown();
+    ASSERT(died, "pane-died hook did not fire for the exiting pane child");
+    ASSERT(stray_reaped, "stray child was left as a zombie");
+    PASS();
+}
+
 int main(void) {
     printf("lmux Remain-on-exit & Monitoring Tests\n");
     printf("=======================================\n\n");
@@ -432,6 +475,7 @@ int main(void) {
     test_scrollback_preserved_remain_on_exit();
     test_status_flags();
     test_monitor_settings_getters();
+    test_stray_children_reaped_without_stealing_panes();
     
     printf("\n===============\n");
     printf("Tests: %d passed, %d failed, %d total\n\n",

@@ -48,13 +48,13 @@ static volatile sig_atomic_t daemon_should_exit = 0;
 static lmux_app *daemon_app_global = NULL;
 
 /* Async-signal-safe SIGCHLD handler: reap terminated children immediately. */
+/* SIGCHLD only needs to wake the main loop's poll(); the tick reaps.
+ * Reaping here with waitpid(-1) took pane children before the core could
+ * read their exit status, so pane-died/pane-exited hooks never fired and
+ * exit codes were lost. lmux_app_tick() checks each pane's own child first
+ * and then reaps any other exited child (reap_stray_children). */
 static void sigchld_handler(int sig) {
     (void)sig;
-    int saved_errno = errno;
-    while (waitpid(-1, NULL, WNOHANG) > 0) {
-        /* reap all terminated children */
-    }
-    errno = saved_errno;
 }
 
 /* SIGTERM/SIGINT handler: just set the exit flag.
