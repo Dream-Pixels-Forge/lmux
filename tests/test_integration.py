@@ -7511,6 +7511,94 @@ class TestDaemonOwnedTerminals(unittest.TestCase):
         self.assertEqual(p.get("split_dir"), "v")
 
 
+
+# ====================================================================
+# "Auto-save session" decides whether the last session comes back
+# ====================================================================
+
+class TestAutoSaveSessionSetting(unittest.TestCase):
+    """restore_on_start was derived from auto_save_session but never read, so
+    a snapshot on disk was always restored and save-on-quit always ran:
+    turning "Auto-save session" off in Settings could not stop an old session
+    from coming back."""
+
+    def _titles(self, client):
+        return [w["title"] for w in client.assert_ok("workspace.list", {})["workspaces"]]
+
+    def _restart(self, home, daemon):
+        daemon.stop()
+        return _isolated_client(home=home)
+
+    def test_default_restores_previous_session(self):
+        client, daemon, home = _isolated_client()
+        try:
+            client.assert_ok("workspace.create", {"title": "keep-me"})
+            client, daemon, _ = self._restart(home, daemon)
+            self.assertIn("keep-me", self._titles(client))
+        finally:
+            daemon.stop()
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_disabled_in_config_neither_saves_nor_restores(self):
+        home = Path(tempfile.mkdtemp(prefix="lmux-iso-home-"))
+        (home / ".config" / "lmux").mkdir(parents=True)
+        (home / ".config" / "lmux" / "config.json").write_text('{"auto_save_session": false}')
+        client, daemon, _ = _isolated_client(home=home)
+        try:
+            client.assert_ok("workspace.create", {"title": "should-vanish"})
+            client, daemon, _ = self._restart(home, daemon)
+            self.assertNotIn("should-vanish", self._titles(client))
+            self.assertFalse((home / ".local" / "share" / "lmux" / "snapshot.json").exists(),
+                             "quit saved a snapshot although auto-save is off")
+        finally:
+            daemon.stop()
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_turning_it_off_at_runtime_takes_effect(self):
+        """The GUI's Settings dialog changes it with config.set."""
+        client, daemon, home = _isolated_client()
+        try:
+            client.assert_ok("workspace.create", {"title": "first"})
+            client, daemon, _ = self._restart(home, daemon)
+            self.assertIn("first", self._titles(client))
+            client.assert_ok("config.set", {"key": "auto_save_session", "value": "false"})
+            client.assert_ok("workspace.create", {"title": "second"})
+            client, daemon, _ = self._restart(home, daemon)
+            titles = self._titles(client)
+            self.assertNotIn("first", titles)
+            self.assertNotIn("second", titles)
+        finally:
+            daemon.stop()
+            shutil.rmtree(home, ignore_errors=True)
+
+
+class TestCliListOutput(unittest.TestCase):
+    """`lmux workspace.list` printed only the first workspace: the CLI's
+    single-object branch matched the first "id" anywhere in the reply (the
+    first list element), printed it and returned before the list loop."""
+
+    def test_workspace_list_prints_every_workspace(self):
+        client, daemon, home = _isolated_client()
+        try:
+            titles = ["alpha", "beta", 'gamma "quoted"']
+            for t in titles:
+                client.assert_ok("workspace.create", {"title": t})
+            cli = Path(__file__).parent.parent / "build" / "lmux"
+            env = dict(os.environ, HOME=str(home), XDG_CONFIG_HOME=str(home / ".config"),
+                       XDG_DATA_HOME=str(home / ".local" / "share"))
+            out = subprocess.run([str(cli), "--socket", daemon.socket_path, "workspace.list"],
+                                 capture_output=True, text=True, timeout=30, env=env).stdout
+            for t in titles:
+                self.assertIn(t, out, out)
+            # A single-object reply still prints its own title.
+            out = subprocess.run([str(cli), "--socket", daemon.socket_path,
+                                  "workspace.create", "delta"],
+                                 capture_output=True, text=True, timeout=30, env=env).stdout
+            self.assertRegex(out, r"delta \(id=\d+\)")
+        finally:
+            daemon.stop()
+            shutil.rmtree(home, ignore_errors=True)
+
 if __name__ == "__main__":
     # Clean up leftover test sockets — only the dead ones (#38): never
     # unlink a socket that still answers, it may belong to a live runner.

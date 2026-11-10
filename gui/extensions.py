@@ -423,7 +423,10 @@ class FileBrowserExtension(ExtensionBase):
 # ── Extension registry (for sidebar integration) ────────────
 
 # Built-in extensions that ship with lmux
+# FileBrowserExtension is not built in: the sidebar already has the full
+# FileExplorer panel, so it showed a second, simpler file list (of the GUI
+# process's own cwd, not the workspace's). It stays importable for anyone who
+# registers it explicitly.
 BUILTIN_EXTENSIONS = [
     ProcessListExtension,
-    FileBrowserExtension,
 ]

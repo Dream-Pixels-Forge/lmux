@@ -237,6 +237,26 @@ class MainWindowStartupTests(unittest.TestCase):
         finally:
             win.destroy()
 
+    def test_sidebar_has_one_file_browser(self):
+        """The FileExplorer panel and a built-in "Files" extension tab both
+        showed a file list (the extension's of the GUI process's own cwd)."""
+        import main
+        win = main.LmuxWindow()
+        try:
+            st = win._sidebar._stack
+            pages = [st.child_get_property(c, "title") for c in st.get_children()]
+            self.assertNotIn("Files", pages, pages)
+            from file_explorer import FileExplorer
+            def walk(w):
+                yield w
+                if isinstance(w, Gtk.Container):
+                    for c in w.get_children():
+                        yield from walk(c)
+            explorers = [w for w in walk(win) if isinstance(w, FileExplorer)]
+            self.assertEqual(len(explorers), 1)
+        finally:
+            win.destroy()
+
     def test_browser_panel_hidden_until_toggled(self):
         import main
         win = main.LmuxWindow()
